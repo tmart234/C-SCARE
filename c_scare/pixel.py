@@ -10,34 +10,110 @@ Encapsulated pixel data (JPEG, JPEG2000, RLE) uses a fragment structure:
     ├── ...
     └── Sequence Delimitation Item
 
-This module allows manipulation of individual fragments for fuzzing.
+This module provides two complementary APIs:
 
-Example:
-    from dicom_hacker.pixel import EncapsulatedPixelData, PixelData
-    
-    # Build encapsulated pixel data
+1. Manual byte-level API (EncapsulatedPixelData, Fragment, PixelData)
+   Full control over encoding, good for surgical corruption.
+
+2. Scapy Packet API (DICOMFragment, DICOMBasicOffsetTable, etc.)
+   Native Scapy layers with automatic length calculation. Use fuzz()
+   to automatically mutate length fields, BOT pointers, and delimiters.
+
+3. Hybrid Fuzzing Pipeline (PixelFuzzer)
+   Seed extraction via pydicom + Scapy-based framing + fuzz() mutation.
+   Pulls valid JPEG/JPEG2000 frames from real files, wraps them in
+   Scapy DICOMFragment layers, then lets fuzz() attack the framing.
+
+Example (manual):
+    from c_scare.pixel import EncapsulatedPixelData, PixelData
+
     epd = EncapsulatedPixelData()
     epd.add_fragment(jpeg_frame_1)
-    epd.add_fragment(jpeg_frame_2)
-    
-    # Corrupt offset table
     epd.set_offset_table([0x00, 0x1000, 0x2000])  # Wrong offsets
-    
-    # Corrupt a fragment
-    epd.corrupt_fragment(0, lambda data: data + b'\\x00' * 100)
-    
-    # Create element
-    elem = Element(0x7FE0, 0x0010, 'OB', epd)
+    raw = epd.encode()
+
+Example (Scapy):
+    from c_scare.pixel import (
+        DICOMFragment, DICOMBasicOffsetTable,
+        DICOMSequenceDelimiter, DICOMEncapsulatedPixelData,
+    )
+    from scapy.packet import fuzz, raw
+
+    # Build valid encapsulated pixel data
+    epd = DICOMEncapsulatedPixelData(fragments=[
+        DICOMFragment(data=jpeg_bytes_1),
+        DICOMFragment(data=jpeg_bytes_2),
+    ])
+    valid_bytes = raw(epd)
+
+    # Fuzz it - Scapy auto-mutates length/tag fields
+    fuzzed = raw(fuzz(DICOMEncapsulatedPixelData(fragments=[
+        DICOMFragment(data=jpeg_bytes_1),
+    ])))
+
+Example (hybrid pipeline):
+    from c_scare.pixel import PixelFuzzer
+
+    fuzzer = PixelFuzzer()
+    fuzzer.add_seed(jpeg_frame_bytes)
+    for payload in fuzzer.generate(count=100):
+        send_to_target(payload)
 """
 
 import struct
+import os
+import random
 from io import BytesIO
-from typing import Callable, List, Optional, Union
+from typing import Callable, Generator, List, Optional, Tuple, Union
+
+# Scapy imports - optional, gracefully degrade
+try:
+    from scapy.packet import Packet, Raw, fuzz as scapy_fuzz
+    from scapy.fields import (
+        FieldLenField,
+        LEIntField,
+        PacketListField,
+        StrLenField,
+        XLEIntField,
+        XLEShortField,
+    )
+    HAS_SCAPY = True
+except ImportError:
+    HAS_SCAPY = False
+
+# pydicom imports - optional, for seed extraction
+try:
+    import pydicom
+    from pydicom.encaps import generate_pixel_data_frame
+    HAS_PYDICOM = True
+except ImportError:
+    HAS_PYDICOM = False
+    try:
+        import pydicom
+        HAS_PYDICOM = True
+    except ImportError:
+        pass
 
 __all__ = [
+    # Manual API
     'EncapsulatedPixelData',
     'PixelData',
     'Fragment',
+    # Scapy Packet API
+    'DICOMFragment',
+    'DICOMBasicOffsetTable',
+    'DICOMSequenceDelimiter',
+    'DICOMEncapsulatedPixelData',
+    # Hybrid Fuzzer
+    'PixelFuzzer',
+    # Seed extraction
+    'extract_frames',
+    'extract_frames_from_file',
+    # Corruption helpers
+    'corrupt_jpeg_header',
+    'corrupt_jpeg_eoi',
+    'truncate_fragment',
+    'duplicate_bytes',
 ]
 
 
@@ -105,12 +181,13 @@ class EncapsulatedPixelData:
         raw = epd.encode()
     """
     
-    def __init__(self):
+    def __init__(self, transfer_syntax: str = None):
+        self.transfer_syntax = transfer_syntax
         self.offset_table: Optional[bytes] = None  # Raw offset table bytes
         self.offset_table_offsets: Optional[List[int]] = None  # Computed offsets
         self.fragments: List[Fragment] = []
         self.include_delimiter = True
-        
+
         # Override options
         self._raw_offset_table_length: Optional[int] = None
         
@@ -372,3 +449,517 @@ def truncate_fragment(data: bytes, keep: int) -> bytes:
 def duplicate_bytes(data: bytes, offset: int, count: int) -> bytes:
     """Duplicate bytes at offset."""
     return data[:offset] + data[offset:offset+count] * 2 + data[offset+count:]
+
+
+# =============================================================================
+# Scapy Packet Layers for Encapsulated Pixel Data
+# =============================================================================
+#
+# DICOM encapsulated pixel data (PS3.5 Annex A.4) is structured as:
+#
+#   Item Tag (FFFE,E000) | Length (4 bytes LE) | Offset Table Data
+#   Item Tag (FFFE,E000) | Length (4 bytes LE) | Fragment 1 Data
+#   Item Tag (FFFE,E000) | Length (4 bytes LE) | Fragment 2 Data
+#   ...
+#   Seq Delim Tag (FFFE,E0DD) | Length 0x00000000
+#
+# Defining these as Scapy Packet classes allows:
+#   1. Automatic length calculation via FieldLenField
+#   2. Native fuzz() support that attacks length fields, causing
+#      integer overflows and buffer overflows in target allocators
+#   3. Clean layer stacking with Scapy's / operator
+#
+# =============================================================================
+
+if HAS_SCAPY:
+
+    class DICOMFragment(Packet):
+        """
+        DICOM Fragment Item (FFFE,E000) carrying compressed image data.
+
+        The tag field is the DICOM Item tag (0xFFFEE000 little-endian).
+        The length field is auto-calculated from the data field.
+
+        When fuzz()'d, Scapy will mutate the length field independently
+        of actual data size, triggering buffer over-reads/writes in
+        parsers that trust the declared length.
+        """
+        name = "DICOM Fragment Item"
+        fields_desc = [
+            XLEShortField("tag_group", 0xFFFE),
+            XLEShortField("tag_element", 0xE000),
+            FieldLenField("length", None, length_of="data", fmt="<I"),
+            StrLenField("data", b"", length_from=lambda pkt: pkt.length),
+        ]
+
+        def extract_padding(self, s):
+            # If data length is odd, consume one padding byte
+            if self.length is not None and self.length % 2:
+                return s[1:], s[:1]
+            return s, b""
+
+    class DICOMBasicOffsetTable(Packet):
+        """
+        DICOM Basic Offset Table (BOT) - first Item in encapsulated pixel data.
+
+        Contains a list of 32-bit little-endian offsets (one per frame)
+        pointing into the fragment stream. An empty BOT (length=0) is valid.
+
+        When fuzz()'d, the offset pointers get randomized, causing
+        parsers to seek to wild addresses in the fragment stream.
+        """
+        name = "DICOM Basic Offset Table"
+        fields_desc = [
+            XLEShortField("tag_group", 0xFFFE),
+            XLEShortField("tag_element", 0xE000),
+            FieldLenField("length", None, length_of="offsets", fmt="<I"),
+            StrLenField("offsets", b"", length_from=lambda pkt: pkt.length),
+        ]
+
+        def set_offsets(self, offset_list):
+            """Set offset table from a list of integers."""
+            self.offsets = b"".join(struct.pack("<I", o) for o in offset_list)
+            return self
+
+        def get_offsets(self):
+            """Parse offset table into list of integers."""
+            data = self.offsets if isinstance(self.offsets, bytes) else bytes(self.offsets)
+            return [
+                struct.unpack("<I", data[i:i + 4])[0]
+                for i in range(0, len(data), 4)
+                if i + 4 <= len(data)
+            ]
+
+    class DICOMSequenceDelimiter(Packet):
+        """
+        DICOM Sequence Delimitation Item (FFFE,E0DD) with zero length.
+
+        Marks the end of encapsulated pixel data. Dropping or corrupting
+        this causes parsers to read past the end of pixel data.
+        """
+        name = "DICOM Sequence Delimiter"
+        fields_desc = [
+            XLEShortField("tag_group", 0xFFFE),
+            XLEShortField("tag_element", 0xE0DD),
+            LEIntField("length", 0),
+        ]
+
+    class DICOMEncapsulatedPixelData(Packet):
+        """
+        Complete encapsulated pixel data structure as a Scapy layer.
+
+        Composes: BOT + Fragment list + Sequence Delimiter.
+
+        Usage:
+            # Build valid encapsulated pixel data
+            epd = DICOMEncapsulatedPixelData(
+                bot=DICOMBasicOffsetTable(),
+                fragments=[
+                    DICOMFragment(data=jpeg_frame_1),
+                    DICOMFragment(data=jpeg_frame_2),
+                ],
+            )
+            valid_bytes = raw(epd)
+
+            # Fuzz the framing (lengths, offsets, delimiter)
+            fuzzed = raw(fuzz(DICOMEncapsulatedPixelData(
+                bot=fuzz(DICOMBasicOffsetTable()),
+                fragments=[fuzz(DICOMFragment(data=jpeg_frame_1))],
+            )))
+
+            # Drop the delimiter entirely
+            epd = DICOMEncapsulatedPixelData(
+                fragments=[DICOMFragment(data=b'\\xff\\xd8...')],
+                include_delimiter=False,
+            )
+        """
+        name = "DICOM Encapsulated Pixel Data"
+        fields_desc = [
+            # We handle sub-packets manually in build/dissect
+        ]
+
+        def __init__(self, bot=None, fragments=None, include_delimiter=True, **kwargs):
+            super().__init__(**kwargs)
+            self._bot = bot or DICOMBasicOffsetTable()
+            self._fragments = fragments or []
+            self._include_delimiter = include_delimiter
+
+        def do_build(self):
+            """Build the complete encapsulated pixel data bytes."""
+            from scapy.packet import raw as scapy_raw
+            bio = BytesIO()
+
+            # Basic Offset Table
+            bio.write(scapy_raw(self._bot))
+
+            # Fragments
+            for frag in self._fragments:
+                bio.write(scapy_raw(frag))
+
+            # Sequence Delimiter
+            if self._include_delimiter:
+                bio.write(scapy_raw(DICOMSequenceDelimiter()))
+
+            return bio.getvalue()
+
+        def add_fragment(self, data):
+            """Add a fragment (bytes or DICOMFragment)."""
+            if isinstance(data, bytes):
+                self._fragments.append(DICOMFragment(data=data))
+            else:
+                self._fragments.append(data)
+            return self
+
+        @classmethod
+        def from_encapsulated(cls, epd_obj):
+            """Create from an EncapsulatedPixelData instance."""
+            bot = DICOMBasicOffsetTable()
+            if epd_obj.offset_table:
+                bot.offsets = epd_obj.offset_table
+            elif epd_obj.offset_table_offsets:
+                bot.set_offsets(epd_obj.offset_table_offsets)
+
+            fragments = [
+                DICOMFragment(data=f.data) for f in epd_obj.fragments
+            ]
+
+            return cls(
+                bot=bot,
+                fragments=fragments,
+                include_delimiter=epd_obj.include_delimiter,
+            )
+
+else:
+    # Stub classes when Scapy is not available
+    DICOMFragment = None
+    DICOMBasicOffsetTable = None
+    DICOMSequenceDelimiter = None
+    DICOMEncapsulatedPixelData = None
+
+
+# =============================================================================
+# Seed Extraction - Pull valid compressed frames from real DICOM files
+# =============================================================================
+
+def extract_frames(dataset) -> List[bytes]:
+    """
+    Extract compressed pixel data frames from a pydicom Dataset.
+
+    Uses pydicom's encapsulation handling to pull out individual
+    JPEG/JPEG2000/RLE frames as raw byte streams. These serve as
+    valid seeds for the fuzzer - real compressed data that will pass
+    initial format checks in the target's decoder.
+
+    Args:
+        dataset: A pydicom Dataset with encapsulated pixel data.
+
+    Returns:
+        List of raw frame byte streams.
+    """
+    if not HAS_PYDICOM:
+        raise ImportError("pydicom required for frame extraction")
+
+    frames = []
+
+    if not hasattr(dataset, 'PixelData'):
+        return frames
+
+    try:
+        # pydicom >= 2.0 encapsulation API
+        from pydicom.encaps import generate_pixel_data_frame
+        nr_frames = getattr(dataset, 'NumberOfFrames', 1)
+        if isinstance(nr_frames, str):
+            nr_frames = int(nr_frames)
+
+        for i in range(nr_frames):
+            try:
+                frame = generate_pixel_data_frame(
+                    dataset.PixelData, i
+                )
+                frames.append(bytes(frame))
+            except Exception:
+                break
+    except (ImportError, TypeError):
+        # Fallback: parse encapsulated data manually
+        try:
+            from pydicom.encaps import decode_data_sequence
+            fragment_list = decode_data_sequence(dataset.PixelData)
+            for fragment in fragment_list:
+                frames.append(bytes(fragment))
+        except Exception:
+            # Last resort: parse raw bytes
+            raw_value = bytes(dataset.PixelData)
+            epd = EncapsulatedPixelData.parse(raw_value)
+            for frag in epd.fragments:
+                frames.append(frag.data)
+
+    return frames
+
+
+def extract_frames_from_file(path: str) -> List[bytes]:
+    """
+    Extract compressed pixel data frames from a DICOM file.
+
+    Args:
+        path: Path to a DICOM file with encapsulated pixel data.
+
+    Returns:
+        List of raw frame byte streams.
+    """
+    if not HAS_PYDICOM:
+        raise ImportError("pydicom required for frame extraction")
+
+    ds = pydicom.dcmread(path, force=True)
+    return extract_frames(ds)
+
+
+# =============================================================================
+# Hybrid Fuzzing Pipeline
+# =============================================================================
+
+class PixelFuzzer:
+    """
+    Hybrid pixel data fuzzer combining pydicom seeds with Scapy framing.
+
+    Pipeline:
+        1. Seed:  Pull valid JPEG/JPEG2000 frames from real files (pydicom)
+        2. Frame: Wrap frames in Scapy DICOMFragment / BasicOffsetTable layers
+        3. Fuzz:  Let Scapy's fuzz() mutate BOT pointers, fragment lengths,
+                  or drop the Sequence Delimiter entirely
+        4. Yield: Return raw bytes ready to send via DICOMSocket
+
+    This keeps the architecture lean: pydicom harvests valid payload seeds,
+    Scapy dynamically generates the vulnerable offset framing around them.
+
+    Usage:
+        fuzzer = PixelFuzzer()
+        fuzzer.add_seed(jpeg_bytes)
+        # or
+        fuzzer.add_seeds_from_file('real_ct.dcm')
+
+        for payload in fuzzer.generate(count=100):
+            # payload is raw encapsulated pixel data bytes
+            send_to_target(payload)
+    """
+
+    # Mutation strategies
+    STRATEGY_FUZZ_LENGTHS = 'fuzz_lengths'
+    STRATEGY_FUZZ_BOT = 'fuzz_bot'
+    STRATEGY_DROP_DELIMITER = 'drop_delimiter'
+    STRATEGY_CORRUPT_FRAGMENT = 'corrupt_fragment'
+    STRATEGY_DUPLICATE_FRAGMENTS = 'duplicate_fragments'
+    STRATEGY_EMPTY_FRAGMENTS = 'empty_fragments'
+    STRATEGY_OVERFLOW_BOT = 'overflow_bot'
+
+    ALL_STRATEGIES = [
+        STRATEGY_FUZZ_LENGTHS,
+        STRATEGY_FUZZ_BOT,
+        STRATEGY_DROP_DELIMITER,
+        STRATEGY_CORRUPT_FRAGMENT,
+        STRATEGY_DUPLICATE_FRAGMENTS,
+        STRATEGY_EMPTY_FRAGMENTS,
+        STRATEGY_OVERFLOW_BOT,
+    ]
+
+    def __init__(self, strategies: List[str] = None):
+        """
+        Args:
+            strategies: List of mutation strategies to use.
+                        None = use all strategies.
+        """
+        self._seeds: List[bytes] = []
+        self._strategies = strategies or self.ALL_STRATEGIES
+
+    def add_seed(self, frame_data: bytes) -> 'PixelFuzzer':
+        """Add a raw compressed frame as a seed."""
+        self._seeds.append(frame_data)
+        return self
+
+    def add_seeds_from_file(self, path: str) -> 'PixelFuzzer':
+        """Extract and add seeds from a DICOM file."""
+        frames = extract_frames_from_file(path)
+        self._seeds.extend(frames)
+        return self
+
+    def add_seeds_from_dataset(self, dataset) -> 'PixelFuzzer':
+        """Extract and add seeds from a pydicom Dataset."""
+        frames = extract_frames(dataset)
+        self._seeds.extend(frames)
+        return self
+
+    def _get_seed(self) -> bytes:
+        """Get a random seed, or a minimal JPEG stub if no seeds."""
+        if self._seeds:
+            return random.choice(self._seeds)
+        # Minimal valid JPEG: SOI + EOI
+        return b'\xFF\xD8\xFF\xD9'
+
+    def generate(self, count: int = 100) -> Generator[bytes, None, None]:
+        """
+        Generate fuzzed encapsulated pixel data payloads.
+
+        Args:
+            count: Number of payloads to generate.
+
+        Yields:
+            Raw bytes of fuzzed encapsulated pixel data.
+        """
+        for _ in range(count):
+            strategy = random.choice(self._strategies)
+            yield self._apply_strategy(strategy)
+
+    def _apply_strategy(self, strategy: str) -> bytes:
+        """Apply a single mutation strategy and return raw bytes."""
+        seed = self._get_seed()
+
+        if HAS_SCAPY and DICOMFragment is not None:
+            return self._apply_scapy_strategy(strategy, seed)
+        else:
+            return self._apply_manual_strategy(strategy, seed)
+
+    def _apply_scapy_strategy(self, strategy: str, seed: bytes) -> bytes:
+        """Apply strategy using Scapy packet layers."""
+        from scapy.packet import raw as scapy_raw
+
+        if strategy == self.STRATEGY_FUZZ_LENGTHS:
+            # Fuzz fragment length fields - causes buffer over/under-reads
+            epd = DICOMEncapsulatedPixelData(
+                bot=DICOMBasicOffsetTable(),
+                fragments=[scapy_fuzz(DICOMFragment(data=seed))],
+            )
+            return scapy_raw(epd)
+
+        elif strategy == self.STRATEGY_FUZZ_BOT:
+            # Fuzz BOT offsets - causes wild seeking in fragment stream
+            bot = DICOMBasicOffsetTable()
+            # Random bogus offsets
+            num_offsets = random.randint(1, 20)
+            bot.offsets = b"".join(
+                struct.pack("<I", random.randint(0, 0xFFFFFFFF))
+                for _ in range(num_offsets)
+            )
+            epd = DICOMEncapsulatedPixelData(
+                bot=scapy_fuzz(bot),
+                fragments=[DICOMFragment(data=seed)],
+            )
+            return scapy_raw(epd)
+
+        elif strategy == self.STRATEGY_DROP_DELIMITER:
+            # Drop sequence delimiter - parser reads past pixel data
+            epd = DICOMEncapsulatedPixelData(
+                bot=DICOMBasicOffsetTable(),
+                fragments=[DICOMFragment(data=seed)],
+                include_delimiter=False,
+            )
+            return scapy_raw(epd)
+
+        elif strategy == self.STRATEGY_CORRUPT_FRAGMENT:
+            # Apply random corruption to the seed data inside the fragment
+            corrupted = self._random_corrupt(seed)
+            epd = DICOMEncapsulatedPixelData(
+                bot=DICOMBasicOffsetTable(),
+                fragments=[DICOMFragment(data=corrupted)],
+            )
+            return scapy_raw(epd)
+
+        elif strategy == self.STRATEGY_DUPLICATE_FRAGMENTS:
+            # Blast thousands of fragments to exhaust allocations
+            dup_count = random.choice([100, 1000, 5000])
+            epd = DICOMEncapsulatedPixelData(
+                bot=DICOMBasicOffsetTable(),
+                fragments=[DICOMFragment(data=seed)] * dup_count,
+            )
+            return scapy_raw(epd)
+
+        elif strategy == self.STRATEGY_EMPTY_FRAGMENTS:
+            # Mix empty and populated fragments
+            frags = []
+            for _ in range(random.randint(2, 10)):
+                if random.random() < 0.5:
+                    frags.append(DICOMFragment(data=b""))
+                else:
+                    frags.append(DICOMFragment(data=seed))
+            epd = DICOMEncapsulatedPixelData(
+                bot=DICOMBasicOffsetTable(),
+                fragments=frags,
+            )
+            return scapy_raw(epd)
+
+        elif strategy == self.STRATEGY_OVERFLOW_BOT:
+            # BOT with huge declared length but tiny actual data
+            bot = DICOMBasicOffsetTable()
+            bot.offsets = struct.pack("<I", 0)
+            bot.length = 0xFFFFFFFF  # Lie about length
+            epd = DICOMEncapsulatedPixelData(
+                bot=bot,
+                fragments=[DICOMFragment(data=seed)],
+            )
+            return scapy_raw(epd)
+
+        # Fallback
+        epd = DICOMEncapsulatedPixelData(
+            bot=DICOMBasicOffsetTable(),
+            fragments=[DICOMFragment(data=seed)],
+        )
+        return scapy_raw(epd)
+
+    def _apply_manual_strategy(self, strategy: str, seed: bytes) -> bytes:
+        """Apply strategy using manual byte-level API (no Scapy)."""
+        epd = EncapsulatedPixelData()
+        epd.add_fragment(seed)
+
+        if strategy == self.STRATEGY_FUZZ_LENGTHS:
+            # Lie about fragment length
+            epd.fragments[0].length_override = random.randint(0, 0xFFFFFFFF)
+
+        elif strategy == self.STRATEGY_FUZZ_BOT:
+            num_offsets = random.randint(1, 20)
+            offsets = [random.randint(0, 0xFFFFFFFF) for _ in range(num_offsets)]
+            epd.set_offset_table(offsets)
+
+        elif strategy == self.STRATEGY_DROP_DELIMITER:
+            epd.include_delimiter = False
+
+        elif strategy == self.STRATEGY_CORRUPT_FRAGMENT:
+            epd.corrupt_fragment(0, self._random_corrupt)
+
+        elif strategy == self.STRATEGY_DUPLICATE_FRAGMENTS:
+            for _ in range(random.choice([100, 1000])):
+                epd.add_fragment(seed)
+
+        elif strategy == self.STRATEGY_EMPTY_FRAGMENTS:
+            for _ in range(random.randint(2, 10)):
+                if random.random() < 0.5:
+                    epd.add_fragment(b"")
+                else:
+                    epd.add_fragment(seed)
+
+        elif strategy == self.STRATEGY_OVERFLOW_BOT:
+            epd.set_offset_table_raw(struct.pack("<I", 0), length_override=0xFFFFFFFF)
+
+        return epd.encode()
+
+    @staticmethod
+    def _random_corrupt(data: bytes) -> bytes:
+        """Apply random byte-level corruption to data."""
+        if not data:
+            return data
+        ba = bytearray(data)
+        mutation = random.choice(['bitflip', 'insert', 'delete', 'overwrite'])
+
+        if mutation == 'bitflip':
+            pos = random.randint(0, len(ba) - 1)
+            ba[pos] ^= (1 << random.randint(0, 7))
+        elif mutation == 'insert':
+            pos = random.randint(0, len(ba))
+            ba.insert(pos, random.randint(0, 255))
+        elif mutation == 'delete' and len(ba) > 1:
+            pos = random.randint(0, len(ba) - 1)
+            del ba[pos]
+        elif mutation == 'overwrite':
+            pos = random.randint(0, len(ba) - 1)
+            length = min(random.randint(1, 16), len(ba) - pos)
+            for i in range(length):
+                ba[pos + i] = random.randint(0, 255)
+
+        return bytes(ba)
