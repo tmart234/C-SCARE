@@ -42,7 +42,7 @@ except ImportError:
     )
     import deliver
 
-__all__ = ['main', 'run_command', 'write_junit_xml']
+__all__ = ['main', 'run_command', 'write_sarif']
 
 
 def _collect_results(args, results: list):
@@ -52,22 +52,62 @@ def _collect_results(args, results: list):
         collector.extend(results)
 
 
-def write_junit_xml(results: list, filepath: str):
-    """Write JUnit XML report from AttackResult objects."""
-    from junitparser import JUnitXml, TestSuite, TestCase, Failure
+def write_sarif(results: list, filepath: str):
+    """Write SARIF v2.1.0 report from AttackResult objects."""
+    import json
 
-    xml = JUnitXml()
-    suites = {}
+    rules = {}
+    sarif_results = []
     for r in results:
-        if r.category not in suites:
-            suites[r.category] = TestSuite(name=r.category)
-        tc = TestCase(name=r.name, classname=f"c_scare.{r.category}")
+        rule_id = f"{r.category}/{r.name}"
+        if rule_id not in rules:
+            rule_def = {
+                "id": rule_id,
+                "shortDescription": {"text": r.name},
+            }
+            if r.cve:
+                rule_def["helpUri"] = f"https://cve.mitre.org/cgi-bin/cvename.cgi?name={r.cve}"
+            rules[rule_id] = rule_def
+
         if r.success is False:
-            tc.result = [Failure(message=r.description)]
-        suites[r.category].add_testcase(tc)
-    for suite in suites.values():
-        xml.add_testsuite(suite)
-    xml.write(filepath)
+            level = "error"
+        elif r.success is True:
+            level = "note"
+        else:
+            level = "warning"
+
+        result_obj = {
+            "ruleId": rule_id,
+            "level": level,
+            "message": {"text": r.description},
+            "properties": {
+                "category": r.category,
+                "expected_behavior": r.expected_behavior,
+            },
+        }
+        if r.cve:
+            result_obj["properties"]["cve"] = r.cve
+        sarif_results.append(result_obj)
+
+    sarif = {
+        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "name": "C-SCARE",
+                        "informationUri": "https://github.com/tmart234/C-SCARE",
+                        "rules": list(rules.values()),
+                    }
+                },
+                "results": sarif_results,
+            }
+        ],
+    }
+
+    with open(filepath, "w") as f:
+        json.dump(sarif, f, indent=2)
 
 
 def print_banner():
@@ -630,9 +670,9 @@ def main(argv: Optional[List[str]] = None):
     )
 
     parser.add_argument(
-        '--junit-xml',
+        '--sarif',
         metavar='FILE',
-        help='Write JUnit XML report to file'
+        help='Write SARIF v2.1.0 report to file'
     )
     
     args = parser.parse_args(argv)
@@ -680,9 +720,9 @@ def main(argv: Optional[List[str]] = None):
             traceback.print_exc()
         return 1
 
-    if args.junit_xml and args.result_collector:
-        write_junit_xml(args.result_collector, args.junit_xml)
-        print(f"\nJUnit XML report written to: {args.junit_xml}")
+    if args.sarif and args.result_collector:
+        write_sarif(args.result_collector, args.sarif)
+        print(f"\nSARIF report written to: {args.sarif}")
 
     return ret
 
