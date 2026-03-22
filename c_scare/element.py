@@ -18,6 +18,12 @@ from dataclasses import dataclass, field
 from io import BytesIO
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
+try:
+    from pydicom.valuerep import EXPLICIT_VR_LENGTH_32
+    _LONG_LENGTH_VRS = {str(v) for v in EXPLICIT_VR_LENGTH_32}
+except ImportError:
+    _LONG_LENGTH_VRS = {'OB', 'OD', 'OF', 'OL', 'OW', 'SQ', 'UC', 'UN', 'UR', 'UT', 'OV', 'SV', 'UV'}
+
 __all__ = [
     'Element', 'Dataset', 'Sequence', 'VR', 'Tag',
     'hexdump',
@@ -90,7 +96,8 @@ class VR:
     """DICOM Value Representations — kept minimal for the encoder."""
 
     # VRs that use 4-byte length in explicit VR encoding (PS3.5 Section 7.1.2)
-    LONG_LENGTH = {'OB', 'OD', 'OF', 'OL', 'OW', 'SQ', 'UC', 'UN', 'UR', 'UT', 'OV', 'SV', 'UV'}
+    # Sourced from pydicom.valuerep.EXPLICIT_VR_LENGTH_32 when available.
+    LONG_LENGTH = _LONG_LENGTH_VRS
 
     @classmethod
     def uses_long_length(cls, vr: str) -> bool:

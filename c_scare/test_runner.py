@@ -42,7 +42,32 @@ except ImportError:
     )
     import deliver
 
-__all__ = ['main', 'run_command']
+__all__ = ['main', 'run_command', 'write_junit_xml']
+
+
+def _collect_results(args, results: list):
+    """Append results to the shared collector if present."""
+    collector = getattr(args, 'result_collector', None)
+    if collector is not None:
+        collector.extend(results)
+
+
+def write_junit_xml(results: list, filepath: str):
+    """Write JUnit XML report from AttackResult objects."""
+    from junitparser import JUnitXml, TestSuite, TestCase, Failure
+
+    xml = JUnitXml()
+    suites = {}
+    for r in results:
+        if r.category not in suites:
+            suites[r.category] = TestSuite(name=r.category)
+        tc = TestCase(name=r.name, classname=f"c_scare.{r.category}")
+        if r.success is False:
+            tc.result = [Failure(message=r.description)]
+        suites[r.category].add_testcase(tc)
+    for suite in suites.values():
+        xml.add_testsuite(suite)
+    xml.write(filepath)
 
 
 def print_banner():
@@ -87,6 +112,7 @@ def run_cve_attacks(args) -> int:
         all_results.append(result)
 
     print(f"\nTotal CVE test cases: {len(all_results)}")
+    _collect_results(args, all_results)
 
     if args.output:
         os.makedirs(args.output, exist_ok=True)
@@ -189,7 +215,8 @@ def run_fuzz_packets(args) -> int:
             print(f"✗ Failed to create fuzzed C_ECHO_RQ #{i}: {e}")
     
     print(f"\nTotal fuzz test cases: {len(results)}")
-    
+    _collect_results(args, results)
+
     # Save if output dir specified
     if args.output:
         os.makedirs(args.output, exist_ok=True)
@@ -334,6 +361,7 @@ def run_parser_attacks(args) -> int:
             print(f"✗ {result.name}: {e}")
 
     print(f"\nTotal parser attack tests: {len(results)}")
+    _collect_results(args, results)
 
     if args.output:
         os.makedirs(args.output, exist_ok=True)
@@ -359,6 +387,7 @@ def run_protocol_attacks(args) -> int:
             print(f"✗ {result.name}: {e}")
 
     print(f"\nTotal protocol attack tests: {len(results)}")
+    _collect_results(args, results)
 
     if args.output:
         os.makedirs(args.output, exist_ok=True)
@@ -383,6 +412,7 @@ def run_logic_attacks(args) -> int:
             print(f"✗ {result.name}: {e}")
 
     print(f"\nTotal logic attack tests: {len(results)}")
+    _collect_results(args, results)
 
     if args.output:
         os.makedirs(args.output, exist_ok=True)
@@ -437,6 +467,7 @@ def run_state_machine_attacks(args) -> int:
         results.append(result)
 
     print(f"\nTotal state machine attack tests: {len(results)}")
+    _collect_results(args, results)
     return 0
 
 
@@ -453,6 +484,7 @@ def run_memory_attacks(args) -> int:
             print(f"✗ {result.name}: {e}")
 
     print(f"\nTotal memory attack tests: {len(results)}")
+    _collect_results(args, results)
 
     if args.output:
         os.makedirs(args.output, exist_ok=True)
@@ -596,6 +628,12 @@ def main(argv: Optional[List[str]] = None):
         metavar='DIR',
         help='Generate fuzzing corpus in specified directory'
     )
+
+    parser.add_argument(
+        '--junit-xml',
+        metavar='FILE',
+        help='Write JUnit XML report to file'
+    )
     
     args = parser.parse_args(argv)
     
@@ -626,9 +664,12 @@ def main(argv: Optional[List[str]] = None):
         command = category_map.get(args.category, 'all')
     else:
         command = 'all'
-    
+
+    # Set up result collector for JUnit XML output
+    args.result_collector = []
+
     try:
-        return run_command(command, args)
+        ret = run_command(command, args)
     except KeyboardInterrupt:
         print("\nInterrupted by user")
         return 130
@@ -638,6 +679,12 @@ def main(argv: Optional[List[str]] = None):
             import traceback
             traceback.print_exc()
         return 1
+
+    if args.junit_xml and args.result_collector:
+        write_junit_xml(args.result_collector, args.junit_xml)
+        print(f"\nJUnit XML report written to: {args.junit_xml}")
+
+    return ret
 
 
 if __name__ == '__main__':

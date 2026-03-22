@@ -81,18 +81,13 @@ try:
 except ImportError:
     HAS_SCAPY = False
 
-# pydicom imports - optional, for seed extraction
+# pydicom imports - for seed extraction
 try:
     import pydicom
-    from pydicom.encaps import generate_pixel_data_frame
+    from pydicom.encaps import get_frame
     HAS_PYDICOM = True
 except ImportError:
     HAS_PYDICOM = False
-    try:
-        import pydicom
-        HAS_PYDICOM = True
-    except ImportError:
-        pass
 
 __all__ = [
     # Manual API
@@ -664,34 +659,16 @@ def extract_frames(dataset) -> List[bytes]:
     if not hasattr(dataset, 'PixelData'):
         return frames
 
-    try:
-        # pydicom >= 2.0 encapsulation API
-        from pydicom.encaps import generate_pixel_data_frame
-        nr_frames = getattr(dataset, 'NumberOfFrames', 1)
-        if isinstance(nr_frames, str):
-            nr_frames = int(nr_frames)
+    nr_frames = getattr(dataset, 'NumberOfFrames', 1)
+    if isinstance(nr_frames, str):
+        nr_frames = int(nr_frames)
 
-        for i in range(nr_frames):
-            try:
-                frame = generate_pixel_data_frame(
-                    dataset.PixelData, i
-                )
-                frames.append(bytes(frame))
-            except Exception:
-                break
-    except (ImportError, TypeError):
-        # Fallback: parse encapsulated data manually
+    for i in range(nr_frames):
         try:
-            from pydicom.encaps import decode_data_sequence
-            fragment_list = decode_data_sequence(dataset.PixelData)
-            for fragment in fragment_list:
-                frames.append(bytes(fragment))
+            frame = get_frame(dataset.PixelData, i, number_of_frames=nr_frames)
+            frames.append(bytes(frame))
         except Exception:
-            # Last resort: parse raw bytes
-            raw_value = bytes(dataset.PixelData)
-            epd = EncapsulatedPixelData.parse(raw_value)
-            for frag in epd.fragments:
-                frames.append(frag.data)
+            break
 
     return frames
 
