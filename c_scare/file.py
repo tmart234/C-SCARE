@@ -38,50 +38,18 @@ Example:
 """
 
 import struct
-from dataclasses import dataclass, field
 from io import BytesIO
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
+
+import pydicom
+from pydicom.uid import UID
 
 from .element import Element, Dataset, Tag, hexdump
 
 __all__ = [
     'DicomFile',
     'FileMetaInformation',
-    'TransferSyntax',
 ]
-
-
-class TransferSyntax:
-    """Common Transfer Syntax UIDs."""
-    ImplicitVRLittleEndian = '1.2.840.10008.1.2'
-    ExplicitVRLittleEndian = '1.2.840.10008.1.2.1'
-    ExplicitVRBigEndian = '1.2.840.10008.1.2.2'
-    DeflatedExplicitVRLittleEndian = '1.2.840.10008.1.2.1.99'
-    JPEGBaseline = '1.2.840.10008.1.2.4.50'
-    JPEGExtended = '1.2.840.10008.1.2.4.51'
-    JPEGLossless = '1.2.840.10008.1.2.4.70'
-    JPEGLSLossless = '1.2.840.10008.1.2.4.80'
-    JPEGLSLossy = '1.2.840.10008.1.2.4.81'
-    JPEG2000Lossless = '1.2.840.10008.1.2.4.90'
-    JPEG2000 = '1.2.840.10008.1.2.4.91'
-    RLELossless = '1.2.840.10008.1.2.5'
-    
-    @classmethod
-    def is_implicit(cls, ts: str) -> bool:
-        return ts == cls.ImplicitVRLittleEndian
-    
-    @classmethod
-    def is_big_endian(cls, ts: str) -> bool:
-        return ts == cls.ExplicitVRBigEndian
-    
-    @classmethod
-    def is_encapsulated(cls, ts: str) -> bool:
-        return ts in (
-            cls.JPEGBaseline, cls.JPEGExtended, cls.JPEGLossless,
-            cls.JPEGLSLossless, cls.JPEGLSLossy,
-            cls.JPEG2000Lossless, cls.JPEG2000,
-            cls.RLELossless,
-        )
 
 
 class FileMetaInformation:
@@ -95,7 +63,7 @@ class FileMetaInformation:
         self.version: bytes = b'\x00\x01'
         self.media_storage_sop_class_uid: str = ''
         self.media_storage_sop_instance_uid: str = ''
-        self.transfer_syntax_uid: str = TransferSyntax.ExplicitVRLittleEndian
+        self.transfer_syntax_uid: str = '1.2.840.10008.1.2.1'  # Explicit VR LE
         self.implementation_class_uid: str = '1.2.3.4.5.6.7.8.9'
         self.implementation_version_name: str = 'DICOM_HACKER'
         self.source_ae_title: Optional[str] = None
@@ -209,16 +177,11 @@ class DicomFile:
         """
         if isinstance(data, bytes):
             self.dataset = data
-        elif hasattr(data, 'encode'):
-            # Dataset or Corruptor
-            ts = self.file_meta.transfer_syntax_uid
-            implicit = TransferSyntax.is_implicit(ts)
-            little_endian = not TransferSyntax.is_big_endian(ts)
-            
-            if hasattr(data, 'encode') and callable(data.encode):
-                self.dataset = data.encode(implicit_vr=implicit, little_endian=little_endian)
-            else:
-                self.dataset = bytes(data)
+        elif hasattr(data, 'encode') and callable(data.encode):
+            ts = UID(self.file_meta.transfer_syntax_uid)
+            implicit = ts.is_implicit_VR
+            little_endian = ts.is_little_endian
+            self.dataset = data.encode(implicit_vr=implicit, little_endian=little_endian)
         else:
             self.dataset = bytes(data)
         return self
@@ -254,58 +217,58 @@ class DicomFile:
         df.set_meta(
             sop_class_uid=sop_class_uid,
             sop_instance_uid=sop_instance_uid,
-            transfer_syntax=transfer_syntax_uid or TransferSyntax.ExplicitVRLittleEndian,
+            transfer_syntax=transfer_syntax_uid or '1.2.840.10008.1.2.1',
         )
         df.dataset = dataset_bytes
         return df.encode()
     
     @classmethod
     def parse(cls, data: bytes, lenient: bool = True) -> 'DicomFile':
-        """
-        Parse DICOM file.
-        
-        Returns DicomFile with parsed components.
-        """
+        """Parse DICOM file using pydicom."""
         df = cls()
-        pos = 0
-        
+
         # Check for preamble/prefix
         if len(data) >= 132 and data[128:132] == b'DICM':
             df.preamble = data[:128]
             df.prefix = data[128:132]
-            pos = 132
         else:
             df.include_preamble = False
             df.include_prefix = False
-        
-        # Parse file meta (group 0002)
-        from .element import parse_element
-        
-        meta_end = pos
-        while pos < len(data) - 4:
-            # Peek at group
-            group = struct.unpack('<H', data[pos:pos+2])[0]
-            if group != 0x0002:
-                break
-            
-            elem, consumed = parse_element(data, pos, implicit_vr=False, little_endian=True)
-            if elem:
-                tag = elem.tag
-                if tag == Tag(0x0002, 0x0002):
-                    df.file_meta.media_storage_sop_class_uid = elem.value.rstrip(b'\x00').decode('ascii') if isinstance(elem.value, bytes) else elem.value
-                elif tag == Tag(0x0002, 0x0003):
-                    df.file_meta.media_storage_sop_instance_uid = elem.value.rstrip(b'\x00').decode('ascii') if isinstance(elem.value, bytes) else elem.value
-                elif tag == Tag(0x0002, 0x0010):
-                    df.file_meta.transfer_syntax_uid = elem.value.rstrip(b'\x00').decode('ascii') if isinstance(elem.value, bytes) else elem.value
-            
-            if consumed == 0:
-                break
-            pos += consumed
-            meta_end = pos
-        
-        # Rest is dataset
-        df.dataset = data[meta_end:]
-        
+
+        # Use pydicom for the heavy lifting
+        try:
+            ds = pydicom.dcmread(BytesIO(data), force=True)
+            if hasattr(ds, 'file_meta'):
+                fm = ds.file_meta
+                df.file_meta.media_storage_sop_class_uid = str(getattr(fm, 'MediaStorageSOPClassUID', ''))
+                df.file_meta.media_storage_sop_instance_uid = str(getattr(fm, 'MediaStorageSOPInstanceUID', ''))
+                df.file_meta.transfer_syntax_uid = str(getattr(fm, 'TransferSyntaxUID', '1.2.840.10008.1.2.1'))
+
+            # Find where dataset body starts (after preamble + prefix + meta)
+            meta_end = 132 if df.include_preamble else 0
+            if hasattr(ds, 'file_meta'):
+                # Walk past group 0002 elements
+                pos = meta_end
+                while pos < len(data) - 4:
+                    group = struct.unpack('<H', data[pos:pos + 2])[0]
+                    if group != 0x0002:
+                        break
+                    # Read VR-dependent header to skip element
+                    vr = data[pos + 4:pos + 6].decode('ascii', errors='replace')
+                    from .element import VR
+                    if VR.uses_long_length(vr):
+                        elem_len = struct.unpack('<I', data[pos + 8:pos + 12])[0]
+                        pos += 12 + elem_len
+                    else:
+                        elem_len = struct.unpack('<H', data[pos + 6:pos + 8])[0]
+                        pos += 8 + elem_len
+                meta_end = pos
+            df.dataset = data[meta_end:]
+        except Exception:
+            if not lenient:
+                raise
+            df.dataset = data
+
         return df
     
     def hexdump(self) -> str:

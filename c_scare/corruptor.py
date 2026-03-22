@@ -206,18 +206,10 @@ class Corruptor:
                 self._load_bytes(f.read())
     
     def _load_bytes(self, data: bytes):
-        """Load from raw bytes."""
-        try:
-            import pydicom
-            from io import BytesIO
-            self._pydicom_ds = pydicom.dcmread(BytesIO(data), force=True)
-            self._extract_pydicom_info()
-        except ImportError:
-            from .element import parse
-            # Skip preamble if present
-            if len(data) > 132 and data[128:132] == b'DICM':
-                data = data[132:]
-            self._our_ds = parse(data)
+        """Load from raw bytes using pydicom."""
+        import pydicom
+        self._pydicom_ds = pydicom.dcmread(BytesIO(data), force=True)
+        self._extract_pydicom_info()
     
     def _extract_pydicom_info(self):
         """Extract encoding info from pydicom dataset."""

@@ -39,11 +39,12 @@ graph TD
 
     PGEN --> SCAPY_PDU["<b>scapy_dicom.py</b><br/>PDUs / DIMSE"]
 
-    COR --> TRANSPORT
-    ELEM --> TRANSPORT
-    SCAPY_PDU --> TRANSPORT
+    COR --> DELIVER
+    ELEM --> DELIVER
+    SCAPY_PDU --> DELIVER
 
-    subgraph TRANSPORT ["TRANSPORT LAYER"]
+    subgraph DELIVER ["DELIVERY LAYER"]
+        DEL["<b>deliver.py</b><br/>send_pdu / send_cstore"]
         SCU["<b>scapy_dicom.py</b><br/>DICOMSocket / SCU"]
         SCP["<b>server.py</b><br/>RawSCP"]
     end
@@ -54,7 +55,7 @@ graph TD
 ### Install
 
 ```bash
-pip install c_scare scapy pydicom
+pip install c_scare scapy pydicom  # pydicom is a hard dependency
 ```
 
 ### 1. Corrupt a real DICOM file
@@ -140,10 +141,11 @@ scp.start()
 | `element.py` | Dataset/Element building with Scapy-style `/` chaining |
 | `corruptor.py` | Pydicom bridge — read with pydicom, corrupt with our encoder |
 | `pixel.py` | Encapsulated pixel data with fragment-level control + Scapy layers |
-| `file.py` | Part 10 file handling (preamble, meta header, transfer syntax) |
+| `file.py` | Part 10 file handling (preamble, meta header, transfer syntax via `pydicom.uid.UID`) |
 | `scapy_dicom.py` | Full protocol stack — PDUs, DIMSE-C/N, `DICOMSocket` |
 | `server.py` | `RawSCP` rogue server for fuzzing clients |
-| `attacks.py` | Pre-built attack patterns, CVE reproductions, corpus generation |
+| `attacks.py` | Pure payload generators — all classes expose `all()` iterators yielding `AttackResult` |
+| `deliver.py` | Network delivery — `send_pdu()`, `send_sequence()`, `send_cstore()` |
 | `test_runner.py` | CLI test runner (`python -m c_scare`) |
 
 ## Protocol Reference

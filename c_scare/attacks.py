@@ -53,7 +53,7 @@ import time
 from .element import Element, Dataset, Tag, VR
 from .corruptor import Corruptor, Override, Injection, InjectionPoint
 from .pixel import EncapsulatedPixelData, Fragment
-from .file import DicomFile, TransferSyntax
+from .file import DicomFile
 
 # Scapy imports - may not be available in all environments
 try:
