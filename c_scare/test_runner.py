@@ -156,17 +156,6 @@ def run_fuzz_packets(args) -> int:
             from attacks import C_ECHO_RQ, C_STORE_RQ
             from scapy.packet import raw, fuzz
         
-        # Try to import Fuzz variants if they exist
-        try:
-            from .attacks import C_ECHO_RQ_Fuzz, C_STORE_RQ_Fuzz
-            has_fuzz_classes = True
-        except ImportError:
-            try:
-                from attacks import C_ECHO_RQ_Fuzz, C_STORE_RQ_Fuzz
-                has_fuzz_classes = True
-            except ImportError:
-                has_fuzz_classes = False
-                print("Note: Specialized fuzz classes not available, using standard classes\n")
     except ImportError as e:
         print(f"ERROR: Could not import DIMSE classes: {e}")
         return 1
@@ -178,15 +167,7 @@ def run_fuzz_packets(args) -> int:
     print("1. C_ECHO_RQ with field variations")
     for i in range(min(5, count)):
         try:
-            if has_fuzz_classes:
-                # Use specialized fuzz class if available
-                cmd = C_ECHO_RQ_Fuzz(
-                    command_group_length=0xFFFF,
-                    message_id=i+1
-                )
-            else:
-                # Use standard class
-                cmd = C_ECHO_RQ(message_id=i+1)
+            cmd = C_ECHO_RQ(message_id=i+1)
             
             payload = raw(cmd)
             result = AttackResult(
@@ -205,16 +186,7 @@ def run_fuzz_packets(args) -> int:
     print("\n2. C_STORE_RQ with field variations")
     for i in range(min(5, count)):
         try:
-            if has_fuzz_classes:
-                cmd = C_STORE_RQ_Fuzz(
-                    command_group_length=100,
-                    affected_sop_class_uid=b'1.2.3.4.5',
-                    affected_sop_instance_uid=f'1.2.3.4.5.6.{i}'.encode(),
-                    message_id=i+1
-                )
-            else:
-                # Use standard class with modifications
-                cmd = C_STORE_RQ(
+            cmd = C_STORE_RQ(
                     affected_sop_class_uid='1.2.840.10008.5.1.4.1.1.2',
                     affected_sop_instance_uid=f'1.2.3.4.5.6.{i}',
                     message_id=i+1

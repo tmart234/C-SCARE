@@ -10,7 +10,7 @@ __version__ = "0.1.0"
 __author__ = "Tyler M"
 
 # Import all symbols from scapy_dicom
-from scapy_dicom import (
+from .scapy_dicom import (
     # Constants
     DICOM_PORT,
     DICOM_PORT_ALT,
