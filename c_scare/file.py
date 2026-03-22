@@ -42,6 +42,7 @@ from io import BytesIO
 from typing import List, Optional
 
 import pydicom
+from pydicom.filewriter import write_file_meta_info
 from pydicom.uid import UID
 
 from .element import Element, Dataset, Tag, hexdump
@@ -246,23 +247,10 @@ class DicomFile:
 
             # Find where dataset body starts (after preamble + prefix + meta)
             meta_end = 132 if df.include_preamble else 0
-            if hasattr(ds, 'file_meta'):
-                # Walk past group 0002 elements
-                pos = meta_end
-                while pos < len(data) - 4:
-                    group = struct.unpack('<H', data[pos:pos + 2])[0]
-                    if group != 0x0002:
-                        break
-                    # Read VR-dependent header to skip element
-                    vr = data[pos + 4:pos + 6].decode('ascii', errors='replace')
-                    from .element import VR
-                    if VR.uses_long_length(vr):
-                        elem_len = struct.unpack('<I', data[pos + 8:pos + 12])[0]
-                        pos += 12 + elem_len
-                    else:
-                        elem_len = struct.unpack('<H', data[pos + 6:pos + 8])[0]
-                        pos += 8 + elem_len
-                meta_end = pos
+            if hasattr(ds, 'file_meta') and len(ds.file_meta):
+                buf = BytesIO()
+                write_file_meta_info(buf, ds.file_meta, enforce_standard=False)
+                meta_end += len(buf.getvalue())
             df.dataset = data[meta_end:]
         except Exception:
             if not lenient:
