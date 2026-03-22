@@ -364,7 +364,8 @@ class Dataset:
     def __init__(self, elements: List[Element] = None):
         self._elements: Dict[int, Element] = {}
         self._order: List[int] = []
-        
+        self._raw_list: Optional[List[Element]] = None
+
         if elements:
             for e in elements:
                 self._add(e)
@@ -374,7 +375,13 @@ class Dataset:
         self._elements[tag_int] = elem
         if tag_int not in self._order:
             self._order.append(tag_int)
-    
+
+    def _force_append(self, elem: Element) -> None:
+        """Append element without dedup — for crafting malformed datasets."""
+        if self._raw_list is None:
+            self._raw_list = []
+        self._raw_list.append(elem)
+
     def __truediv__(self, other: Element) -> 'Dataset':
         """Scapy-like chaining: ds / element."""
         self._add(other)
@@ -441,12 +448,17 @@ class Dataset:
     def encode(self, implicit_vr: bool = False, little_endian: bool = True,
                sort_tags: bool = False) -> bytes:
         """Encode dataset to bytes."""
-        order = sorted(self._order) if sort_tags else self._order
-        
         bio = BytesIO()
+
+        if self._raw_list is not None:
+            for elem in self._raw_list:
+                bio.write(elem.encode(implicit_vr, little_endian))
+            return bio.getvalue()
+
+        order = sorted(self._order) if sort_tags else self._order
         for tag_int in order:
             bio.write(self._elements[tag_int].encode(implicit_vr, little_endian))
-        
+
         return bio.getvalue()
     
     def __bytes__(self) -> bytes:

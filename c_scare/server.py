@@ -118,7 +118,7 @@ PDU_ABORT = 0x07
 def _try_parse_scapy(pdu_bytes: bytes):
     """Try to parse PDU with Scapy. Returns packet or None."""
     try:
-        from ..scapy_dicom import DICOM
+        from .scapy_dicom import DICOM
         return DICOM(pdu_bytes)
     except Exception:
         return None
