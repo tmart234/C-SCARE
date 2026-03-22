@@ -20,7 +20,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 __all__ = [
     'Element', 'Dataset', 'Sequence', 'VR', 'Tag',
-    'hexdump', 'parse', 'parse_element',
+    'hexdump',
 ]
 
 
@@ -87,31 +87,14 @@ class Tag:
 # =============================================================================
 
 class VR:
-    """DICOM Value Representations."""
-    
-    # VRs that use 4-byte length in explicit VR encoding
+    """DICOM Value Representations — kept minimal for the encoder."""
+
+    # VRs that use 4-byte length in explicit VR encoding (PS3.5 Section 7.1.2)
     LONG_LENGTH = {'OB', 'OD', 'OF', 'OL', 'OW', 'SQ', 'UC', 'UN', 'UR', 'UT', 'OV', 'SV', 'UV'}
-    
-    # All standard VRs
-    ALL = {
-        'AE', 'AS', 'AT', 'CS', 'DA', 'DS', 'DT', 'FL', 'FD', 'IS', 'LO', 'LT',
-        'OB', 'OD', 'OF', 'OL', 'OV', 'OW', 'PN', 'SH', 'SL', 'SQ', 'SS', 'ST',
-        'SV', 'TM', 'UC', 'UI', 'UL', 'UN', 'UR', 'US', 'UT', 'UV',
-    }
-    
-    # Numeric VRs with their struct formats
-    NUMERIC = {
-        'SS': ('<h', 2), 'US': ('<H', 2), 'SL': ('<i', 4), 'UL': ('<I', 4),
-        'SV': ('<q', 8), 'UV': ('<Q', 8), 'FL': ('<f', 4), 'FD': ('<d', 8),
-    }
-    
+
     @classmethod
     def uses_long_length(cls, vr: str) -> bool:
         return vr.upper() in cls.LONG_LENGTH
-    
-    @classmethod
-    def is_valid(cls, vr: str) -> bool:
-        return vr.upper() in cls.ALL
 
 
 # =============================================================================
@@ -250,22 +233,15 @@ class Element:
             return self.value
         elif isinstance(self.value, str):
             return self.value.encode('ascii', errors='replace')
-        elif isinstance(self.value, int):
+        elif isinstance(self.value, (int, float)):
             vr_upper = self.vr.upper()
-            if vr_upper in VR.NUMERIC:
-                fmt, _ = VR.NUMERIC[vr_upper]
-                if not little_endian:
-                    fmt = '>' + fmt[1:]
-                return struct.pack(fmt, self.value)
-            return str(self.value).encode('ascii')
-        elif isinstance(self.value, float):
-            vr_upper = self.vr.upper()
-            if vr_upper == 'FL':
-                fmt = '<f' if little_endian else '>f'
-                return struct.pack(fmt, self.value)
-            elif vr_upper == 'FD':
-                fmt = '<d' if little_endian else '>d'
-                return struct.pack(fmt, self.value)
+            _NUMERIC_FMT = {
+                'SS': 'h', 'US': 'H', 'SL': 'i', 'UL': 'I',
+                'SV': 'q', 'UV': 'Q', 'FL': 'f', 'FD': 'd',
+            }
+            if vr_upper in _NUMERIC_FMT:
+                endian = '<' if little_endian else '>'
+                return struct.pack(endian + _NUMERIC_FMT[vr_upper], self.value)
             return str(self.value).encode('ascii')
         elif self.value is None:
             return b''
@@ -551,93 +527,6 @@ class Sequence:
             bio.write(b'\x00\x00\x00\x00')
         
         return bio.getvalue()
-
-
-# =============================================================================
-# Parsing
-# =============================================================================
-
-def parse_element(data: bytes, pos: int, implicit_vr: bool = False,
-                  little_endian: bool = True) -> Tuple[Optional[Element], int]:
-    """Parse single element. Returns (element, bytes_consumed)."""
-    start = pos
-    
-    if len(data) < pos + 4:
-        return None, 0
-    
-    # Tag
-    fmt = '<HH' if little_endian else '>HH'
-    group, element = struct.unpack(fmt, data[pos:pos+4])
-    pos += 4
-    
-    # Special tags (items, delimiters)
-    if group == 0xFFFE:
-        if len(data) < pos + 4:
-            return None, pos - start
-        fmt = '<I' if little_endian else '>I'
-        length = struct.unpack(fmt, data[pos:pos+4])[0]
-        pos += 4
-        if length != 0xFFFFFFFF and length > 0:
-            pos += min(length, len(data) - pos)
-        return None, pos - start
-    
-    if implicit_vr:
-        if len(data) < pos + 4:
-            return None, pos - start
-        fmt = '<I' if little_endian else '>I'
-        length = struct.unpack(fmt, data[pos:pos+4])[0]
-        pos += 4
-        vr = 'UN'
-    else:
-        if len(data) < pos + 4:
-            return None, pos - start
-        vr = data[pos:pos+2].decode('ascii', errors='replace')
-        pos += 2
-        
-        if VR.uses_long_length(vr):
-            if len(data) < pos + 6:
-                return None, pos - start
-            pos += 2  # Reserved
-            fmt = '<I' if little_endian else '>I'
-            length = struct.unpack(fmt, data[pos:pos+4])[0]
-            pos += 4
-        else:
-            fmt = '<H' if little_endian else '>H'
-            length = struct.unpack(fmt, data[pos:pos+2])[0]
-            pos += 2
-    
-    # Value
-    if length == 0xFFFFFFFF:
-        value = b''  # Undefined length - would need delimiter parsing
-    else:
-        end = min(pos + length, len(data))
-        value = data[pos:end]
-        pos = end
-    
-    return Element(group, element, vr, value), pos - start
-
-
-def parse(data: bytes, implicit_vr: bool = False, little_endian: bool = True,
-          lenient: bool = True) -> Dataset:
-    """Parse bytes into Dataset."""
-    ds = Dataset()
-    pos = 0
-    
-    while pos < len(data) - 4:
-        try:
-            elem, consumed = parse_element(data, pos, implicit_vr, little_endian)
-            if elem:
-                ds._add(elem)
-            if consumed == 0:
-                break
-            pos += consumed
-        except Exception:
-            if lenient:
-                pos += 1
-            else:
-                raise
-    
-    return ds
 
 
 # =============================================================================
