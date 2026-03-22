@@ -4,11 +4,81 @@ This document provides byte-level structure of DICOM files and network PDUs for 
 
 ## Table of Contents
 
-1. [File Structure (Part 10)](#file-structure-part-10)
-2. [Data Element Encoding](#data-element-encoding)
-3. [Network PDU Structure](#network-pdu-structure)
-4. [DIMSE Message Structure](#dimse-message-structure)
-5. [State Machine Reference](#state-machine-reference)
+1. [C-SCARE Tool Mapping](#c-scare-tool-mapping)
+2. [File Structure (Part 10)](#file-structure-part-10)
+3. [Data Element Encoding](#data-element-encoding)
+4. [Network PDU Structure](#network-pdu-structure)
+5. [DIMSE Message Structure](#dimse-message-structure)
+6. [State Machine Reference](#state-machine-reference)
+
+---
+
+## C-SCARE Tool Mapping
+
+Each layer of the DICOM stack has corresponding C-SCARE modules for testing:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                              C-Scare Framework                                      │
+├──────────────────────────────────┬──────────────────────────────────────────────────┤
+│         DICOM STACK              │              C-SCARE TOOLS                       │
+├──────────────────────────────────┼──────────────────────────────────────────────────┤
+│                                  │                                                  │
+│  Application Layer               │  attacks.py (LogicAttacks)                       │
+│    IOD constraints               │    SOP class mismatch, transfer syntax mismatch  │
+│    SOP Class semantics           │    SSRF via URI, file:// injection               │
+│                                  │                                                  │
+├──────────────────────────────────┼──────────────────────────────────────────────────┤
+│                                  │                                                  │
+│  Dataset Layer                   │  element.py    ─ Element.raw() byte control      │
+│    Elements, Sequences, Values   │  corruptor.py  ─ pydicom surgical corruption     │
+│    Part 10 Files, Pixel Data     │  file.py       ─ Part 10 file handling           │
+│                                  │  pixel.py      ─ Encapsulated/fragment attacks   │
+│                                  │  attacks.py (ParserAttacks, MemoryAttacks)       │
+│                                  │    VR fuzzing, length overflow, sequence bombs   │
+│                                  │    Buffer overflow, fragment bombs, LUT attacks  │
+│                                  │                                                  │
+├──────────────────────────────────┼──────────────────────────────────────────────────┤
+│                                  │                                                  │
+│  DIMSE Layer                     │  scapy_dicom.py (DIMSE packets)                  │
+│    C-STORE, C-FIND, C-ECHO       │    C_ECHO_RQ, C_STORE_RQ, C_FIND_RQ, C_MOVE_RQ   │
+│    Command + Data                │    C_STORE_RQ_Fuzz ─ explicit group_length       │
+│                                  │    fuzz() for automatic field mutation           │
+│                                  │                                                  │
+├──────────────────────────────────┼──────────────────────────────────────────────────┤
+│                                  │                                                  │
+│  PDU Layer                       │  scapy_dicom.py (PDU packets)                    │
+│    A-ASSOCIATE-RQ/AC/RJ          │    A_ASSOCIATE_RQ, A_ASSOCIATE_AC, A_ABORT       │
+│    P-DATA-TF, A-RELEASE          │    P_DATA_TF, A_RELEASE_RQ/RP                    │
+│    A-ABORT                       │  attacks.py (ProtocolAttacks, StateMachineAttacks)│
+│                                  │    PDU malformation, AE title fuzzing            │
+│                                  │    State violations (Sta1-Sta13)                 │
+│                                  │                                                  │
+├──────────────────────────────────┼──────────────────────────────────────────────────┤
+│                                  │                                                  │
+│  Transport Layer                 │  scapy_dicom.py (DICOMSocket)                    │
+│    TCP segments                  │    Client with full Scapy integration            │
+│                                  │  server.py (RawSCP)                              │
+│                                  │    Rogue server for fuzzing DICOM clients        │
+│                                  │    State machine hooks, response injection       │
+│                                  │                                                  │
+└──────────────────────────────────┴──────────────────────────────────────────────────┘
+```
+
+Quick reference for which tool to use:
+
+| Target                          | Module              | Class / Function                        |
+|---------------------------------|---------------------|-----------------------------------------|
+| File preamble / meta header     | `file.py`           | `DicomFile`, `FileMetaInformation`       |
+| Data element VR / length / value| `element.py`        | `Element.raw()`, `Dataset`              |
+| Existing DICOM file corruption  | `corruptor.py`      | `Corruptor`                             |
+| Encapsulated pixel data         | `pixel.py`          | `EncapsulatedPixelData`, `PixelFuzzer`  |
+| Association negotiation         | `scapy_dicom.py`    | `A_ASSOCIATE_RQ`, `DICOMSocket`         |
+| DIMSE commands                  | `scapy_dicom.py`    | `C_ECHO_RQ`, `C_STORE_RQ`, `N_GET_RQ`  |
+| State machine violations        | `attacks.py`        | `StateMachineAttacks`                   |
+| Client-side fuzzing             | `server.py`         | `RawSCP`                                |
+| CVE reproductions               | `attacks.py`        | `CVEAttacks`                            |
+| Corpus generation               | `attacks.py`        | `ParserAttacks.generate_corpus()`       |
 
 ---
 
