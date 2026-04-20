@@ -23,6 +23,7 @@ Examples:
 import sys
 import os
 import argparse
+import time
 from typing import List, Optional
 import tempfile
 
@@ -34,6 +35,11 @@ try:
         SCAPY_AVAILABLE
     )
     from . import deliver
+    from .monitor import (
+        BaseMonitor, MonitorReport, SanitizerMonitor,
+        ProtocolMonitor, ProcessMonitor,
+    )
+    from .process_manager import InstrumentedProcess
 except ImportError:
     from attacks import (
         ParserAttacks, ProtocolAttacks, MemoryAttacks, LogicAttacks,
@@ -41,8 +47,15 @@ except ImportError:
         SCAPY_AVAILABLE
     )
     import deliver
+    from monitor import (
+        BaseMonitor, MonitorReport, SanitizerMonitor,
+        ProtocolMonitor, ProcessMonitor,
+    )
+    from process_manager import InstrumentedProcess
 
 __all__ = ['main', 'run_command', 'write_sarif']
+
+SANITIZER_FLUSH_DELAY = 0.3
 
 
 def _collect_results(args, results: list):
@@ -50,6 +63,51 @@ def _collect_results(args, results: list):
     collector = getattr(args, 'result_collector', None)
     if collector is not None:
         collector.extend(results)
+
+
+def _get_monitors(args):
+    """Get active monitors based on CLI args."""
+    return getattr(args, '_monitors', [])
+
+
+def _get_process(args):
+    """Get managed process if one was started."""
+    return getattr(args, '_managed_process', None)
+
+
+def _run_monitored_test(args, result: AttackResult, target, timeout: float):
+    """Send a payload and check all monitors for findings."""
+    monitors = _get_monitors(args)
+    if not monitors:
+        return
+
+    for i, monitor in enumerate(monitors):
+        monitor.pre_test(i)
+
+    response = deliver.send_pdu(target, result.payload, timeout=timeout)
+    result.response = response
+
+    error = None
+    if response is None:
+        error = 'timeout'
+
+    for monitor in monitors:
+        if isinstance(monitor, ProtocolMonitor):
+            monitor.set_response(response, error=error)
+
+    if any(isinstance(m, SanitizerMonitor) for m in monitors):
+        time.sleep(SANITIZER_FLUSH_DELAY)
+
+    for monitor in monitors:
+        report = monitor.post_test()
+        result.monitor_reports.append(report)
+        if report.detected:
+            result.success = True
+
+    proc = _get_process(args)
+    if proc and not proc.is_alive():
+        proc.restart()
+        time.sleep(0.5)
 
 
 def write_sarif(results: list, filepath: str):
@@ -87,6 +145,16 @@ def write_sarif(results: list, filepath: str):
         }
         if r.cve:
             result_obj["properties"]["cve"] = r.cve
+        detections = [rpt for rpt in r.monitor_reports if rpt.detected]
+        if detections:
+            result_obj["properties"]["monitors"] = [
+                {
+                    "finding_type": rpt.finding_type,
+                    "description": rpt.description,
+                    "evidence": rpt.evidence,
+                }
+                for rpt in detections
+            ]
         sarif_results.append(result_obj)
 
     sarif = {
@@ -126,10 +194,16 @@ def print_banner():
 
 def print_result(result: AttackResult, verbose: bool = False):
     """Print an attack result."""
-    status = "✓" if result.success is not False else "✗"
+    status = "✓" if result.success is True else ("✗" if result.success is False else "?")
     cve_tag = f" [{result.cve}]" if result.cve else ""
-    
-    print(f"{status} {result.name}{cve_tag}")
+
+    detections = [r for r in result.monitor_reports if r.detected]
+    if detections:
+        detection_str = f" → {detections[0].finding_type}"
+    else:
+        detection_str = ""
+
+    print(f"{status} {result.name}{cve_tag}{detection_str}")
     if verbose:
         print(f"  Category: {result.category}")
         print(f"  Description: {result.description}")
@@ -139,6 +213,12 @@ def print_result(result: AttackResult, verbose: bool = False):
         print(f"  Payload size: {len(result.payload)} bytes")
         if result.response:
             print(f"  Response size: {len(result.response)} bytes")
+        for report in result.monitor_reports:
+            if report.detected:
+                print(f"  Monitor: {report.finding_type} - {report.description}")
+                if report.evidence:
+                    for line in report.evidence.split('\n')[:5]:
+                        print(f"    {line}")
         print()
 
 
@@ -147,7 +227,8 @@ def run_cve_attacks(args) -> int:
     print("\n=== CVE Attack Patterns ===\n")
 
     all_results = []
-    for result in CVEAttacks.all():
+    for i, result in enumerate(CVEAttacks.all()):
+        _maybe_deliver(args, result, i)
         print_result(result, args.verbose)
         all_results.append(result)
 
@@ -299,30 +380,47 @@ def run_protocol_fuzzing(args) -> int:
 
     try:
         interesting_count = 0
+        monitors = _get_monitors(args)
+        all_results = []
+
         for i, result in enumerate(ProtocolFuzzer.fuzz_association(count=args.count)):
             if not result.payload:
                 print(f"✗ #{i+1}: {result.description}")
                 continue
 
-            response = deliver.send_pdu(target, result.payload, timeout=args.timeout)
-            interesting = (
-                response is None or
-                len(response) == 0 or
-                (response and response[0] not in (0x02, 0x03, 0x07))
-            )
-            status = "!" if interesting else "✓"
-            print(f"{status} #{i+1}: {result.name}")
+            if monitors:
+                _run_monitored_test(args, result, target, args.timeout)
+                detected = any(r.detected for r in result.monitor_reports)
+                status = "!" if detected else "✓"
+                print(f"{status} #{i+1}: {result.name}")
+                if detected:
+                    interesting_count += 1
+                    if args.verbose:
+                        for report in result.monitor_reports:
+                            if report.detected:
+                                print(f"  Monitor: {report.finding_type} - {report.description}")
+            else:
+                response = deliver.send_pdu(target, result.payload, timeout=args.timeout)
+                interesting = (
+                    response is None or
+                    len(response) == 0 or
+                    (response and response[0] not in (0x02, 0x03, 0x07))
+                )
+                status = "!" if interesting else "✓"
+                print(f"{status} #{i+1}: {result.name}")
+                if interesting:
+                    interesting_count += 1
+                    if args.verbose:
+                        print(f"  Mutation: {result.metadata.get('mutation')}")
+                        if response:
+                            print(f"  Response: {len(response)} bytes")
+                        else:
+                            print(f"  Response: None (timeout or connection closed)")
 
-            if interesting:
-                interesting_count += 1
-                if args.verbose:
-                    print(f"  Mutation: {result.metadata.get('mutation')}")
-                    if response:
-                        print(f"  Response: {len(response)} bytes")
-                    else:
-                        print(f"  Response: None (timeout or connection closed)")
+            all_results.append(result)
 
         print(f"\nInteresting results: {interesting_count}/{args.count}")
+        _collect_results(args, all_results)
 
     except Exception as e:
         print(f"ERROR: Fuzzing failed: {e}")
@@ -388,13 +486,27 @@ def run_generate_corpus(args) -> int:
     return 0
 
 
+def _maybe_deliver(args, result: AttackResult, index: int):
+    """If monitors are active, deliver the payload and run monitors."""
+    monitors = _get_monitors(args)
+    if not monitors:
+        return
+    try:
+        host, port = args.target.rsplit(':', 1)
+        target = (host, int(port))
+    except (ValueError, AttributeError):
+        return
+    _run_monitored_test(args, result, target, args.timeout)
+
+
 def run_parser_attacks(args) -> int:
     """Run parser attack tests."""
     print("\n=== Parser Attacks ===\n")
 
     results = []
-    for result in ParserAttacks.all():
+    for i, result in enumerate(ParserAttacks.all()):
         try:
+            _maybe_deliver(args, result, i)
             print_result(result, args.verbose)
             results.append(result)
         except Exception as e:
@@ -419,8 +531,9 @@ def run_protocol_attacks(args) -> int:
     print("\n=== Protocol Attacks ===\n")
 
     results = []
-    for result in ProtocolAttacks.all():
+    for i, result in enumerate(ProtocolAttacks.all()):
         try:
+            _maybe_deliver(args, result, i)
             print_result(result, args.verbose)
             results.append(result)
         except Exception as e:
@@ -444,8 +557,9 @@ def run_logic_attacks(args) -> int:
     print("\n=== Logic Attacks ===\n")
 
     results = []
-    for result in LogicAttacks.all():
+    for i, result in enumerate(LogicAttacks.all()):
         try:
+            _maybe_deliver(args, result, i)
             print_result(result, args.verbose)
             results.append(result)
         except Exception as e:
@@ -490,15 +604,38 @@ def run_state_machine_attacks(args) -> int:
     print()
 
     results = []
-    for result in StateMachineAttacks.all():
+    monitors = _get_monitors(args)
+
+    for i, result in enumerate(StateMachineAttacks.all()):
         try:
+            if monitors:
+                for monitor in monitors:
+                    monitor.pre_test(i)
+
             steps = result.metadata.get('steps')
             if steps:
                 responses = deliver.send_sequence(target, steps, timeout=args.timeout)
                 result.response = responses[-1] if responses else None
             else:
                 result.response = deliver.send_pdu(target, result.payload, timeout=args.timeout)
-            result.success = True
+
+            if monitors:
+                for monitor in monitors:
+                    if isinstance(monitor, ProtocolMonitor):
+                        monitor.set_response(result.response)
+                if any(isinstance(m, SanitizerMonitor) for m in monitors):
+                    time.sleep(SANITIZER_FLUSH_DELAY)
+                for monitor in monitors:
+                    report = monitor.post_test()
+                    result.monitor_reports.append(report)
+                    if report.detected:
+                        result.success = True
+                proc = _get_process(args)
+                if proc and not proc.is_alive():
+                    proc.restart()
+                    time.sleep(0.5)
+            else:
+                result.success = True
         except Exception as e:
             result.success = False
             result.description = f'Failed: {e}'
@@ -516,8 +653,9 @@ def run_memory_attacks(args) -> int:
     print("\n=== Memory Attacks ===\n")
 
     results = []
-    for result in MemoryAttacks.all():
+    for i, result in enumerate(MemoryAttacks.all()):
         try:
+            _maybe_deliver(args, result, i)
             print_result(result, args.verbose)
             results.append(result)
         except Exception as e:
@@ -674,13 +812,27 @@ def main(argv: Optional[List[str]] = None):
         metavar='FILE',
         help='Write SARIF v2.1.0 report to file'
     )
-    
+
+    parser.add_argument(
+        '--asan-binary',
+        metavar='PATH',
+        help='Path to ASan-instrumented target binary (e.g., storescp compiled with -fsanitize=address,undefined). '
+             'Enables SanitizerMonitor + ProcessMonitor + ProtocolMonitor for per-test detection.'
+    )
+
+    parser.add_argument(
+        '--asan-port',
+        type=int,
+        default=None,
+        help='Port for ASan-instrumented binary (default: same as --port)'
+    )
+
     args = parser.parse_args(argv)
-    
+
     # Build target string
     args.target = f"{args.ip}:{args.port}"
     args.count = args.live_fuzz_count
-    
+
     # Map category to command
     category_map = {
         'parser': 'parser_attacks',
@@ -693,12 +845,12 @@ def main(argv: Optional[List[str]] = None):
         'live_fuzz': 'protocol_fuzzing',
         'all': 'all',
     }
-    
+
     # Handle corpus generation
     if args.generate_corpus:
         args.output = args.generate_corpus
         return run_command('generate_corpus', args)
-    
+
     # Determine command from category
     if args.category:
         command = category_map.get(args.category, 'all')
@@ -708,17 +860,60 @@ def main(argv: Optional[List[str]] = None):
     # Set up result collector for JUnit XML output
     args.result_collector = []
 
+    # Set up monitors if --asan-binary is specified
+    args._monitors = []
+    args._managed_process = None
+
+    if args.asan_binary:
+        asan_port = args.asan_port or args.port
+        cmd = [args.asan_binary, str(asan_port)]
+        proc = InstrumentedProcess(cmd)
+        proc.start()
+        time.sleep(1.0)
+
+        if not proc.is_alive():
+            log = proc.get_full_log()
+            print(f"ERROR: ASan binary failed to start: {log[:500]}")
+            return 1
+
+        args._managed_process = proc
+        args._monitors = [
+            SanitizerMonitor(proc),
+            ProcessMonitor(proc),
+            ProtocolMonitor(),
+        ]
+        args.target = f"{args.ip}:{asan_port}"
+        print(f"Monitors: SanitizerMonitor, ProcessMonitor, ProtocolMonitor")
+        print(f"Target: {args.target} (ASan-instrumented)")
+        print()
+
     try:
         ret = run_command(command, args)
     except KeyboardInterrupt:
         print("\nInterrupted by user")
-        return 130
+        ret = 130
     except Exception as e:
         print(f"\nERROR: {e}")
         if args.verbose:
             import traceback
             traceback.print_exc()
-        return 1
+        ret = 1
+    finally:
+        if args._managed_process:
+            args._managed_process.stop()
+            for monitor in args._monitors:
+                monitor.teardown()
+
+    # Print monitor summary
+    if args._monitors and args.result_collector:
+        detected_count = sum(
+            1 for r in args.result_collector
+            if any(rpt.detected for rpt in r.monitor_reports)
+        )
+        total = len(args.result_collector)
+        print(f"\n{'='*50}")
+        print(f"Monitor Summary: {detected_count}/{total} tests triggered detections")
+        print(f"{'='*50}")
 
     if args.sarif and args.result_collector:
         write_sarif(args.result_collector, args.sarif)

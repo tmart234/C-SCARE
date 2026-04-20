@@ -271,4 +271,20 @@ __all__ = [
     "STATUS_ERR_UNRECOGNIZED_OPERATION",
     "STATUS_ERR_NO_SUCH_ACTION_TYPE",
     "STATUS_ERR_NOT_AUTHORIZED",
+    # Monitor framework
+    "BaseMonitor",
+    "MonitorReport",
+    "SanitizerMonitor",
+    "ProtocolMonitor",
+    "ProcessMonitor",
+    "InstrumentedProcess",
 ]
+
+from .monitor import (
+    BaseMonitor,
+    MonitorReport,
+    SanitizerMonitor,
+    ProtocolMonitor,
+    ProcessMonitor,
+)
+from .process_manager import InstrumentedProcess
