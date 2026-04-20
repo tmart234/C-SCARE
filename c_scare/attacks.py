@@ -119,7 +119,8 @@ class AttackResult:
     metadata: Dict[str, Any] = field(default_factory=dict)
     response: Optional[bytes] = None
     success: Optional[bool] = None
-    
+    monitor_reports: List[Any] = field(default_factory=list)
+
     @property
     def cve(self) -> Optional[str]:
         """Get CVE reference if present."""
