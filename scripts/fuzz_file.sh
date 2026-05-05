@@ -20,6 +20,7 @@ DCM2PNM="$(find "${BUILD_DIR}" -type f -name dcm2pnm -executable | head -1)"
 if [[ ! -d "${SEEDS_DIR}" || -z "$(ls -A "${SEEDS_DIR}" 2>/dev/null)" ]]; then
     echo "[fuzz_file] generating seed corpus"
     python3 "${REPO_ROOT}/fuzz/harness/gen_file_seeds.py"
+    python3 "${REPO_ROOT}/fuzz/harness/gen_pixel_seeds.py"
 fi
 if [[ ! -f "${DICT_PATH}" ]]; then
     echo "[fuzz_file] building dictionary"
