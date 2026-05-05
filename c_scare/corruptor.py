@@ -245,7 +245,7 @@ class Corruptor:
             tag: Tag as int (0x00100010), tuple ((0x0010, 0x0010)), or Tag
             vr: New VR string (2 characters, need not be valid)
         """
-        self._get_override(Tag(tag).int).vr = vr
+        self._get_override(Tag(tag).as_int).vr = vr
         return self
     
     def set_length(self, tag, length: int) -> 'Corruptor':
@@ -259,7 +259,7 @@ class Corruptor:
             tag: Target tag
             length: Length to encode (0xFFFFFFFF for undefined)
         """
-        self._get_override(Tag(tag).int).length = length
+        self._get_override(Tag(tag).as_int).length = length
         return self
     
     def set_value(self, tag, value: Any) -> 'Corruptor':
@@ -270,7 +270,7 @@ class Corruptor:
             tag: Target tag
             value: New value (string, int, bytes, etc.)
         """
-        self._get_override(Tag(tag).int).value = value
+        self._get_override(Tag(tag).as_int).value = value
         return self
     
     def set_raw_value(self, tag, raw: bytes) -> 'Corruptor':
@@ -283,7 +283,7 @@ class Corruptor:
             tag: Target tag
             raw: Exact bytes to use as value
         """
-        self._get_override(Tag(tag).int).raw_value = raw
+        self._get_override(Tag(tag).as_int).raw_value = raw
         return self
     
     def set_raw_tag(self, tag, raw: bytes) -> 'Corruptor':
@@ -294,7 +294,7 @@ class Corruptor:
             tag: Target tag (identifies which element)
             raw: 4 bytes to use as tag
         """
-        self._get_override(Tag(tag).int).raw_tag = raw
+        self._get_override(Tag(tag).as_int).raw_tag = raw
         return self
     
     def set_raw_vr(self, tag, raw: bytes) -> 'Corruptor':
@@ -305,7 +305,7 @@ class Corruptor:
             tag: Target tag
             raw: 2 bytes to use as VR
         """
-        self._get_override(Tag(tag).int).raw_vr = raw
+        self._get_override(Tag(tag).as_int).raw_vr = raw
         return self
     
     def set_undefined_length(self, tag, undefined: bool = True) -> 'Corruptor':
@@ -316,7 +316,7 @@ class Corruptor:
             tag: Target tag (typically sequence)
             undefined: True for undefined (0xFFFFFFFF), False for defined
         """
-        override = self._get_override(Tag(tag).int)
+        override = self._get_override(Tag(tag).as_int)
         override.force_undefined_length = undefined
         override.force_defined_length = not undefined
         return self
@@ -381,7 +381,7 @@ class Corruptor:
             data: Bytes to inject (can be anything)
         """
         self._injections.append(Injection(
-            InjectionPoint.BEFORE_TAG, Tag(tag).int, data
+            InjectionPoint.BEFORE_TAG, Tag(tag).as_int, data
         ))
         return self
     
@@ -394,7 +394,7 @@ class Corruptor:
             data: Bytes to inject
         """
         self._injections.append(Injection(
-            InjectionPoint.AFTER_TAG, Tag(tag).int, data
+            InjectionPoint.AFTER_TAG, Tag(tag).as_int, data
         ))
         return self
     
@@ -407,13 +407,13 @@ class Corruptor:
             data: Raw bytes to use instead of encoded element
         """
         self._injections.append(Injection(
-            InjectionPoint.REPLACE, Tag(tag).int, data
+            InjectionPoint.REPLACE, Tag(tag).as_int, data
         ))
         return self
     
     def delete(self, tag) -> 'Corruptor':
         """Delete an element."""
-        self._deletions.add(Tag(tag).int)
+        self._deletions.add(Tag(tag).as_int)
         return self
     
     def duplicate(self, tag, position: str = 'end') -> 'Corruptor':
@@ -424,7 +424,7 @@ class Corruptor:
             tag: Tag to duplicate
             position: 'end' (default), 'before', or 'after' the original
         """
-        tag_int = Tag(tag).int
+        tag_int = Tag(tag).as_int
         self._duplicates.append(tag_int)
         self._duplicate_positions[tag_int] = position
         return self
@@ -438,7 +438,7 @@ class Corruptor:
         Args:
             tags: List of tags in desired order
         """
-        self._reorder = [Tag(t).int for t in tags]
+        self._reorder = [Tag(t).as_int for t in tags]
         return self
     
     def append_raw(self, data: bytes) -> 'Corruptor':
@@ -697,7 +697,7 @@ class Corruptor:
     def _encode_element_from_ours(self, elem: Element,
                                    implicit_vr: bool, little_endian: bool) -> bytes:
         """Encode one of our Element objects with overrides."""
-        override = self._overrides.get(elem.tag.int, Override())
+        override = self._overrides.get(elem.tag.as_int, Override())
         
         # Apply overrides to element
         if override.vr:
@@ -722,7 +722,7 @@ class Corruptor:
                 yield (elem.tag.group << 16) | elem.tag.element, elem, True
         elif self._our_ds:
             for elem in self._our_ds:
-                yield elem.tag.int, elem, False
+                yield elem.tag.as_int, elem, False
     
     def encode(self, implicit_vr: bool = None, little_endian: bool = None) -> bytes:
         """

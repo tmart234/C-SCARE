@@ -1,0 +1,9 @@
+[submodule "fuzz/dcmtk"]
+	path = fuzz/dcmtk
+	url = https://github.com/DCMTK/dcmtk.git
+[submodule "fuzz/aflnet"]
+	path = fuzz/aflnet
+	url = https://github.com/aflnet/aflnet.git
+[submodule "fuzz/aflplusplus"]
+	path = fuzz/aflplusplus
+	url = https://github.com/AFLplusplus/AFLplusplus.git
