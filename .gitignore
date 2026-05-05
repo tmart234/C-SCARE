@@ -159,3 +159,11 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 .qodo
+
+# Fuzzing artifacts
+fuzz/build-asan/
+fuzz/out/
+fuzz/seeds/file/*.dcm
+fuzz/seeds/file/PIXEL_SEED.txt
+fuzz/seeds/net/*.raw
+fuzz/seeds/net/SEED.txt
