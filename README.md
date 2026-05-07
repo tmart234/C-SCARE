@@ -152,6 +152,64 @@ scp.start()
 
 See [PROTOCOL.md](PROTOCOL.md) for byte-level DICOM structure (file format, data elements, PDUs, DIMSE commands, state machine).
 
+## DCMTK Fuzzing Toolchain
+
+The `fuzz/` tree and `scripts/` shell harnesses run AFL++ / AFLNet against DCMTK binaries (`dcm2pnm`, `storescp`, `dcmrecv`, `dcmqrscp`). For coverage and campaign reporting see `scripts/coverage.sh` and `scripts/campaign.sh` below.
+
+### Device parity (READ THIS)
+
+The fuzz build must match the device's DCMTK source rev and build flags or the results don't reflect device behaviour. By default `scripts/build_dcmtk.sh` uses the upstream submodule at `fuzz/dcmtk/`. Override these env vars to point at the device build:
+
+| Env var            | Purpose                                                                          |
+|--------------------|----------------------------------------------------------------------------------|
+| `DCMTK_SRC_DIR`    | Absolute path to operator-supplied DCMTK source. Submodule and `DCMTK_REF` ignored when set. |
+| `DCMTK_REF`        | Git ref/tag/SHA to check out inside the submodule. Ignored if `DCMTK_SRC_DIR` set. |
+| `OPT_LEVEL`        | Compiler optimization (default `-O1`). Set to match the device build.            |
+| `EXTRA_CFLAGS`     | Appended to `CFLAGS`/`CXXFLAGS` verbatim — match device defines.                  |
+| `EXTRA_CMAKE_ARGS` | Extra `-D...` CMake args (whitespace-separated) — match device DCMTK feature flags. |
+| `SANITIZERS`       | Comma list: `address,undefined,memory`. Default `address`.                       |
+
+Worked example (matching a hypothetical device build):
+
+```bash
+DCMTK_SRC_DIR=/opt/device-src/dcmtk \
+  OPT_LEVEL=-O2 \
+  EXTRA_CFLAGS="-DCSCARE_DEVICE_PARITY=1" \
+  EXTRA_CMAKE_ARGS="-DDCMTK_WITH_OPENSSL=ON -DDCMTK_ENABLE_LFS=lfs64" \
+  SANITIZERS=address,undefined \
+  scripts/build_dcmtk.sh
+```
+
+Each build writes `fuzz/build-asan/build_manifest.txt` recording DCMTK SHA, compiler version, flags, and AFL fork SHAs. Campaign reports (`scripts/campaign.sh`) embed this manifest in `run.json`.
+
+### Coverage measurement
+
+A separate gcov-instrumented build replays the saturated corpus to produce an lcov HTML report and per-file summary. Vanilla `gcc --coverage` (no AFL, no ASAN) — AFL's forkserver instrumentation collides with `--coverage` flushing.
+
+```bash
+# Install lcov (preferred) or gcovr fallback:
+apt-get install lcov          # primary
+pip install gcovr             # fallback
+
+scripts/build_dcmtk_cov.sh    # builds into fuzz/build-cov/
+scripts/coverage.sh file      # replays fuzz/out/file/{queue,crashes}
+# Report → fuzz/coverage/file/{lcov.info, summary.txt, html/index.html}
+```
+
+`coverage.sh` aborts if the gcov build SHA doesn't match the ASAN build SHA.
+
+### Campaigns + saturation rule
+
+`scripts/campaign.sh <target>` runs a fuzz harness to a documented stop rule and emits `fuzz/runs/<target>/<UTC-timestamp>/run.json` with provenance and metrics for the test report.
+
+| Env var            | Default | Notes                                                          |
+|--------------------|---------|----------------------------------------------------------------|
+| `CAMPAIGN_HOURS`   | 24      | Hard wallclock cap. Sample range 24–72.                        |
+| `SATURATION_HOURS` | 6       | Stop early if no new edges/paths for this long. Effective floor is `max(SATURATION_HOURS, CAMPAIGN_HOURS/10)`. |
+| `POLL_SECONDS`     | 60      | Poll cadence on `fuzzer_stats`.                                 |
+
+Targets: `file` (dcm2pnm), `net-storescp`, `net-dcmrecv`, `net-dcmqrscp`.
+
 ## License
 
 GPL-2.0-only

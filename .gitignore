@@ -162,8 +162,20 @@ cython_debug/
 
 # Fuzzing artifacts
 fuzz/build-asan/
+fuzz/build-cov/
 fuzz/out/
+fuzz/runs/
+fuzz/coverage/
+fuzz/storage/
+fuzz/configs/dcmqrscp.cfg
+fuzz/configs/dcmqrscp.cfg.cov
 fuzz/seeds/file/*.dcm
 fuzz/seeds/file/PIXEL_SEED.txt
 fuzz/seeds/net/*.raw
 fuzz/seeds/net/SEED.txt
+fuzz/seeds/net-storescp/*.raw
+fuzz/seeds/net-storescp/SEED.txt
+fuzz/seeds/net-dcmrecv/*.raw
+fuzz/seeds/net-dcmrecv/SEED.txt
+fuzz/seeds/net-dcmqrscp/*.raw
+fuzz/seeds/net-dcmqrscp/SEED.txt

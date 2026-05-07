@@ -15,8 +15,8 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUILD_DIR="${REPO_ROOT}/fuzz/build-asan"
-SEEDS_DIR="${REPO_ROOT}/fuzz/seeds/net"
-OUT_DIR="${REPO_ROOT}/fuzz/out/net"
+SEEDS_DIR="${REPO_ROOT}/fuzz/seeds/net-storescp"
+OUT_DIR="${REPO_ROOT}/fuzz/out/net-storescp"
 PORT="${DICOM_PORT:-11112}"
 
 # shellcheck disable=SC1091
@@ -25,7 +25,7 @@ source "${REPO_ROOT}/scripts/install_afl.sh"
 STORESCP="$(find "${BUILD_DIR}" -type f -name storescp -executable | head -1)"
 [[ -n "${STORESCP}" ]] || { echo "[fuzz_net] storescp not built"; exit 1; }
 
-if [[ ! -d "${SEEDS_DIR}" || -z "$(ls -A "${SEEDS_DIR}"/*.raw 2>/dev/null)" ]]; then
+if [[ ! -d "${SEEDS_DIR}" || -z "$(find "${SEEDS_DIR}" -maxdepth 1 -name '*.raw' -print -quit 2>/dev/null)" ]]; then
     echo "[fuzz_net] generating network seeds"
     python3 "${REPO_ROOT}/fuzz/harness/seed_serializer.py"
 fi
