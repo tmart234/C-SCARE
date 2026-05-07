@@ -17,37 +17,44 @@ C-SCARE lets you surgically craft malformed DICOM files, datasets, and network t
 ## Architecture
 
 ```mermaid
-graph TD
-    ENGINE["Fuzzing / DAST Engine<br/><b>attacks.py</b>, <b>test_runner.py</b>"]
+flowchart TD
 
-    ENGINE --> PAYLOAD
-    ENGINE --> ENVELOPE
+    USER["Operator / Researcher"]
 
-    subgraph PAYLOAD ["PAYLOAD (Dataset / File)"]
-        direction LR
-        MUT["MUTATION<br/><i>pydicom API</i>"]
-        GEN["GENERATION<br/><i>Scapy Elements</i>"]
+    USER --> ATTACKS
+    USER --> RAW_API
+    USER --> AFL
+
+    ATTACKS["attacks.py<br/>Prebuilt Attack Recipes"]
+
+    subgraph DATA["DICOM Data Manipulation"]
+        ELEMENT["element.py"]
+        CORRUPTOR["corruptor.py"]
+        PIXEL["pixel.py"]
+        FILE["file.py"]
     end
 
-    subgraph ENVELOPE ["THE ENVELOPE (Protocol)"]
-        PGEN["GENERATION<br/><i>Scapy Layers</i>"]
+    subgraph NET["DICOM Networking"]
+        SCAPY["scapy_dicom.py"]
+        SERVER["server.py"]
+        DELIVER["deliver.py"]
     end
 
-    MUT --> REAL["Real DICOM File"]
-    REAL --> COR["<b>corruptor.py</b>"]
-    GEN --> ELEM["<b>element.py</b><br/>Dataset()"]
+    AFL["AFL++ / AFLNet"]
+    RAW_API["Direct Module Usage"]
 
-    PGEN --> SCAPY_PDU["<b>scapy_dicom.py</b><br/>PDUs / DIMSE"]
+    ATTACKS --> DATA
+    ATTACKS --> NET
 
-    COR --> DELIVER
-    ELEM --> DELIVER
-    SCAPY_PDU --> DELIVER
+    ELEMENT --> FILE
+    CORRUPTOR --> FILE
+    PIXEL --> FILE
 
-    subgraph DELIVER ["DELIVERY LAYER"]
-        DEL["<b>deliver.py</b><br/>send_pdu / send_cstore"]
-        SCU["<b>scapy_dicom.py</b><br/>DICOMSocket / SCU"]
-        SCP["<b>server.py</b><br/>RawSCP"]
-    end
+    SCAPY --> DELIVER
+    SERVER --> SCAPY
+
+    FILE --> AFL
+    FILE --> DELIVER
 ```
 
 ## Quick Start
