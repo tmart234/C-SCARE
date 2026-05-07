@@ -19,32 +19,34 @@ C-SCARE lets you surgically craft malformed DICOM files, datasets, and network t
 ```mermaid
 flowchart TD
 
-    USER["Operator / Researcher"]
+    USER[Operator / Researcher]
 
     USER --> ATTACKS
-    USER --> RAW_API
+    USER --> RAWAPI
     USER --> AFL
 
-    ATTACKS["attacks.py<br/>Prebuilt Attack Recipes"]
+    ATTACKS[attacks.py - Prebuilt Attack Recipes]
 
-    subgraph DATA["DICOM Data Manipulation"]
-        ELEMENT["element.py"]
-        CORRUPTOR["corruptor.py"]
-        PIXEL["pixel.py"]
-        FILE["file.py"]
+    subgraph DATA [DICOM Data Manipulation]
+        ELEMENT[element.py]
+        CORRUPTOR[corruptor.py]
+        PIXEL[pixel.py]
+        FILE[file.py]
     end
 
-    subgraph NET["DICOM Networking"]
-        SCAPY["scapy_dicom.py"]
-        SERVER["server.py"]
-        DELIVER["deliver.py"]
+    subgraph NET [DICOM Networking]
+        SCAPY[scapy_dicom.py]
+        SERVER[server.py]
+        DELIVER[deliver.py]
     end
 
-    AFL["AFL++ / AFLNet"]
-    RAW_API["Direct Module Usage"]
+    RAWAPI[Direct Module Usage]
+    AFL[AFL++ / AFLNet]
 
-    ATTACKS --> DATA
-    ATTACKS --> NET
+    ATTACKS --> ELEMENT
+    ATTACKS --> CORRUPTOR
+    ATTACKS --> PIXEL
+    ATTACKS --> SCAPY
 
     ELEMENT --> FILE
     CORRUPTOR --> FILE
