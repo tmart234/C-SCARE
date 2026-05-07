@@ -1,0 +1,21 @@
+# DCMTK dcmqrscp config — fuzzing template.
+# @REPO_ROOT@ is substituted by scripts/fuzz_dcmqrscp.sh at launch time.
+#
+# Fields:
+#   NetworkType, NetworkTCPPort, MaxPDUSize, MaxAssociations
+#
+# Service Class providers
+NetworkTCPPort  = 11114
+MaxPDUSize      = 16384
+MaxAssociations = 4
+
+HostTable BEGIN
+caller    = (C-SCARE-FZ, 127.0.0.1, 11112)
+HostTable END
+
+VendorTable BEGIN
+VendorTable END
+
+AETable BEGIN
+DCMQRSCP    @REPO_ROOT@/fuzz/storage/dcmqrscp    RW (50, 1024mb)    caller
+AETable END
