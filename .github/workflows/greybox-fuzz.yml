@@ -1,9 +1,11 @@
 name: Grey-box fuzz smoke (DCMTK + AFL)
 
-# The grey-box quadrant: build DCMTK instrumented with AFL + ASan and run
-# scripts/smoke.sh (valid-baseline parse, ASan-instrumentation check, and a
-# ~60s afl-fuzz forkserver run). The DCMTK + AFL build takes ~20-40 min, so
-# this runs nightly and on demand rather than on every PR.
+# The grey-box quadrant. Two jobs, both heavy, so this runs nightly and on
+# demand rather than per-PR:
+#   greybox-smoke - build DCMTK 3.6.7 instrumented with AFL + ASan, then run
+#                   scripts/smoke.sh. The fastest-fuzzing path.
+#   qemu-smoke    - fuzz the *prebuilt* (apt) DCMTK 3.6.7 via AFL++ QEMU mode,
+#                   proving the no-recompilation path works.
 on:
   schedule:
     - cron: '0 3 * * *'
@@ -11,6 +13,7 @@ on:
 
 jobs:
   greybox-smoke:
+    name: Instrumented build (DCMTK 3.6.7 + AFL + ASan)
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -19,10 +22,16 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install build dependencies
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake zlib1g-dev clang llvm-dev
+          python -m pip install --upgrade pip
+          pip install -e .
 
       - name: Build DCMTK under AFL + ASan
         run: bash scripts/build_dcmtk.sh
@@ -37,3 +46,48 @@ jobs:
           name: greybox-build-manifest
           path: fuzz/build-asan/build_manifest.txt
           if-no-files-found: ignore
+
+  qemu-smoke:
+    name: QEMU mode - fuzz prebuilt DCMTK 3.6.7 (no recompile)
+    runs-on: ubuntu-24.04   # apt dcmtk on 24.04 is 3.6.7
+    timeout-minutes: 75
+    steps:
+      - name: Checkout repository (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install DCMTK 3.6.7 (apt) and AFL/QEMU build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dcmtk build-essential clang llvm-dev \
+            libglib2.0-dev ninja-build flex bison libtool libtool-bin \
+            automake pkg-config
+          python -m pip install --upgrade pip
+          pip install -e .
+          echo "DCMTK version:"; dcm2pnm --version | head -2
+
+      - name: Build AFL++ and QEMU mode
+        run: |
+          source scripts/install_afl.sh
+          ( cd fuzz/aflplusplus/qemu_mode && ./build_qemu_support.sh )
+
+      - name: QEMU-mode fuzz the prebuilt dcm2pnm (~4 min, no recompilation)
+        run: |
+          DCM2PNM="$(command -v dcm2pnm)"
+          echo "QEMU-mode fuzzing: ${DCM2PNM}"
+          timeout --signal=TERM 240 bash scripts/fuzz_qemu.sh \
+            "${DCM2PNM}" @@ /tmp/out.pnm || true
+          stats="fuzz/out/qemu/default/fuzzer_stats"
+          [[ -f "${stats}" ]] || stats="fuzz/out/qemu/fuzzer_stats"
+          if [[ -f "${stats}" ]]; then
+            echo "=== fuzzer_stats ==="
+            cat "${stats}"
+          else
+            echo "::error::QEMU-mode run produced no fuzzer_stats"
+            exit 1
+          fi

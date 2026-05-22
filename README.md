@@ -210,8 +210,10 @@ Grey-box targets (`scripts/campaign.sh <target>` / `c-scare greybox run <target>
 
 The harnesses default to DCMTK's stock tools, but the framework targets any DICOM binary:
 
-- **Black-box** — point `c-scare --ip … --port …` (DAST) or `c-scare rogue` at your live service. No build access or instrumentation needed; works against a real device or a container.
-- **Grey-box** — coverage-guided fuzzing needs the target *instrumented*, so it cannot run from a stock container image. Build your binary with the AFL compiler wrappers (`$AFLPP_PATH/afl-clang-fast` or `afl-gcc` — see `scripts/install_afl.sh`).
+- **Black-box** — point `c-scare --ip … --port …` (DAST) or `c-scare rogue` at your live service. No build access or instrumentation needed; works against a real device, a container, or a vendor-prebuilt binary.
+- **Grey-box** — coverage-guided fuzzing needs the target instrumented. Two ways to get that:
+  - *Recompiled instrumentation (fast)* — build your binary **and its `.so` dependencies** with the AFL compiler wrappers (`$AFLPP_PATH/afl-clang-fast` or `afl-gcc`, see `scripts/install_afl.sh`). Fastest fuzzing; requires source/build access.
+  - *QEMU mode (no recompile)* — `scripts/fuzz_qemu.sh <binary> [args…]` runs `afl-fuzz -Q`, instrumenting at runtime. It fuzzes vendor-prebuilt binaries — the official DCMTK 3.6.7 release, or your own `.so`-backed binaries — with **no recompilation**, ~2-5× slower. Use this when rebuilding the target is impractical.
   - *File / parser path*: if your binary has no standalone file mode, copy `fuzz/harness/parse_harness.c`, wire in your parse entry point, and fuzz it with AFL++.
   - *Network path*: AFLNet's `-P DICOM` parser drives any DICOM listener — adapt `scripts/fuzz_net.sh` to your binary's launch command.
 
@@ -222,7 +224,7 @@ The fuzz build must match the device's DCMTK source rev and build flags or the r
 | Env var            | Purpose                                                                          |
 |--------------------|----------------------------------------------------------------------------------|
 | `DCMTK_SRC_DIR`    | Absolute path to operator-supplied DCMTK source. Submodule and `DCMTK_REF` ignored when set. |
-| `DCMTK_REF`        | Git ref/tag/SHA to check out inside the submodule. Ignored if `DCMTK_SRC_DIR` set. |
+| `DCMTK_REF`        | Git ref/tag/SHA inside the submodule. Default `DCMTK-3.6.7`. Ignored if `DCMTK_SRC_DIR` set. |
 | `OPT_LEVEL`        | Compiler optimization (default `-O1`). Set to match the device build.            |
 | `EXTRA_CFLAGS`     | Appended to `CFLAGS`/`CXXFLAGS` verbatim — match device defines.                  |
 | `EXTRA_CMAKE_ARGS` | Extra `-D...` CMake args (whitespace-separated) — match device DCMTK feature flags. |
