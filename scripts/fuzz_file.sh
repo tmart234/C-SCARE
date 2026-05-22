@@ -42,9 +42,24 @@ else
     echo "[fuzz_file] starting fresh campaign in ${OUT_DIR}"
 fi
 
+# SAND mode (scripts/build_dcmtk.sh SAND=1): when sanitizer-worker trees
+# exist under fuzz/build-san-*/, route suspicious inputs to them via -w —
+# DCM2PNM is then the fast native loop binary. No workers → the plain
+# single-binary loop, unchanged. See https://aflplus.plus/docs/sand/.
+SAND_ARGS=()
+for wdir in "${REPO_ROOT}"/fuzz/build-san-*/; do
+    [[ -d "${wdir}" ]] || continue
+    worker="$(find "${wdir}" -type f -name dcm2pnm -executable | head -1)"
+    if [[ -n "${worker}" ]]; then
+        SAND_ARGS+=(-w "${worker}")
+        echo "[fuzz_file] SAND worker: ${worker}"
+    fi
+done
+
 exec "${AFLPP_PATH}/afl-fuzz" \
     -i "${INPUT_ARG}" \
     -o "${OUT_DIR}" \
     -x "${DICT_PATH}" \
     -m none \
+    "${SAND_ARGS[@]}" \
     -- "${DCM2PNM}" @@ /tmp/cscare-fuzz-out.pnm

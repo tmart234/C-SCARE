@@ -10,22 +10,49 @@ is the thin bridge between those engines and C-SCARE's reporting layer:
   * list_crashes() - enumerate an AFL/AFLNet crashes directory
   * list_queue()   - enumerate the queue (leak-class bugs land here, not in
                      crashes/, because a leak is not a crash)
-  * triage()       - replay each input through an instrumented binary and
-                     parse the sanitizer output (ASan / UBSan / LSan) into
-                     structured findings
+  * triage()       - replay each input through one or more sanitizer
+                     binaries and parse the output (ASan / UBSan / LSan /
+                     MSan) into structured findings. File targets replay
+                     the input as a file argument; AFLNet network targets
+                     replay it at a freshly launched instrumented server
+                     with aflnet-replay (net_target=...)
 
 The fuzzing itself is run via scripts/ (see scripts/campaign.sh). This
 module turns the resulting crashes into triaged, reportable findings.
+
+SAND alignment (https://aflplus.plus/docs/sand/): SAND decouples
+sanitization from the fuzz loop - the loop drives a fast native binary and
+only suspicious inputs reach the sanitizer-instrumented worker binaries.
+The triage pass here *is* that worker stage: it replays crash/queue inputs
+through the sanitizer worker(s) to obtain a verdict. scripts/build_dcmtk.sh
+with SAND=1 builds one worker per sanitizer under fuzz/build-san-<san>/;
+find_san_workers() discovers them and triage() replays an input through
+every worker so an ASan + UBSan (+ MSan) campaign is triaged in one pass.
+
+Network triage: an AFLNet input is a serialized DICOM message stream, not
+a file - it cannot be replayed as a binary argument. triage(net_target=...)
+launches a fresh instrumented server per input, replays the stream at it
+with AFLNet's aflnet-replay, and parses the *server's* own stderr (where
+the sanitizer report lands). A fresh server per input keeps every finding
+attributable to exactly one input.
 
 Leak detection: an AFL campaign runs with detect_leaks=0 (a leak at exit
 is noise mid-loop and clashes with the forkserver). A triage replay is a
 clean one-shot process, so LeakSanitizer's atexit scan works here -
 _triage_env() forces detect_leaks back on. Leak-triggering inputs sit in
-the queue, so pass include_queue=True to surface CVE-class leaks.
+the queue, so pass include_queue=True to surface CVE-class leaks. For
+network targets a leak is reported only if the server runs its atexit
+scan on the triage shutdown signal, so file targets remain the reliable
+path for leak-class bugs.
 """
 
 import os
+import shutil
+import signal
+import socket
 import subprocess
+import tempfile
+import time
 from typing import List, Optional
 
 from .attacks import AttackResult
@@ -35,8 +62,8 @@ from .monitor import (
 )
 
 __all__ = [
-    'TARGETS', 'repo_root', 'run', 'list_crashes', 'list_queue',
-    'triage', 'triage_to_sarif',
+    'TARGETS', 'NET_TARGETS', 'repo_root', 'run', 'list_crashes',
+    'list_queue', 'find_san_workers', 'triage', 'triage_to_sarif',
 ]
 
 # target -> fuzz harness script (mirrors scripts/campaign.sh).
@@ -51,6 +78,10 @@ TARGETS = {
     'net-dcmqrscp': 'fuzz_dcmqrscp.sh',
     'scu': 'fuzz_scu.sh',
 }
+
+# AFLNet network targets — triaged by replaying the input at a launched
+# instrumented server (see triage(net_target=...)), not as a file argument.
+NET_TARGETS = ('net-storescp', 'net-dcmrecv', 'net-dcmqrscp')
 
 
 def repo_root() -> str:
@@ -115,18 +146,63 @@ def list_queue(out_dir: str) -> List[str]:
 
 
 def _triage_env() -> dict:
-    """Process environment for a triage replay.
+    """Process environment for a one-shot triage / SAND-worker replay.
 
-    Forces ``detect_leaks=1`` on: an AFL campaign typically runs with
-    ``detect_leaks=0``, but a triage replay is a clean one-shot process
-    where LeakSanitizer's atexit scan is valid. ASan parses its options
-    last-wins, so appending overrides any inherited ``detect_leaks=0``.
+    A fuzzing campaign tunes the sanitizers for throughput - it sets
+    ``symbolize=0`` (skip the symbolizer) and ``detect_leaks=0`` (a leak at
+    exit clashes with the forkserver). Those settings make a triage report
+    incomplete or unreadable, so override them: a triage replay is a clean
+    one-shot process where the full, symbolized report is exactly the point.
+
+      ASAN_OPTIONS  - detect_leaks=1 (LeakSanitizer's atexit scan is valid
+                      in a one-shot replay) and symbolize=1.
+      UBSAN_OPTIONS - print_stacktrace=1 (UBSan prints no stack trace at
+                      all by default) and symbolize=1.
+      MSAN_OPTIONS  - symbolize=1.
+
+    Sanitizers parse their ``*_OPTIONS`` last-wins, so appending overrides
+    any value inherited from the campaign environment.
     """
     env = dict(os.environ)
-    inherited = env.get('ASAN_OPTIONS', '')
-    forced = 'detect_leaks=1'
-    env['ASAN_OPTIONS'] = f'{inherited}:{forced}' if inherited else forced
+    overrides = {
+        'ASAN_OPTIONS': 'detect_leaks=1:symbolize=1',
+        'UBSAN_OPTIONS': 'print_stacktrace=1:symbolize=1',
+        'MSAN_OPTIONS': 'symbolize=1',
+    }
+    for var, forced in overrides.items():
+        inherited = env.get(var, '')
+        env[var] = f'{inherited}:{forced}' if inherited else forced
     return env
+
+
+def find_san_workers(bin_name: str, repo: Optional[str] = None) -> List[str]:
+    """Return the SAND sanitizer-worker binaries built for ``bin_name``.
+
+    ``scripts/build_dcmtk.sh`` run with ``SAND=1`` builds one worker tree
+    per sanitizer under ``fuzz/build-san-<sanitizer>/`` (forkserver only,
+    no PC instrumentation - see https://aflplus.plus/docs/sand/). This
+    locates the ``bin_name`` executable inside each, sorted by sanitizer,
+    so triage can replay an input through every sanitizer the campaign ran.
+    Returns an empty list when no worker trees exist (non-SAND build).
+    """
+    repo = repo or repo_root()
+    fuzz_dir = os.path.join(repo, 'fuzz')
+    workers: List[str] = []
+    if not os.path.isdir(fuzz_dir):
+        return workers
+    for name in sorted(os.listdir(fuzz_dir)):
+        if not name.startswith('build-san-'):
+            continue
+        build_dir = os.path.join(fuzz_dir, name)
+        if not os.path.isdir(build_dir):
+            continue
+        for root, _dirs, files in os.walk(build_dir):
+            if bin_name in files:
+                path = os.path.join(root, bin_name)
+                if os.access(path, os.X_OK):
+                    workers.append(path)
+                    break
+    return workers
 
 
 def _replay(cmd: List[str], crash_path: str, timeout: float):
@@ -151,18 +227,165 @@ def _replay(cmd: List[str], crash_path: str, timeout: float):
         return None, f'replay failed: {e}'
 
 
+def _free_port() -> int:
+    """Return a currently-free local TCP port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
+
+
+def _wait_port(host: str, port: int, deadline: float) -> bool:
+    """Block until ``host:port`` accepts a connection, or ``deadline`` passes."""
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=0.5):
+                return True
+        except OSError:
+            time.sleep(0.1)
+    return False
+
+
+def _dcmqrscp_config(repo: str):
+    """Render the dcmqrscp config from its template into a throwaway tree.
+
+    Returns ``(config_path, base_dir)``; remove ``base_dir`` to clean up.
+    Mirrors the ``@REPO_ROOT@`` substitution scripts/fuzz_dcmqrscp.sh does,
+    but points storage at a temp tree so triage never writes into the repo.
+    """
+    template = os.path.join(repo, 'fuzz', 'configs', 'dcmqrscp.cfg.template')
+    with open(template, 'r') as fh:
+        body = fh.read()
+    base = tempfile.mkdtemp(prefix='cscare-triage-qr-')
+    os.makedirs(os.path.join(base, 'fuzz', 'storage', 'dcmqrscp'),
+                exist_ok=True)
+    cfg = os.path.join(base, 'dcmqrscp.cfg')
+    with open(cfg, 'w') as fh:
+        fh.write(body.replace('@REPO_ROOT@', base))
+    return cfg, base
+
+
+def _replay_net(server_binary: str, net_target: str, crash_path: str,
+                timeout: float, repo: str):
+    """Triage one AFLNet input against a freshly launched instrumented server.
+
+    Returns ``(returncode, server_output)``. aflnet-replay is only the
+    transport that delivers the recorded DICOM message stream; the verdict
+    is the *server's* own stderr, where the sanitizer report is written.
+    A fresh server per input means a crash is attributable to exactly that
+    input and cannot mask the inputs that follow.
+    """
+    replay_bin = os.path.join(repo, 'fuzz', 'aflnet', 'aflnet-replay')
+    if not os.access(replay_bin, os.X_OK):
+        return None, (f'aflnet-replay not found at {replay_bin} — '
+                      f'run scripts/install_afl.sh')
+    if not (os.path.isfile(server_binary) and os.access(server_binary, os.X_OK)):
+        return None, f'instrumented server not executable: {server_binary}'
+
+    port = _free_port()
+    workdir = tempfile.mkdtemp(prefix='cscare-triage-net-')
+    env = _triage_env()
+    dict_path = os.path.join(repo, 'fuzz', 'dcmtk', 'dcmdata', 'data',
+                             'dicom.dic')
+    if os.path.isfile(dict_path):
+        env['DCMDICTPATH'] = dict_path
+
+    qr_base = None
+    if net_target == 'net-storescp':
+        argv = [server_binary, str(port), '--eostudy-timeout', '1']
+    elif net_target == 'net-dcmrecv':
+        argv = [server_binary, str(port), '--output-directory', workdir,
+                '--eostudy-timeout', '1']
+    elif net_target == 'net-dcmqrscp':
+        try:
+            cfg, qr_base = _dcmqrscp_config(repo)
+        except OSError as e:
+            shutil.rmtree(workdir, ignore_errors=True)
+            return None, f'dcmqrscp config setup failed: {e}'
+        argv = [server_binary, '-c', cfg, str(port)]
+    else:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise ValueError(f'unknown network target {net_target!r}')
+
+    proc = None
+    try:
+        proc = subprocess.Popen(argv, cwd=workdir, env=env,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT)
+        # Wait for the listener; if it never comes up the server likely
+        # exited early — its captured output below explains why.
+        _wait_port('127.0.0.1', port, time.time() + 5.0)
+        try:
+            subprocess.run(
+                [replay_bin, crash_path, 'DICOM', str(port), '127.0.0.1'],
+                capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            pass
+        # Let the server fault / flush its sanitizer report.
+        time.sleep(0.3)
+        crashed = proc.poll() is not None
+        if not crashed:
+            # Survived the replay. SIGINT gives the cleanest shot at an
+            # atexit LeakSanitizer scan; escalate below if it is ignored.
+            proc.send_signal(signal.SIGINT)
+        try:
+            output, _ = proc.communicate(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            output, _ = proc.communicate()
+        decoded = (output or b'').decode('utf-8', errors='replace')
+        # A fault during the replay is the verdict; a shutdown we initiated
+        # is not — only surface an exit status when the server faulted on
+        # its own, so an ignored SIGINT / our SIGKILL is never a "finding".
+        return (proc.returncode if crashed else None), decoded
+    except FileNotFoundError as e:
+        return None, f'replay failed: {e}'
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        shutil.rmtree(workdir, ignore_errors=True)
+        if qr_base:
+            shutil.rmtree(qr_base, ignore_errors=True)
+
+
 def triage(crashes: List[str],
            cmd: Optional[List[str]] = None,
-           timeout: float = 10.0) -> List[AttackResult]:
+           cmds: Optional[List[List[str]]] = None,
+           net_target: Optional[str] = None,
+           timeout: float = 10.0,
+           repo: Optional[str] = None) -> List[AttackResult]:
     """Triage AFL/AFLNet fuzz inputs into ``AttackResult`` findings.
 
     Accepts crash *and* queue inputs (see ``list_crashes`` / ``list_queue``).
-    If ``cmd`` is given (e.g. ``['/build/dcm2pnm', '@@', '/tmp/o.pnm']``)
-    each input is replayed through it and the sanitizer output is parsed
-    into ``MonitorReport`` findings. The replay forces ``detect_leaks=1``,
-    so a one-shot replay also surfaces LeakSanitizer findings. Without
-    ``cmd`` the inputs are only inventoried (no instrumented binary).
+
+    Pass the sanitizer binary to replay through as ``cmd`` (a single command,
+    e.g. ``['/build/dcm2pnm', '@@', '/tmp/o.pnm']``) and/or ``cmds`` (a list
+    of such commands). Every input is replayed through *each* command and the
+    sanitizer output (ASan / UBSan / LSan / MSan) is parsed into
+    ``MonitorReport`` findings - this is how a SAND-style campaign with one
+    worker per sanitizer is triaged in a single pass (see ``find_san_workers``).
+    The replay forces a full one-shot sanitizer report (``_triage_env``), so
+    it also surfaces LeakSanitizer findings. With no command the inputs are
+    only inventoried (no instrumented binary).
+
+    For an AFLNet network target pass ``net_target`` (one of ``NET_TARGETS``):
+    each command's first element is then the instrumented server binary, and
+    every input is replayed at a freshly launched server with aflnet-replay
+    (see ``_replay_net``). ``repo`` locates aflnet-replay / the data
+    dictionary; it defaults to the C-SCARE repository root.
     """
+    if net_target and net_target not in NET_TARGETS:
+        raise ValueError(
+            f'unknown net_target {net_target!r}; choose from {NET_TARGETS}')
+    repo = repo or repo_root()
+
+    workers: List[List[str]] = []
+    if cmd:
+        workers.append(list(cmd))
+    for extra in (cmds or []):
+        if extra:
+            workers.append(list(extra))
+
     results: List[AttackResult] = []
     for crash_path in crashes:
         try:
@@ -182,21 +405,32 @@ def triage(crashes: List[str],
                       'size': len(payload)},
         )
 
-        if cmd:
-            returncode, output = _replay(cmd, crash_path, timeout)
-            findings: List[SanitizerFinding] = parse_sanitizer_output(output)
-            exit_finding = check_exit_code(returncode)
-            if exit_finding:
-                findings.append(exit_finding)
-            for finding in findings:
-                result.monitor_reports.append(MonitorReport(
-                    detected=True,
-                    finding_type=f'{finding.sanitizer}:{finding.error_kind}',
-                    description=finding.summary,
-                    evidence=finding.stack_trace or None,
-                ))
-            result.success = bool(findings)
-            result.metadata['exit_code'] = returncode
+        if workers:
+            exit_codes: List[Optional[int]] = []
+            detected = False
+            for worker in workers:
+                if net_target:
+                    returncode, output = _replay_net(
+                        worker[0], net_target, crash_path, timeout, repo)
+                else:
+                    returncode, output = _replay(worker, crash_path, timeout)
+                exit_codes.append(returncode)
+                findings: List[SanitizerFinding] = \
+                    parse_sanitizer_output(output)
+                exit_finding = check_exit_code(returncode)
+                if exit_finding:
+                    findings.append(exit_finding)
+                for finding in findings:
+                    detected = True
+                    result.monitor_reports.append(MonitorReport(
+                        detected=True,
+                        finding_type=f'{finding.sanitizer}:{finding.error_kind}',
+                        description=finding.summary,
+                        evidence=finding.stack_trace or None,
+                    ))
+            result.success = detected
+            result.metadata['exit_code'] = (
+                exit_codes[0] if len(exit_codes) == 1 else exit_codes)
 
         results.append(result)
     return results
@@ -204,13 +438,18 @@ def triage(crashes: List[str],
 
 def triage_to_sarif(crashes_or_dir,
                      cmd: Optional[List[str]] = None,
+                     cmds: Optional[List[List[str]]] = None,
+                     net_target: Optional[str] = None,
                      sarif_path: Optional[str] = None,
                      timeout: float = 10.0,
-                     include_queue: bool = False) -> List[AttackResult]:
+                     include_queue: bool = False,
+                     repo: Optional[str] = None) -> List[AttackResult]:
     """Triage crashes and optionally write a SARIF v2.1.0 report.
 
     ``crashes_or_dir`` may be an AFL/AFLNet output directory (str) or an
-    explicit list of input file paths.
+    explicit list of input file paths. ``cmd`` / ``cmds`` select the
+    sanitizer worker binary/binaries to replay through; ``net_target``
+    switches to AFLNet server-replay triage (see ``triage``).
 
     With ``include_queue`` and a directory argument, the queue inputs are
     triaged alongside the crashes. This is required to catch leak-class
@@ -224,7 +463,8 @@ def triage_to_sarif(crashes_or_dir,
             crashes += list_queue(crashes_or_dir)
     else:
         crashes = list(crashes_or_dir)
-    results = triage(crashes, cmd=cmd, timeout=timeout)
+    results = triage(crashes, cmd=cmd, cmds=cmds, net_target=net_target,
+                     timeout=timeout, repo=repo)
     if sarif_path:
         from .test_runner import write_sarif
         write_sarif(results, sarif_path)

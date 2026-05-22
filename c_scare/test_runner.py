@@ -886,10 +886,24 @@ def _cmd_greybox(argv: List[str]) -> int:
 
     trp = sub.add_parser('triage', help='triage AFL/AFLNet crashes into SARIF')
     trp.add_argument('crashes', help='AFL/AFLNet output directory or crashes dir')
-    trp.add_argument('--binary',
-                     help='instrumented binary to replay crashes through')
+    trp.add_argument('--binary', action='append', default=[], dest='binaries',
+                     metavar='PATH',
+                     help='instrumented binary to replay crashes through. For '
+                          'file targets: a SAND sanitizer worker (repeat for '
+                          'several sanitizers). For --net: the instrumented '
+                          'DICOM server.')
+    trp.add_argument('--sand', metavar='BINNAME',
+                     help='auto-discover SAND sanitizer-worker binaries named '
+                          'BINNAME under fuzz/build-san-*/ and triage through '
+                          'each (scripts/build_dcmtk.sh SAND=1)')
+    trp.add_argument('--net', metavar='TARGET', choices=greybox.NET_TARGETS,
+                     help='AFLNet network triage: replay each input at a '
+                          'freshly launched instrumented server via '
+                          'aflnet-replay. TARGET ∈ ' +
+                          ', '.join(greybox.NET_TARGETS))
     trp.add_argument('--arg', action='append', default=[], dest='args',
-                     help='binary argument; use @@ for the crash file path')
+                     help='binary argument; use @@ for the crash file path '
+                          '(file targets only)')
     trp.add_argument('--sarif', help='write a SARIF v2.1.0 report here')
     trp.add_argument('--timeout', type=float, default=10.0)
     trp.add_argument('--include-queue', action='store_true',
@@ -900,15 +914,36 @@ def _cmd_greybox(argv: List[str]) -> int:
     if a.gbcmd == 'run':
         return greybox.run(a.target)
 
-    cmd = ([a.binary] + a.args) if a.binary else None
+    if a.net:
+        if not a.binaries:
+            print("ERROR: --net triage needs --binary <instrumented server> "
+                  "(e.g. fuzz/build-net/.../storescp)")
+            return 1
+        if a.sand:
+            print("WARNING: --sand applies to file targets only; "
+                  "ignored for --net")
+        cmds = [[b] for b in a.binaries]
+    else:
+        cmds = [[b] + a.args for b in a.binaries]
+        if a.sand:
+            workers = greybox.find_san_workers(a.sand)
+            if not workers:
+                print(f"WARNING: no SAND workers named '{a.sand}' found under "
+                      f"fuzz/build-san-*/ — run scripts/build_dcmtk.sh "
+                      f"with SAND=1")
+            for w in workers:
+                print(f"SAND worker: {w}")
+            cmds += [[w] + a.args for w in workers]
+        cmds = cmds or None
+
     results = greybox.triage_to_sarif(
-        a.crashes, cmd=cmd, sarif_path=a.sarif, timeout=a.timeout,
-        include_queue=a.include_queue)
+        a.crashes, cmds=cmds, net_target=a.net, sarif_path=a.sarif,
+        timeout=a.timeout, include_queue=a.include_queue)
     detected = sum(1 for r in results if r.success)
     print(f"\nTriaged {len(results)} fuzz input(s); "
           f"{detected} reproduced a sanitizer/crash finding")
     for r in results:
-        mark = '!' if r.success else ('.' if cmd else '?')
+        mark = '!' if r.success else ('.' if cmds else '?')
         print(f"  {mark} {r.name} ({r.metadata.get('size', 0)} bytes)")
         for report in r.monitor_reports:
             print(f"      {report.finding_type}: {report.description}")

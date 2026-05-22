@@ -16,6 +16,8 @@ PORT="${DICOM_PORT:-11113}"
 
 # shellcheck disable=SC1091
 source "${REPO_ROOT}/scripts/install_afl.sh"
+# shellcheck source=scripts/aflnet_common.sh
+source "${REPO_ROOT}/scripts/aflnet_common.sh"
 
 DCMRECV="$(find "${BUILD_DIR}" -type f -name dcmrecv -executable | head -1)"
 [[ -n "${DCMRECV}" ]] || { echo "[fuzz_dcmrecv] dcmrecv not built"; exit 1; }
@@ -41,14 +43,10 @@ fi
 
 # dcmrecv writes received instances under --output-directory. Point it at a
 # scratch dir so AFLNet's per-execution storms don't fill the repo tree.
+# AFLNet options come from scripts/aflnet_common.sh (shared, includes -E).
 exec "${AFL_PATH}/afl-fuzz" \
     -i "${INPUT_ARG}" \
     -o "${OUT_DIR}" \
     -N "tcp://127.0.0.1/${PORT}" \
-    -P DICOM \
-    -D 10000 \
-    -W 30 \
-    -m none \
-    -E \
-    -q 3 \
+    "${AFLNET_FUZZ_OPTS[@]}" \
     -- "${DCMRECV}" "${PORT}" --output-directory "${STORAGE_DIR}" --eostudy-timeout 1

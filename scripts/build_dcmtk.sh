@@ -27,6 +27,17 @@
 #   EXTRA_CMAKE_ARGS — extra CMake -D args (whitespace-separated).
 #   SANITIZERS       — comma list. Recognised: address, undefined, memory.
 #                      Default: address.
+#   SAND             — when set (SAND=1), build the AFL++ file track the
+#                      SAND way (https://aflplus.plus/docs/sand/): the fuzz
+#                      loop drives a native (sanitizer-free) build-llvm for
+#                      speed, and one sanitizer-only worker tree per entry
+#                      in SANITIZERS is built under fuzz/build-san-<san>/
+#                      with AFL_SAN_NO_INST=1 (forkserver, no PC instr).
+#                      scripts/fuzz_file.sh / fuzz_parse.sh route suspicious
+#                      inputs to those workers via afl-fuzz -w; triage
+#                      replays through them (c-scare greybox triage --sand).
+#                      The AFLNet network track has no -w support, so it is
+#                      always built with the sanitizers inline.
 #
 # Each build dir records provenance to build_manifest.txt (consumed by
 # scripts/campaign.sh and scripts/coverage.sh).
@@ -89,19 +100,32 @@ fi
 
 # SANITIZERS → AFL_USE_* env vars. AFL_HARDEN intentionally never set;
 # it's mutually exclusive with the sanitizers. afl-gcc and afl-clang-fast
-# both honour these AFL_USE_* vars, so one set serves both builds.
+# both honour these AFL_USE_* vars.
 SANITIZERS="${SANITIZERS:-address}"
-unset AFL_USE_ASAN AFL_USE_UBSAN AFL_USE_MSAN
-IFS=',' read -ra _SAN <<<"${SANITIZERS}"
-for s in "${_SAN[@]}"; do
+SAND="${SAND:-}"
+declare -a SAN_LIST=()
+IFS=',' read -ra _SAN_RAW <<<"${SANITIZERS}"
+for s in "${_SAN_RAW[@]}"; do
     case "${s// /}" in
-        address)   export AFL_USE_ASAN=1 ;;
-        undefined) export AFL_USE_UBSAN=1 ;;
-        memory)    export AFL_USE_MSAN=1 ;;
+        address|undefined|memory) SAN_LIST+=("${s// /}") ;;
         "")        ;;
         *)         echo "[build_dcmtk] unknown sanitizer '${s}'"; exit 1 ;;
     esac
 done
+
+# Set AFL_USE_* from a sanitizer-name list ($@). Clears all three first, so
+# it can be called repeatedly to retarget each build_track invocation.
+apply_san_env() {
+    unset AFL_USE_ASAN AFL_USE_UBSAN AFL_USE_MSAN
+    local s
+    for s in "$@"; do
+        case "${s}" in
+            address)   export AFL_USE_ASAN=1 ;;
+            undefined) export AFL_USE_UBSAN=1 ;;
+            memory)    export AFL_USE_MSAN=1 ;;
+        esac
+    done
+}
 
 OPT_LEVEL="${OPT_LEVEL:--O1}"
 export CFLAGS="-g ${OPT_LEVEL} -fno-omit-frame-pointer ${EXTRA_CFLAGS:-}"
@@ -150,7 +174,15 @@ write_manifest() {
         echo "cflags=${CFLAGS}"
         echo "cxxflags=${CXXFLAGS}"
         echo "opt_level=${OPT_LEVEL}"
-        echo "sanitizers=${SANITIZERS}"
+        # Effective sanitizers for *this* track, read from the AFL_USE_* env
+        # set just before build_track — accurate for a SAND native build
+        # (none) and per-sanitizer worker trees alike.
+        local eff_san=""
+        [[ -n "${AFL_USE_ASAN:-}" ]]  && eff_san+="address,"
+        [[ -n "${AFL_USE_UBSAN:-}" ]] && eff_san+="undefined,"
+        [[ -n "${AFL_USE_MSAN:-}" ]]  && eff_san+="memory,"
+        echo "sanitizers=${eff_san%,}"
+        echo "afl_san_no_inst=${AFL_SAN_NO_INST:-0}"
         echo "extra_cmake_args=${EXTRA_CMAKE_ARGS:-}"
         if is_git_worktree "${REPO_ROOT}/fuzz/aflnet"; then
             echo "aflnet_sha=$(git -C "${REPO_ROOT}/fuzz/aflnet" rev-parse HEAD)"
@@ -196,12 +228,37 @@ build_track() {
 }
 
 # File / parser / SCU track — AFL++ afl-clang-fast (LLVM mode).
-build_track "${LLVM_BUILD_DIR}" \
-    "${AFLPP_PATH}/afl-clang-fast" "${AFLPP_PATH}/afl-clang-fast++" \
-    "${AFLPP_PATH}" llvm \
-    dcm2pnm dcmdump storescu dcmconv
+if [[ -n "${SAND}" ]]; then
+    echo "[build_dcmtk] SAND mode: native loop binary + ${#SAN_LIST[@]} sanitizer worker tree(s)"
+    # Loop binary: native (no sanitizer), normal PCGUARD instrumentation.
+    apply_san_env
+    unset AFL_SAN_NO_INST
+    build_track "${LLVM_BUILD_DIR}" \
+        "${AFLPP_PATH}/afl-clang-fast" "${AFLPP_PATH}/afl-clang-fast++" \
+        "${AFLPP_PATH}" llvm-native \
+        dcm2pnm dcmdump storescu dcmconv
+    # Worker trees: one per sanitizer, forkserver only (AFL_SAN_NO_INST=1
+    # disables PC instrumentation — the loop binary owns coverage feedback).
+    for san in "${SAN_LIST[@]}"; do
+        apply_san_env "${san}"
+        export AFL_SAN_NO_INST=1
+        build_track "${REPO_ROOT}/fuzz/build-san-${san}" \
+            "${AFLPP_PATH}/afl-clang-fast" "${AFLPP_PATH}/afl-clang-fast++" \
+            "${AFLPP_PATH}" "san-${san}" \
+            dcm2pnm dcmdump storescu
+    done
+    unset AFL_SAN_NO_INST
+else
+    apply_san_env "${SAN_LIST[@]}"
+    build_track "${LLVM_BUILD_DIR}" \
+        "${AFLPP_PATH}/afl-clang-fast" "${AFLPP_PATH}/afl-clang-fast++" \
+        "${AFLPP_PATH}" llvm \
+        dcm2pnm dcmdump storescu dcmconv
+fi
 
-# Network track — AFLNet afl-gcc (afl-as classic instrumentation).
+# Network track — AFLNet afl-gcc (afl-as classic instrumentation). AFLNet
+# has no -w worker support, so the sanitizers stay inline even under SAND.
+apply_san_env "${SAN_LIST[@]}"
 build_track "${NET_BUILD_DIR}" \
     "${AFLNET_PATH}/afl-gcc" "${AFLNET_PATH}/afl-g++" \
     "${AFLNET_PATH}" aflnet \
