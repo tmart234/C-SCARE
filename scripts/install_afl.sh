@@ -47,7 +47,7 @@ fi
 if [[ ! -x "${AFLNET_DIR}/afl-fuzz" ]]; then
     echo "[install_afl] building AFLNet at ${AFLNET_DIR} (pin: ${AFLNET_PIN})"
     pushd "${AFLNET_DIR}" >/dev/null
-    if [[ -d .git ]]; then
+    if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
         current="$(git rev-parse --short HEAD)"
         if [[ "${current}" != "${AFLNET_PIN}"* ]]; then
             echo "[install_afl] WARNING: AFLNet at ${current}, expected ${AFLNET_PIN}"
