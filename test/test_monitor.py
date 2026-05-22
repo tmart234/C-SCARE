@@ -96,6 +96,26 @@ UBSAN_MULTIPLE = """\
 /src/file2.cc:20:5: runtime error: signed integer overflow: -2147483648 - 1
 """
 
+# UBSan prints frames only when UBSAN_OPTIONS=print_stacktrace=1 — which the
+# triage replay forces on (see greybox._triage_env).
+UBSAN_WITH_STACKTRACE = """\
+/src/dcmdata/libsrc/dcvr.cc:123:5: runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int'
+    #0 0x4d1234 in parseVR /src/dcmdata/libsrc/dcvr.cc:123:5
+    #1 0x4d5678 in DcmElement::read /src/dcmdata/libsrc/dcelem.cc:200:7
+    #2 0x4b0000 in main /src/apps/dcmdump.cc:88:3
+"""
+
+# MemorySanitizer reports a WARNING (not an ASan ERROR). SAND can run an
+# MSan worker alongside ASan/UBSan.
+MSAN_USE_OF_UNINIT = """\
+==23456==WARNING: MemorySanitizer: use-of-uninitialized-value
+    #0 0x4e1111 in readPixelData /src/dcmimgle/libsrc/dipixel.cc:301:9
+    #1 0x4e2222 in DicomImage::render /src/dcmimgle/libsrc/dcmimage.cc:88:5
+    #2 0x4b3333 in main /src/apps/dcm2pnm.cc:140:3
+
+SUMMARY: MemorySanitizer: use-of-uninitialized-value /src/dcmimgle/libsrc/dipixel.cc:301:9 in readPixelData
+"""
+
 MIXED_ASAN_UBSAN = """\
 /src/pre.cc:1:1: runtime error: null pointer dereference
 ==12345==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x602000000014
@@ -182,6 +202,25 @@ class TestParseSanitizerOutput:
         types = [f.sanitizer for f in findings]
         assert 'asan' in types
         assert 'ubsan' in types
+
+    def test_ubsan_with_stacktrace(self):
+        findings = parse_sanitizer_output(UBSAN_WITH_STACKTRACE)
+        assert len(findings) == 1
+        f = findings[0]
+        assert f.sanitizer == 'ubsan'
+        assert 'signed integer overflow' in f.error_kind
+        # print_stacktrace=1 frames are captured into the finding.
+        assert 'parseVR' in f.stack_trace
+        assert 'dcelem.cc:200' in f.stack_trace
+
+    def test_msan_use_of_uninitialized(self):
+        findings = parse_sanitizer_output(MSAN_USE_OF_UNINIT)
+        assert len(findings) == 1
+        f = findings[0]
+        assert f.sanitizer == 'msan'
+        assert 'use-of-uninitialized-value' in f.error_kind
+        assert 'readPixelData' in f.stack_trace
+        assert 'dipixel.cc:301' in f.summary
 
     def test_clean_output_no_findings(self):
         findings = parse_sanitizer_output(CLEAN_OUTPUT)

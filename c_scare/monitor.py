@@ -77,6 +77,37 @@ _LSAN_SUMMARY_RE = re.compile(
     re.MULTILINE,
 )
 
+# MemorySanitizer reports use-of-uninitialized-value as a WARNING (not an
+# ASan-style ERROR), so it needs its own header/summary patterns. SAND can
+# run an MSan worker alongside ASan/UBSan, so triage must recognise it.
+_MSAN_BLOCK_RE = re.compile(
+    r'(==\d+==WARNING:\s*MemorySanitizer:.+?)(?=\n\n|\nSUMMARY:|\Z)',
+    re.DOTALL,
+)
+_MSAN_ERROR_RE = re.compile(
+    r'==\d+==WARNING:\s*MemorySanitizer:\s*(.+?)\s*$',
+    re.MULTILINE,
+)
+_MSAN_SUMMARY_RE = re.compile(
+    r'^SUMMARY:\s*MemorySanitizer:\s*(.+)$',
+    re.MULTILINE,
+)
+
+
+def _frames_after(text: str, start: int, limit: int = 800) -> str:
+    """Collect the stack frames immediately following offset ``start``.
+
+    UBSan emits no stack trace unless ``UBSAN_OPTIONS=print_stacktrace=1``;
+    when it does, the ``#N 0x... in ...`` frames follow the ``runtime error:``
+    line. The scan window is cut at the next sanitizer report so a later
+    finding's frames are not attributed to this one.
+    """
+    window = text[start:start + limit]
+    nxt = re.search(r'runtime error:|==\d+==', window)
+    if nxt:
+        window = window[:nxt.start()]
+    return '\n'.join(_ASAN_FRAME_RE.findall(window)[:10])
+
 
 @dataclass
 class SanitizerFinding:
@@ -97,7 +128,7 @@ class MonitorReport:
 
 
 def parse_sanitizer_output(text: str) -> List[SanitizerFinding]:
-    """Parse ASan/UBSan reports from process stderr text."""
+    """Parse ASan/UBSan/LSan/MSan reports from process stderr text."""
     findings: List[SanitizerFinding] = []
 
     for block_match in _ASAN_BLOCK_RE.finditer(text):
@@ -143,6 +174,24 @@ def parse_sanitizer_output(text: str) -> List[SanitizerFinding]:
             stack_trace='\n'.join(frames[:10]),
         ))
 
+    # MemorySanitizer: WARNING block, parsed like an ASan block.
+    for block_match in _MSAN_BLOCK_RE.finditer(text):
+        block = block_match.group(1)
+        error_match = _MSAN_ERROR_RE.search(block)
+        if not error_match:
+            continue
+        error_kind = error_match.group(1).strip()
+        frames = _ASAN_FRAME_RE.findall(block)
+        summary_match = _MSAN_SUMMARY_RE.search(
+            text[block_match.end():block_match.end() + 500])
+        summary = summary_match.group(1) if summary_match else error_kind
+        findings.append(SanitizerFinding(
+            sanitizer='msan',
+            error_kind=error_kind,
+            summary=summary,
+            stack_trace='\n'.join(frames[:10]),
+        ))
+
     for ubsan_match in _UBSAN_RE.finditer(text):
         location = ubsan_match.group(1)
         description = ubsan_match.group(2)
@@ -150,7 +199,7 @@ def parse_sanitizer_output(text: str) -> List[SanitizerFinding]:
             sanitizer='ubsan',
             error_kind=description.split(':')[0].strip() if ':' in description else description,
             summary=f"{location}: {description}",
-            stack_trace='',
+            stack_trace=_frames_after(text, ubsan_match.end()),
         ))
 
     return findings

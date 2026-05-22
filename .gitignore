@@ -164,6 +164,7 @@ cython_debug/
 fuzz/build-llvm/
 fuzz/build-net/
 fuzz/build-cov/
+fuzz/build-san-*/
 fuzz/out/
 fuzz/runs/
 fuzz/coverage/

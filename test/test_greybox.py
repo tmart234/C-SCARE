@@ -148,6 +148,81 @@ def test_triage_to_sarif_include_queue(tmp_path):
     assert len(with_queue) == 3
 
 
+def test_triage_env_forces_full_report(monkeypatch):
+    """Triage overrides a campaign's throughput-tuned sanitizer options."""
+    # A campaign runs with the symbolizer off and leak detection off.
+    monkeypatch.setenv('ASAN_OPTIONS', 'symbolize=0:detect_leaks=0')
+    monkeypatch.delenv('UBSAN_OPTIONS', raising=False)
+    monkeypatch.delenv('MSAN_OPTIONS', raising=False)
+    env = greybox._triage_env()
+    # Last-wins: the forced values land after the inherited campaign ones.
+    assert env['ASAN_OPTIONS'].endswith('detect_leaks=1:symbolize=1')
+    assert 'symbolize=0' in env['ASAN_OPTIONS']
+    assert 'print_stacktrace=1' in env['UBSAN_OPTIONS']
+    assert 'symbolize=1' in env['MSAN_OPTIONS']
+
+
+def test_triage_multiple_workers(tmp_path):
+    """Each input is replayed through every worker; findings merge (SAND)."""
+    asan_fake = tmp_path / 'asan_worker.py'
+    asan_fake.write_text(textwrap.dedent('''\
+        import sys
+        sys.stderr.write(
+            "==1==ERROR: AddressSanitizer: heap-buffer-overflow on addr 0x1\\n"
+            "    #0 0x4 in parse foo.c:9\\n\\n"
+            "SUMMARY: AddressSanitizer: heap-buffer-overflow foo.c:9 in parse\\n"
+        )
+        sys.exit(1)
+    '''))
+    ubsan_fake = tmp_path / 'ubsan_worker.py'
+    ubsan_fake.write_text(textwrap.dedent('''\
+        import sys
+        sys.stderr.write(
+            "foo.c:42:7: runtime error: signed integer overflow: 1 + 1\\n"
+            "    #0 0x9 in parse foo.c:42:7\\n"
+        )
+        sys.exit(0)
+    '''))
+    crash_dir = tmp_path / 'crashes'
+    crash_dir.mkdir()
+    (crash_dir / 'id:000000,sig:06').write_bytes(b'bad-input')
+
+    results = greybox.triage(
+        greybox.list_crashes(str(tmp_path)),
+        cmds=[[sys.executable, str(asan_fake), '@@'],
+              [sys.executable, str(ubsan_fake), '@@']],
+        timeout=20,
+    )
+    assert len(results) == 1
+    r = results[0]
+    assert r.success is True
+    kinds = ' '.join(rep.finding_type for rep in r.monitor_reports)
+    assert 'asan:heap-buffer-overflow' in kinds
+    assert 'ubsan' in kinds
+    # One exit code recorded per worker.
+    assert isinstance(r.metadata['exit_code'], list)
+    assert len(r.metadata['exit_code']) == 2
+
+
+def test_find_san_workers(tmp_path):
+    """find_san_workers locates one worker binary per build-san-* tree."""
+    import stat
+    fuzz = tmp_path / 'fuzz'
+    for san in ('address', 'undefined'):
+        bindir = fuzz / f'build-san-{san}' / 'bin'
+        bindir.mkdir(parents=True)
+        binpath = bindir / 'dcm2pnm'
+        binpath.write_text('#!/bin/sh\n')
+        binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+
+    workers = greybox.find_san_workers('dcm2pnm', repo=str(tmp_path))
+    assert len(workers) == 2
+    assert any('build-san-address' in w for w in workers)
+    assert any('build-san-undefined' in w for w in workers)
+    # A binary that was never built yields no workers.
+    assert greybox.find_san_workers('nonexistent', repo=str(tmp_path)) == []
+
+
 @pytest.mark.skipif(shutil.which('gcc') is None, reason='gcc not available')
 def test_triage_real_asan_binary(tmp_path):
     """End-to-end: replay a crash through a real ASan-instrumented binary."""

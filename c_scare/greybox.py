@@ -10,12 +10,21 @@ is the thin bridge between those engines and C-SCARE's reporting layer:
   * list_crashes() - enumerate an AFL/AFLNet crashes directory
   * list_queue()   - enumerate the queue (leak-class bugs land here, not in
                      crashes/, because a leak is not a crash)
-  * triage()       - replay each input through an instrumented binary and
-                     parse the sanitizer output (ASan / UBSan / LSan) into
-                     structured findings
+  * triage()       - replay each input through one or more sanitizer
+                     binaries and parse the output (ASan / UBSan / LSan /
+                     MSan) into structured findings
 
 The fuzzing itself is run via scripts/ (see scripts/campaign.sh). This
 module turns the resulting crashes into triaged, reportable findings.
+
+SAND alignment (https://aflplus.plus/docs/sand/): SAND decouples
+sanitization from the fuzz loop - the loop drives a fast native binary and
+only suspicious inputs reach the sanitizer-instrumented worker binaries.
+The triage pass here *is* that worker stage: it replays crash/queue inputs
+through the sanitizer worker(s) to obtain a verdict. scripts/build_dcmtk.sh
+with SAND=1 builds one worker per sanitizer under fuzz/build-san-<san>/;
+find_san_workers() discovers them and triage() replays an input through
+every worker so an ASan + UBSan (+ MSan) campaign is triaged in one pass.
 
 Leak detection: an AFL campaign runs with detect_leaks=0 (a leak at exit
 is noise mid-loop and clashes with the forkserver). A triage replay is a
@@ -36,7 +45,7 @@ from .monitor import (
 
 __all__ = [
     'TARGETS', 'repo_root', 'run', 'list_crashes', 'list_queue',
-    'triage', 'triage_to_sarif',
+    'find_san_workers', 'triage', 'triage_to_sarif',
 ]
 
 # target -> fuzz harness script (mirrors scripts/campaign.sh).
@@ -115,18 +124,63 @@ def list_queue(out_dir: str) -> List[str]:
 
 
 def _triage_env() -> dict:
-    """Process environment for a triage replay.
+    """Process environment for a one-shot triage / SAND-worker replay.
 
-    Forces ``detect_leaks=1`` on: an AFL campaign typically runs with
-    ``detect_leaks=0``, but a triage replay is a clean one-shot process
-    where LeakSanitizer's atexit scan is valid. ASan parses its options
-    last-wins, so appending overrides any inherited ``detect_leaks=0``.
+    A fuzzing campaign tunes the sanitizers for throughput - it sets
+    ``symbolize=0`` (skip the symbolizer) and ``detect_leaks=0`` (a leak at
+    exit clashes with the forkserver). Those settings make a triage report
+    incomplete or unreadable, so override them: a triage replay is a clean
+    one-shot process where the full, symbolized report is exactly the point.
+
+      ASAN_OPTIONS  - detect_leaks=1 (LeakSanitizer's atexit scan is valid
+                      in a one-shot replay) and symbolize=1.
+      UBSAN_OPTIONS - print_stacktrace=1 (UBSan prints no stack trace at
+                      all by default) and symbolize=1.
+      MSAN_OPTIONS  - symbolize=1.
+
+    Sanitizers parse their ``*_OPTIONS`` last-wins, so appending overrides
+    any value inherited from the campaign environment.
     """
     env = dict(os.environ)
-    inherited = env.get('ASAN_OPTIONS', '')
-    forced = 'detect_leaks=1'
-    env['ASAN_OPTIONS'] = f'{inherited}:{forced}' if inherited else forced
+    overrides = {
+        'ASAN_OPTIONS': 'detect_leaks=1:symbolize=1',
+        'UBSAN_OPTIONS': 'print_stacktrace=1:symbolize=1',
+        'MSAN_OPTIONS': 'symbolize=1',
+    }
+    for var, forced in overrides.items():
+        inherited = env.get(var, '')
+        env[var] = f'{inherited}:{forced}' if inherited else forced
     return env
+
+
+def find_san_workers(bin_name: str, repo: Optional[str] = None) -> List[str]:
+    """Return the SAND sanitizer-worker binaries built for ``bin_name``.
+
+    ``scripts/build_dcmtk.sh`` run with ``SAND=1`` builds one worker tree
+    per sanitizer under ``fuzz/build-san-<sanitizer>/`` (forkserver only,
+    no PC instrumentation - see https://aflplus.plus/docs/sand/). This
+    locates the ``bin_name`` executable inside each, sorted by sanitizer,
+    so triage can replay an input through every sanitizer the campaign ran.
+    Returns an empty list when no worker trees exist (non-SAND build).
+    """
+    repo = repo or repo_root()
+    fuzz_dir = os.path.join(repo, 'fuzz')
+    workers: List[str] = []
+    if not os.path.isdir(fuzz_dir):
+        return workers
+    for name in sorted(os.listdir(fuzz_dir)):
+        if not name.startswith('build-san-'):
+            continue
+        build_dir = os.path.join(fuzz_dir, name)
+        if not os.path.isdir(build_dir):
+            continue
+        for root, _dirs, files in os.walk(build_dir):
+            if bin_name in files:
+                path = os.path.join(root, bin_name)
+                if os.access(path, os.X_OK):
+                    workers.append(path)
+                    break
+    return workers
 
 
 def _replay(cmd: List[str], crash_path: str, timeout: float):
@@ -153,16 +207,29 @@ def _replay(cmd: List[str], crash_path: str, timeout: float):
 
 def triage(crashes: List[str],
            cmd: Optional[List[str]] = None,
+           cmds: Optional[List[List[str]]] = None,
            timeout: float = 10.0) -> List[AttackResult]:
     """Triage AFL/AFLNet fuzz inputs into ``AttackResult`` findings.
 
     Accepts crash *and* queue inputs (see ``list_crashes`` / ``list_queue``).
-    If ``cmd`` is given (e.g. ``['/build/dcm2pnm', '@@', '/tmp/o.pnm']``)
-    each input is replayed through it and the sanitizer output is parsed
-    into ``MonitorReport`` findings. The replay forces ``detect_leaks=1``,
-    so a one-shot replay also surfaces LeakSanitizer findings. Without
-    ``cmd`` the inputs are only inventoried (no instrumented binary).
+
+    Pass the sanitizer binary to replay through as ``cmd`` (a single command,
+    e.g. ``['/build/dcm2pnm', '@@', '/tmp/o.pnm']``) and/or ``cmds`` (a list
+    of such commands). Every input is replayed through *each* command and the
+    sanitizer output (ASan / UBSan / LSan / MSan) is parsed into
+    ``MonitorReport`` findings - this is how a SAND-style campaign with one
+    worker per sanitizer is triaged in a single pass (see ``find_san_workers``).
+    The replay forces a full one-shot sanitizer report (``_triage_env``), so
+    it also surfaces LeakSanitizer findings. With no command the inputs are
+    only inventoried (no instrumented binary).
     """
+    workers: List[List[str]] = []
+    if cmd:
+        workers.append(list(cmd))
+    for extra in (cmds or []):
+        if extra:
+            workers.append(list(extra))
+
     results: List[AttackResult] = []
     for crash_path in crashes:
         try:
@@ -182,21 +249,28 @@ def triage(crashes: List[str],
                       'size': len(payload)},
         )
 
-        if cmd:
-            returncode, output = _replay(cmd, crash_path, timeout)
-            findings: List[SanitizerFinding] = parse_sanitizer_output(output)
-            exit_finding = check_exit_code(returncode)
-            if exit_finding:
-                findings.append(exit_finding)
-            for finding in findings:
-                result.monitor_reports.append(MonitorReport(
-                    detected=True,
-                    finding_type=f'{finding.sanitizer}:{finding.error_kind}',
-                    description=finding.summary,
-                    evidence=finding.stack_trace or None,
-                ))
-            result.success = bool(findings)
-            result.metadata['exit_code'] = returncode
+        if workers:
+            exit_codes: List[Optional[int]] = []
+            detected = False
+            for worker in workers:
+                returncode, output = _replay(worker, crash_path, timeout)
+                exit_codes.append(returncode)
+                findings: List[SanitizerFinding] = \
+                    parse_sanitizer_output(output)
+                exit_finding = check_exit_code(returncode)
+                if exit_finding:
+                    findings.append(exit_finding)
+                for finding in findings:
+                    detected = True
+                    result.monitor_reports.append(MonitorReport(
+                        detected=True,
+                        finding_type=f'{finding.sanitizer}:{finding.error_kind}',
+                        description=finding.summary,
+                        evidence=finding.stack_trace or None,
+                    ))
+            result.success = detected
+            result.metadata['exit_code'] = (
+                exit_codes[0] if len(exit_codes) == 1 else exit_codes)
 
         results.append(result)
     return results
@@ -204,13 +278,15 @@ def triage(crashes: List[str],
 
 def triage_to_sarif(crashes_or_dir,
                      cmd: Optional[List[str]] = None,
+                     cmds: Optional[List[List[str]]] = None,
                      sarif_path: Optional[str] = None,
                      timeout: float = 10.0,
                      include_queue: bool = False) -> List[AttackResult]:
     """Triage crashes and optionally write a SARIF v2.1.0 report.
 
     ``crashes_or_dir`` may be an AFL/AFLNet output directory (str) or an
-    explicit list of input file paths.
+    explicit list of input file paths. ``cmd`` / ``cmds`` select the
+    sanitizer worker binary/binaries to replay through (see ``triage``).
 
     With ``include_queue`` and a directory argument, the queue inputs are
     triaged alongside the crashes. This is required to catch leak-class
@@ -224,7 +300,7 @@ def triage_to_sarif(crashes_or_dir,
             crashes += list_queue(crashes_or_dir)
     else:
         crashes = list(crashes_or_dir)
-    results = triage(crashes, cmd=cmd, timeout=timeout)
+    results = triage(crashes, cmd=cmd, cmds=cmds, timeout=timeout)
     if sarif_path:
         from .test_runner import write_sarif
         write_sarif(results, sarif_path)

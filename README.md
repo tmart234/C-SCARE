@@ -239,6 +239,7 @@ The fuzz build must match the device's DCMTK source rev and build flags or the r
 | `EXTRA_CFLAGS`     | Appended to `CFLAGS`/`CXXFLAGS` verbatim — match device defines.                  |
 | `EXTRA_CMAKE_ARGS` | Extra `-D...` CMake args (whitespace-separated) — match device DCMTK feature flags. |
 | `SANITIZERS`       | Comma list: `address,undefined,memory`. Default `address`.                       |
+| `SAND`             | Set `SAND=1` for SAND decoupled sanitization — a native fuzz-loop binary plus one worker per sanitizer. See [SAND mode](#sand-mode-decoupled-sanitization). |
 
 Worked example (matching a hypothetical device build):
 
@@ -252,6 +253,33 @@ DCMTK_SRC_DIR=/opt/device-src/dcmtk \
 ```
 
 `build_dcmtk.sh` produces two builds, one per fuzzing track: `fuzz/build-llvm/` (AFL++ `afl-clang-fast`, LLVM mode — `dcm2pnm` / `dcmdump` / `storescu`) and `fuzz/build-net/` (AFLNet `afl-gcc` — `storescp` / `dcmrecv` / `dcmqrscp`). The two AFL forks' instrumentation is not interchangeable, so each track is compiled with its own fuzzer's toolchain. Each build dir records a `build_manifest.txt` (DCMTK SHA, compiler version, flags, AFL fork SHAs); campaign reports (`scripts/campaign.sh`) embed the relevant manifest in `run.json`.
+
+### SAND mode (decoupled sanitization)
+
+[SAND](https://aflplus.plus/docs/sand/) decouples sanitization from the fuzz loop: the loop drives a fast **native** binary and only the rare suspicious inputs reach the **sanitizer worker** binaries. It keeps near-native throughput while retaining sanitized-fuzzing bug detection, and lets one campaign combine several sanitizers. SAND is opt-in — set `SAND=1`:
+
+```bash
+SAND=1 SANITIZERS=address,undefined scripts/build_dcmtk.sh
+```
+
+That builds the AFL++ file track three ways:
+
+| Build dir | Role | Instrumentation |
+|-----------|------|-----------------|
+| `fuzz/build-llvm/` | native fuzz-loop binary | PCGUARD coverage, no sanitizer |
+| `fuzz/build-san-address/` | ASan worker | `AFL_SAN_NO_INST=1` — forkserver only |
+| `fuzz/build-san-undefined/` | UBSan worker | `AFL_SAN_NO_INST=1` — forkserver only |
+
+`scripts/fuzz_file.sh` / `fuzz_parse.sh` auto-detect the `fuzz/build-san-*/` worker trees and pass each to `afl-fuzz -w`; with no worker trees they run the plain single-binary loop unchanged. The AFLNet network track has no `-w` support, so it always builds with the sanitizers inline regardless of `SAND`.
+
+Triage **is** the SAND sanitizer-worker stage — it replays crash/queue inputs through the sanitizer worker(s) to get a verdict. `--sand <binary-name>` discovers the `fuzz/build-san-*/` workers and triages an input through every one in a single pass:
+
+```bash
+c-scare greybox triage fuzz/out/file --sand dcm2pnm \
+    --arg @@ --arg /tmp/out.pnm --include-queue --sarif findings.sarif
+```
+
+`--binary <path>` (repeatable) names worker binaries explicitly instead. The triage replay also forces a full one-shot sanitizer report — `symbolize=1`, `detect_leaks=1`, and UBSan `print_stacktrace=1` — overriding the throughput-tuned options a campaign runs with.
 
 ### Coverage measurement
 
