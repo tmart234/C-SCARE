@@ -19,6 +19,8 @@ PORT="${DICOM_PORT:-11114}"
 
 # shellcheck disable=SC1091
 source "${REPO_ROOT}/scripts/install_afl.sh"
+# shellcheck source=scripts/aflnet_common.sh
+source "${REPO_ROOT}/scripts/aflnet_common.sh"
 
 DCMQRSCP="$(find "${BUILD_DIR}" -type f -name dcmqrscp -executable | head -1)"
 [[ -n "${DCMQRSCP}" ]] || { echo "[fuzz_dcmqrscp] dcmqrscp not built"; exit 1; }
@@ -46,14 +48,10 @@ else
     echo "[fuzz_dcmqrscp] starting fresh campaign in ${OUT_DIR}"
 fi
 
+# AFLNet options come from scripts/aflnet_common.sh (shared, includes -E).
 exec "${AFL_PATH}/afl-fuzz" \
     -i "${INPUT_ARG}" \
     -o "${OUT_DIR}" \
     -N "tcp://127.0.0.1/${PORT}" \
-    -P DICOM \
-    -D 10000 \
-    -W 30 \
-    -m none \
-    -E \
-    -q 3 \
+    "${AFLNET_FUZZ_OPTS[@]}" \
     -- "${DCMQRSCP}" -c "${CFG_RUNTIME}" "${PORT}"

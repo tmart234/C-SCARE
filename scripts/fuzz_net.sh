@@ -21,6 +21,8 @@ PORT="${DICOM_PORT:-11112}"
 
 # shellcheck disable=SC1091
 source "${REPO_ROOT}/scripts/install_afl.sh"
+# shellcheck source=scripts/aflnet_common.sh
+source "${REPO_ROOT}/scripts/aflnet_common.sh"
 
 STORESCP="$(find "${BUILD_DIR}" -type f -name storescp -executable | head -1)"
 [[ -n "${STORESCP}" ]] || { echo "[fuzz_net] storescp not built"; exit 1; }
@@ -45,24 +47,12 @@ else
     echo "[fuzz_net] starting fresh campaign in ${OUT_DIR}"
 fi
 
-# AFLNet flags:
-#   -N tcp://...    target socket address (informs AFLNet, not bound by it)
-#   -D 10000        wait (us) for the SCP to initialize before the first request
-#   -W 30           wait (ms) for response after sending each message
-#   -m none         no memory limit (ASAN needs ample VM)
-#   -E              state-aware mode: build the IPSM from server responses.
-#                   Required — AFLNet defaults the seed schedule to IPSM
-#                   (-h 2), which afl-fuzz rejects unless -E is set.
-#   -q 3            state selection algorithm: FAVOR. Only takes effect in
-#                   state-aware mode.
+# AFLNet options (-P/-D/-W/-m/-E/-q) come from scripts/aflnet_common.sh so
+# every network harness shares one definition; -E (state-aware mode) is
+# mandatory — see that file.
 exec "${AFL_PATH}/afl-fuzz" \
     -i "${INPUT_ARG}" \
     -o "${OUT_DIR}" \
     -N "tcp://127.0.0.1/${PORT}" \
-    -P DICOM \
-    -D 10000 \
-    -W 30 \
-    -m none \
-    -E \
-    -q 3 \
+    "${AFLNET_FUZZ_OPTS[@]}" \
     -- "${STORESCP}" "${PORT}" --eostudy-timeout 1
