@@ -71,8 +71,11 @@ jobs:
           sudo apt-get update
           # graphviz/libcap dev libs: install_afl.sh builds AFLNet, whose
           # Makefile links afl-* against -lgvc -lcgraph -lcap on Linux.
+          # meson + ninja-build: AFL++ qemuafl builds QEMU with the Meson
+          # build system; without meson build_qemu_support.sh aborts early
+          # with "ERROR: Meson not found".
           sudo apt-get install -y dcmtk build-essential clang llvm-dev \
-            libglib2.0-dev ninja-build flex bison libtool libtool-bin \
+            libglib2.0-dev meson ninja-build flex bison libtool libtool-bin \
             automake pkg-config graphviz libgraphviz-dev libcap-dev
           python -m pip install --upgrade pip
           pip install -e .
