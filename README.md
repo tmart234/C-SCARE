@@ -160,6 +160,14 @@ c-scare greybox run net-storescp      # fuzz storescp via AFLNet
 c-scare greybox triage fuzz/out/file \
     --binary fuzz/build-llvm/bin/dcm2pnm --arg @@ --arg /tmp/out.pnm \
     --sarif crashes.sarif
+
+# Add --include-queue to also hunt leak-class bugs: a memory leak is not a
+# crash, so its trigger sits in queue/, not crashes/. The triage replay is a
+# clean one-shot process, so it forces detect_leaks=1 and LeakSanitizer's
+# atexit scan reports the leak (works for file targets — dcm2pnm/dcmdump).
+c-scare greybox triage fuzz/out/file \
+    --binary fuzz/build-llvm/bin/dcm2pnm --arg @@ --arg /tmp/out.pnm \
+    --include-queue --sarif findings.sarif
 ```
 
 ## Attack Categories

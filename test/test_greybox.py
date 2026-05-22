@@ -93,6 +93,61 @@ def test_triage_to_sarif_writes_report(tmp_path):
     assert len(doc['runs'][0]['results']) == 2
 
 
+def test_list_queue(tmp_path):
+    """list_queue enumerates queue inputs, skipping AFL's .state metadata."""
+    queue = tmp_path / 'default' / 'queue'
+    queue.mkdir(parents=True)
+    (queue / '.state').mkdir()
+    (queue / '.state' / 'redundant_edges').write_text('afl metadata')
+    (queue / 'id:000000,orig:seed').write_bytes(b'q-a')
+    (queue / 'id:000001,src:000000').write_bytes(b'q-b-longer')
+    inputs = greybox.list_queue(str(tmp_path))
+    assert len(inputs) == 2
+    assert all('.state' not in i for i in inputs)
+
+
+def test_triage_detects_memory_leak(tmp_path):
+    """A clean-exit replay that leaks is classified as an lsan finding."""
+    fake = tmp_path / 'leaky_target.py'
+    fake.write_text(textwrap.dedent('''\
+        import sys
+        sys.stderr.write(
+            "==45678==ERROR: LeakSanitizer: detected memory leaks\\n\\n"
+            "Direct leak of 1024 byte(s) in 1 object(s) allocated from:\\n"
+            "    #0 0x7f in malloc\\n"
+            "    #1 0x4a in readPeerList dcmqrcnf.cc:512\\n\\n"
+            "SUMMARY: AddressSanitizer: 1024 byte(s) leaked in 1 allocation(s).\\n"
+        )
+        sys.exit(0)
+    '''))
+    queue = tmp_path / 'queue'
+    queue.mkdir()
+    (queue / 'id:000000,orig:seed').write_bytes(b'leak-input')
+
+    results = greybox.triage(
+        greybox.list_queue(str(tmp_path)),
+        cmd=[sys.executable, str(fake), '@@'], timeout=20,
+    )
+    assert len(results) == 1
+    r = results[0]
+    assert r.success is True
+    assert r.metadata['kind'] == 'queue'
+    assert r.monitor_reports
+    assert 'lsan:memory-leak' in r.monitor_reports[0].finding_type
+
+
+def test_triage_to_sarif_include_queue(tmp_path):
+    """include_queue folds queue inputs into the triaged set."""
+    _make_afl_out(tmp_path, 'afl')          # 2 crash inputs
+    queue = tmp_path / 'default' / 'queue'
+    queue.mkdir(parents=True)
+    (queue / 'id:000000,orig:seed').write_bytes(b'q-a')
+    crashes_only = greybox.triage_to_sarif(str(tmp_path))
+    with_queue = greybox.triage_to_sarif(str(tmp_path), include_queue=True)
+    assert len(crashes_only) == 2
+    assert len(with_queue) == 3
+
+
 @pytest.mark.skipif(shutil.which('gcc') is None, reason='gcc not available')
 def test_triage_real_asan_binary(tmp_path):
     """End-to-end: replay a crash through a real ASan-instrumented binary."""

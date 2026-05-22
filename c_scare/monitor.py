@@ -64,6 +64,19 @@ _ASAN_BLOCK_RE = re.compile(
     re.DOTALL,
 )
 
+# LSan leak report header: ==PID==ERROR: LeakSanitizer: detected memory leaks
+_LSAN_ERROR_RE = re.compile(
+    r'==\d+==ERROR:\s*LeakSanitizer:\s*detected memory leaks',
+    re.MULTILINE,
+)
+
+# LSan leak summary. When LSan runs inside ASan the line still reads
+# "AddressSanitizer", standalone it reads "LeakSanitizer".
+_LSAN_SUMMARY_RE = re.compile(
+    r'^SUMMARY:\s*(?:Address|Leak)Sanitizer:\s*(\d+\s+byte\(s\)\s+leaked.+)$',
+    re.MULTILINE,
+)
+
 
 @dataclass
 class SanitizerFinding:
@@ -113,6 +126,20 @@ def parse_sanitizer_output(text: str) -> List[SanitizerFinding]:
             sanitizer='asan',
             error_kind='DEADLYSIGNAL',
             summary='Process received deadly signal',
+            stack_trace='\n'.join(frames[:10]),
+        ))
+
+    # LeakSanitizer reports a memory leak at clean process exit, not a
+    # crash, so it carries no ASan ERROR block — match it on its own.
+    if _LSAN_ERROR_RE.search(text):
+        summary_match = _LSAN_SUMMARY_RE.search(text)
+        summary = (summary_match.group(1).strip() if summary_match
+                   else 'detected memory leaks')
+        frames = _ASAN_FRAME_RE.findall(text)
+        findings.append(SanitizerFinding(
+            sanitizer='lsan',
+            error_kind='memory-leak',
+            summary=summary,
             stack_trace='\n'.join(frames[:10]),
         ))
 

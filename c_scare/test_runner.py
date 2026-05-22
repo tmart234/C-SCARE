@@ -892,6 +892,9 @@ def _cmd_greybox(argv: List[str]) -> int:
                      help='binary argument; use @@ for the crash file path')
     trp.add_argument('--sarif', help='write a SARIF v2.1.0 report here')
     trp.add_argument('--timeout', type=float, default=10.0)
+    trp.add_argument('--include-queue', action='store_true',
+                     help='also triage queue inputs — required to catch '
+                          'leak-class bugs, which do not crash')
     a = p.parse_args(argv)
 
     if a.gbcmd == 'run':
@@ -899,9 +902,10 @@ def _cmd_greybox(argv: List[str]) -> int:
 
     cmd = ([a.binary] + a.args) if a.binary else None
     results = greybox.triage_to_sarif(
-        a.crashes, cmd=cmd, sarif_path=a.sarif, timeout=a.timeout)
+        a.crashes, cmd=cmd, sarif_path=a.sarif, timeout=a.timeout,
+        include_queue=a.include_queue)
     detected = sum(1 for r in results if r.success)
-    print(f"\nTriaged {len(results)} crash input(s); "
+    print(f"\nTriaged {len(results)} fuzz input(s); "
           f"{detected} reproduced a sanitizer/crash finding")
     for r in results:
         mark = '!' if r.success else ('.' if cmd else '?')
