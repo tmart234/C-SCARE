@@ -1,11 +1,14 @@
 name: Grey-box fuzz smoke (DCMTK + AFL)
 
-# The grey-box quadrant. Manual-only (workflow_dispatch): both jobs are heavy
+# The grey-box quadrant. Manual-only (workflow_dispatch): every job is heavy
 # and the instrumented / QEMU builds are slow, so they never run on push.
 #   greybox-smoke - build DCMTK 3.6.7 instrumented with AFL + ASan, then run
 #                   scripts/smoke.sh. The fastest-fuzzing path.
 #   qemu-smoke    - fuzz the *prebuilt* (apt) DCMTK 3.6.7 via AFL++ QEMU mode,
 #                   proving the no-recompilation path works.
+#   aflnet-smoke  - network-fuzz the instrumented storescp with AFLNet. Seeds
+#                   are harvested from a live DICOM capture (see
+#                   scripts/capture_net_seeds.sh) plus the synthetic flows.
 on:
   workflow_dispatch:
 
@@ -99,3 +102,85 @@ jobs:
             echo "::error::QEMU-mode run produced no fuzzer_stats"
             exit 1
           fi
+
+  aflnet-smoke:
+    name: AFLNet - network-fuzz instrumented storescp (DICOM)
+    runs-on: ubuntu-24.04   # apt dcmtk on 24.04 is 3.6.7
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          # graphviz/libcap dev libs: AFLNet's Makefile links every afl-*
+          # binary against -lgvc -lcgraph -lcap on Linux.
+          # dcmtk + tcpdump: a live storescp/storescu/echoscu exchange is
+          # captured and converted into AFLNet seeds (capture_net_seeds.sh).
+          sudo apt-get install -y build-essential cmake zlib1g-dev clang \
+            llvm-dev graphviz libgraphviz-dev libcap-dev dcmtk tcpdump
+          python -m pip install --upgrade pip
+          pip install -e .
+          echo "DCMTK version:"; storescp --version | head -2
+
+      - name: Build DCMTK net track (AFLNet afl-gcc + ASan)
+        run: bash scripts/build_dcmtk.sh
+
+      - name: Harvest AFLNet seeds (synthetic + live pcap capture)
+        run: |
+          # Synthetic canonical DIMSE flows.
+          python fuzz/harness/seed_serializer.py
+          # Real exchange harvested from a packet capture — full association
+          # negotiation and a multi-PDU C-STORE the hand-coded seeds lack.
+          bash scripts/capture_net_seeds.sh
+          echo "=== net-storescp seed corpus ==="
+          ls -la fuzz/seeds/net-storescp/
+
+      - name: AFLNet network-fuzz storescp (~6 min)
+        run: |
+          # AFL 2.x (AFLNet) aborts unless core dumps are written to a file.
+          sudo bash -c 'echo core > /proc/sys/kernel/core_pattern'
+          timeout --signal=TERM 360 bash scripts/fuzz_net.sh || true
+          stats="fuzz/out/net-storescp/fuzzer_stats"
+          if [[ -f "${stats}" ]]; then
+            echo "=== fuzzer_stats ==="
+            cat "${stats}"
+          else
+            echo "::error::AFLNet run produced no fuzzer_stats"
+            exit 1
+          fi
+
+      - name: Report AFLNet crashes
+        if: always()
+        run: |
+          out="fuzz/out/net-storescp"
+          found=0
+          for dir in "${out}"/crashes "${out}"/replayable-crashes; do
+            [[ -d "${dir}" ]] || continue
+            n="$(find "${dir}" -type f ! -name 'README.txt' | wc -l)"
+            echo "${dir}: ${n} crash input(s)"
+            [[ "${n}" -gt 0 ]] && found=1
+          done
+          if [[ "${found}" -eq 1 ]]; then
+            echo "::warning::AFLNet found crashing inputs - triage with c_scare.greybox.triage"
+          fi
+
+      - name: Upload AFLNet artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aflnet-results
+          path: |
+            fuzz/out/net-seeds/capture.pcap
+            fuzz/out/net-storescp/fuzzer_stats
+            fuzz/out/net-storescp/crashes/
+            fuzz/out/net-storescp/replayable-crashes/
+            fuzz/seeds/net-storescp/
+          if-no-files-found: ignore
