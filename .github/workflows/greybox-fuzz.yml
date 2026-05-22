@@ -29,7 +29,10 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake zlib1g-dev clang llvm-dev
+          # graphviz/libcap dev libs: AFLNet's Makefile links every afl-*
+          # binary against -lgvc -lcgraph -lcap on Linux.
+          sudo apt-get install -y build-essential cmake zlib1g-dev clang llvm-dev \
+            graphviz libgraphviz-dev libcap-dev
           python -m pip install --upgrade pip
           pip install -e .
 
@@ -66,9 +69,11 @@ jobs:
       - name: Install DCMTK 3.6.7 (apt) and AFL/QEMU build deps
         run: |
           sudo apt-get update
+          # graphviz/libcap dev libs: install_afl.sh builds AFLNet, whose
+          # Makefile links afl-* against -lgvc -lcgraph -lcap on Linux.
           sudo apt-get install -y dcmtk build-essential clang llvm-dev \
             libglib2.0-dev ninja-build flex bison libtool libtool-bin \
-            automake pkg-config
+            automake pkg-config graphviz libgraphviz-dev libcap-dev
           python -m pip install --upgrade pip
           pip install -e .
           echo "DCMTK version:"; dcm2pnm --version | head -2
