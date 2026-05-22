@@ -170,6 +170,7 @@ c-scare greybox triage fuzz/out/file \
 | **Protocol** | PDU malformation, AE title overflow, missing items | `ProtocolAttacks` |
 | **Memory** | Pixel dimension overflow, fragment bombs, LUT overflow | `MemoryAttacks` |
 | **Logic** | Transfer syntax mismatch, SSRF via URI, file:// injection | `LogicAttacks` |
+| **Command Injection** | Shell metacharacters in SOP/Study Instance UID & Patient Name that feed storescp's `--exec-on-reception` placeholders (DCMTK #1194) | `CommandInjectionAttacks` |
 | **State Machine** | Out-of-order PDUs (Sta1–Sta13 violations) | `StateMachineAttacks` |
 | **CVE** | CVE-2023-32135, CVE-2024-24793/94, CVE-2024-33606, CVE-2019-11687, and more | `CVEAttacks` |
 

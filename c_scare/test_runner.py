@@ -36,8 +36,8 @@ import tempfile
 try:
     from .attacks import (
         ParserAttacks, ProtocolAttacks, MemoryAttacks, LogicAttacks,
-        StateMachineAttacks, CVEAttacks, ProtocolFuzzer, AttackResult,
-        SCAPY_AVAILABLE
+        CommandInjectionAttacks, StateMachineAttacks, CVEAttacks,
+        ProtocolFuzzer, AttackResult, SCAPY_AVAILABLE
     )
     from . import deliver
     from .monitor import (
@@ -48,8 +48,8 @@ try:
 except ImportError:
     from attacks import (
         ParserAttacks, ProtocolAttacks, MemoryAttacks, LogicAttacks,
-        StateMachineAttacks, CVEAttacks, ProtocolFuzzer, AttackResult,
-        SCAPY_AVAILABLE
+        CommandInjectionAttacks, StateMachineAttacks, CVEAttacks,
+        ProtocolFuzzer, AttackResult, SCAPY_AVAILABLE
     )
     import deliver
     from monitor import (
@@ -468,6 +468,7 @@ def run_generate_corpus(args) -> int:
         ('Parser attacks', ParserAttacks),
         ('Memory attacks', MemoryAttacks),
         ('Logic attacks', LogicAttacks),
+        ('Command injection attacks', CommandInjectionAttacks),
         ('CVE attacks', CVEAttacks),
         ('Protocol attacks', ProtocolAttacks),
         ('State machine attacks', StateMachineAttacks),
@@ -587,6 +588,35 @@ def run_logic_attacks(args) -> int:
     return 0
 
 
+def run_command_injection_attacks(args) -> int:
+    """Run command-injection attack tests (storescp exec placeholders)."""
+    print("\n=== Command Injection Attacks ===\n")
+
+    results = []
+    for i, result in enumerate(CommandInjectionAttacks.all()):
+        try:
+            _maybe_deliver(args, result, i)
+            print_result(result, args.verbose)
+            results.append(result)
+        except Exception as e:
+            print(f"✗ {result.name}: {e}")
+
+    print(f"\nTotal command injection attack tests: {len(results)}")
+    print("Note: confirming RCE needs a live storescp started with "
+          "--exec-on-reception and a C-STORE (see deliver.send_cstore).")
+    _collect_results(args, results)
+
+    if args.output:
+        os.makedirs(args.output, exist_ok=True)
+        for result in results:
+            filepath = os.path.join(args.output, f"{result.name}.dcm")
+            file_data = b'\x00' * 128 + b'DICM' + result.payload
+            with open(filepath, 'wb') as f:
+                f.write(file_data)
+
+    return 0
+
+
 def run_state_machine_attacks(args) -> int:
     """Run state machine attack tests."""
     if not args.target:
@@ -694,6 +724,7 @@ def run_all_tests(args) -> int:
         ('Protocol Attacks', run_protocol_attacks),
         ('Memory Attacks', run_memory_attacks),
         ('Logic Attacks', run_logic_attacks),
+        ('Command Injection Attacks', run_command_injection_attacks),
         ('Fuzz Packets', run_fuzz_packets),
     ]
     
@@ -731,6 +762,7 @@ def run_command(command: str, args) -> int:
         'parser_attacks': run_parser_attacks,
         'memory_attacks': run_memory_attacks,
         'logic_attacks': run_logic_attacks,
+        'command_injection_attacks': run_command_injection_attacks,
         'state_machine_attacks': run_state_machine_attacks,
         'all': run_all_tests,
     }
@@ -895,8 +927,8 @@ def main(argv: Optional[List[str]] = None):
     # Test selection
     parser.add_argument(
         '--category',
-        choices=['parser', 'protocol', 'memory', 'logic', 'state_machine', 
-                 'cve', 'fuzz_packet', 'live_fuzz', 'all'],
+        choices=['parser', 'protocol', 'memory', 'logic', 'command_injection',
+                 'state_machine', 'cve', 'fuzz_packet', 'live_fuzz', 'all'],
         help='Test category to run (if not specified, runs all)'
     )
     
@@ -964,6 +996,7 @@ def main(argv: Optional[List[str]] = None):
         'protocol': 'protocol_attacks',
         'memory': 'memory_attacks',
         'logic': 'logic_attacks',
+        'command_injection': 'command_injection_attacks',
         'state_machine': 'state_machine_attacks',
         'cve': 'cve_attacks',
         'fuzz_packet': 'fuzz_packets',

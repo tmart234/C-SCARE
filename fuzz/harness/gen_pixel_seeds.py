@@ -8,6 +8,9 @@ Wires up dormant capabilities in c_scare/pixel.py:
      duplicate_fragments, empty_fragments, overflow_bot)
   - PixelData.overflow_dimensions / zero_dimensions: native pixel-data
     seeds with malformed Rows/Columns
+  - YBR_FULL / PlanarConfiguration 1 frame whose Pixel Data holds far
+    fewer samples than Rows*Columns*3, exercising the colour-plane
+    stored-vs-expected length check in the image pipeline
 
 Each seed is a complete DICOM Part 10 file dcm2pnm/dcmconv can chew on,
 exercising the codec dispatch + image pipeline (the reason we picked
@@ -79,6 +82,27 @@ def _write(path: Path, data: bytes, label: str) -> None:
     print(f"  wrote {path.relative_to(REPO_ROOT)} ({len(data)} bytes, {label})")
 
 
+def _ybr_full_planar_undersize() -> Dataset:
+    """YBR_FULL + PlanarConfiguration 1 frame with far too few stored pixels.
+
+    A YBR_FULL, planar-configuration-1 image whose Pixel Data holds far fewer
+    samples than Rows*Columns*3 used to be processed regardless, reading past
+    the pixel buffer. The hardened path renders an empty (black) frame and
+    logs a warning instead. This seed reproduces that shape so the dcm2pnm
+    colour pipeline exercises the new stored-vs-expected length check.
+    """
+    ds = _baseline(EXPLICIT_VR_LE)
+    ds.SamplesPerPixel = 3
+    ds.PhotometricInterpretation = "YBR_FULL"
+    ds.PlanarConfiguration = 1
+    ds.Rows = 64
+    ds.Columns = 64
+    # Expected for an 8-bit YBR_FULL frame: 64*64*3 = 12288 bytes.
+    # Supply 96 -- "much too less" -- to trip the length check.
+    ds.PixelData = bytes(96)
+    return ds
+
+
 def main() -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     seed = int(os.environ.get("C_SCARE_PIXEL_SEED", str(DEFAULT_SEED)), 0)
@@ -108,6 +132,12 @@ def main() -> int:
         blob = _splice_pixel(ds_native, pd.data, undefined_length=False)
         _write(OUT_DIR / f"pixel_dim_{label}.dcm", blob,
                f"rows={pd.rows} cols={pd.cols}")
+
+    # YBR_FULL / PlanarConfiguration 1 frame with undersized Pixel Data.
+    ybr_path = OUT_DIR / "pixel_ybr_full_planar1_undersize.dcm"
+    _ybr_full_planar_undersize().save_as(str(ybr_path), write_like_original=False)
+    print(f"  wrote {ybr_path.relative_to(REPO_ROOT)} "
+          f"(YBR_FULL planar=1, 96B pixel data vs 12288B expected)")
 
     (OUT_DIR / "PIXEL_SEED.txt").write_text(f"{seed}\n")
     print(f"  wrote {(OUT_DIR / 'PIXEL_SEED.txt').relative_to(REPO_ROOT)} (seed={hex(seed)})")

