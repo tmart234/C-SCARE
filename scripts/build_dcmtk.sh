@@ -40,6 +40,10 @@ JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
 USING_SUBMODULE=0
 [[ "${DCMTK_SRC}" == "${REPO_ROOT}/fuzz/dcmtk" ]] && USING_SUBMODULE=1
 
+# A submodule (or linked worktree) checkout carries a .git *file* gitlink,
+# not a .git directory, so a plain `-d .git` test wrongly rejects it.
+is_git_worktree() { git -C "$1" rev-parse --is-inside-work-tree >/dev/null 2>&1; }
+
 if [[ ! -f "${DCMTK_SRC}/CMakeLists.txt" ]]; then
     if [[ "${USING_SUBMODULE}" == 1 ]]; then
         echo "[build_dcmtk] DCMTK submodule not initialized at ${DCMTK_SRC}"
@@ -57,7 +61,7 @@ if [[ "${USING_SUBMODULE}" == 1 ]]; then
     DCMTK_REF="${DCMTK_REF:-DCMTK-3.6.7}"
 fi
 if [[ "${USING_SUBMODULE}" == 1 && -n "${DCMTK_REF:-}" ]]; then
-    if [[ -d "${DCMTK_SRC}/.git" ]]; then
+    if is_git_worktree "${DCMTK_SRC}"; then
         echo "[build_dcmtk] checking out DCMTK ref ${DCMTK_REF}"
         git -C "${DCMTK_SRC}" fetch --tags --quiet
         git -C "${DCMTK_SRC}" checkout --quiet "${DCMTK_REF}"
@@ -134,7 +138,7 @@ write_manifest() {
     {
         echo "build_timestamp_utc=$(date -u +%FT%TZ)"
         echo "dcmtk_src=${DCMTK_SRC}"
-        if [[ -d "${DCMTK_SRC}/.git" ]]; then
+        if is_git_worktree "${DCMTK_SRC}"; then
             echo "dcmtk_sha=$(git -C "${DCMTK_SRC}" rev-parse HEAD 2>/dev/null || echo unknown)"
             echo "dcmtk_describe=$(git -C "${DCMTK_SRC}" describe --tags --always --dirty 2>/dev/null || echo unknown)"
         else
@@ -148,10 +152,10 @@ write_manifest() {
         echo "opt_level=${OPT_LEVEL}"
         echo "sanitizers=${SANITIZERS}"
         echo "extra_cmake_args=${EXTRA_CMAKE_ARGS:-}"
-        if [[ -d "${REPO_ROOT}/fuzz/aflnet/.git" ]]; then
+        if is_git_worktree "${REPO_ROOT}/fuzz/aflnet"; then
             echo "aflnet_sha=$(git -C "${REPO_ROOT}/fuzz/aflnet" rev-parse HEAD)"
         fi
-        if [[ -d "${REPO_ROOT}/fuzz/aflplusplus/.git" ]]; then
+        if is_git_worktree "${REPO_ROOT}/fuzz/aflplusplus"; then
             echo "aflpp_sha=$(git -C "${REPO_ROOT}/fuzz/aflplusplus" rev-parse HEAD)"
             echo "aflpp_describe=$(git -C "${REPO_ROOT}/fuzz/aflplusplus" describe --tags --always 2>/dev/null || echo unknown)"
         fi
