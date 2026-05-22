@@ -4,13 +4,15 @@
 # Bootstrap both AFL forks under fuzz/ and expose their toolchains.
 #
 # AFLNet is network-only at this commit (afl-fuzz FATALs without -N/-P), so
-# we use it strictly for the storescp campaign (Phase 4). Its afl-gcc still
-# provides forkserver instrumentation that AFL++ can drive backwards-
-# compatibly, so one DCMTK build serves both tracks.
+# we use it strictly for the network campaigns (Phase 4): storescp /
+# dcmrecv / dcmqrscp. As an AFL-2.x fork it only drives afl-as/afl-gcc
+# instrumentation, so scripts/build_dcmtk.sh builds those targets with its
+# afl-gcc into fuzz/build-net.
 #
 # AFL++ is the file-fuzzing fuzzer (Phase 1-2 dcm2pnm campaign): modern
 # mutators, dictionary support (-x), and ASAN integration via its own
-# afl-clang-fast.
+# afl-clang-fast. scripts/build_dcmtk.sh uses afl-clang-fast (LLVM mode)
+# for the file/SCU targets into fuzz/build-llvm.
 #
 # Exports:
 #   AFL_PATH      — AFLNet directory (also the conventional AFL env var,

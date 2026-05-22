@@ -79,7 +79,7 @@ DCMTK build (see [Grey-box fuzzing](#dcmtk-fuzzing-toolchain) below):
 
 ```bash
 git submodule update --init   # AFL++, AFLNet, DCMTK
-scripts/build_dcmtk.sh        # build DCMTK instrumented with ASan
+scripts/build_dcmtk.sh        # build DCMTK (AFL++ afl-clang-fast + AFLNet afl-gcc, ASan)
 ```
 
 ### 1. Corrupt a real DICOM file
@@ -158,7 +158,7 @@ c-scare greybox run net-storescp      # fuzz storescp via AFLNet
 
 # Triage the crashes a campaign produced into a SARIF report
 c-scare greybox triage fuzz/out/file \
-    --binary fuzz/build-asan/bin/dcm2pnm --arg @@ --arg /tmp/out.pnm \
+    --binary fuzz/build-llvm/bin/dcm2pnm --arg @@ --arg /tmp/out.pnm \
     --sarif crashes.sarif
 ```
 
@@ -241,7 +241,7 @@ DCMTK_SRC_DIR=/opt/device-src/dcmtk \
   scripts/build_dcmtk.sh
 ```
 
-Each build writes `fuzz/build-asan/build_manifest.txt` recording DCMTK SHA, compiler version, flags, and AFL fork SHAs. Campaign reports (`scripts/campaign.sh`) embed this manifest in `run.json`.
+`build_dcmtk.sh` produces two builds, one per fuzzing track: `fuzz/build-llvm/` (AFL++ `afl-clang-fast`, LLVM mode — `dcm2pnm` / `dcmdump` / `storescu`) and `fuzz/build-net/` (AFLNet `afl-gcc` — `storescp` / `dcmrecv` / `dcmqrscp`). The two AFL forks' instrumentation is not interchangeable, so each track is compiled with its own fuzzer's toolchain. Each build dir records a `build_manifest.txt` (DCMTK SHA, compiler version, flags, AFL fork SHAs); campaign reports (`scripts/campaign.sh`) embed the relevant manifest in `run.json`.
 
 ### Coverage measurement
 

@@ -8,7 +8,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_DIR="${REPO_ROOT}/fuzz/build-asan"
+BUILD_DIR="${REPO_ROOT}/fuzz/build-llvm"
 SEEDS_DIR="${REPO_ROOT}/fuzz/seeds/file"
 DICT_PATH="${REPO_ROOT}/fuzz/dict/dicom.dict"
 OUT_DIR="${REPO_ROOT}/fuzz/out/parse"

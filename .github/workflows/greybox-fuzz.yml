@@ -44,7 +44,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: greybox-build-manifest
-          path: fuzz/build-asan/build_manifest.txt
+          path: |
+            fuzz/build-llvm/build_manifest.txt
+            fuzz/build-net/build_manifest.txt
           if-no-files-found: ignore
 
   qemu-smoke:

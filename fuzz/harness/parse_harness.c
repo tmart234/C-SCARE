@@ -14,16 +14,16 @@
  *
  *   source scripts/install_afl.sh
  *   "$AFLPP_PATH/afl-clang-fast" -fsanitize=address -g \
- *       fuzz/harness/parse_harness.c -o fuzz/build-asan/parse_harness \
+ *       fuzz/harness/parse_harness.c -o fuzz/build-llvm/parse_harness \
  *       -I/path/to/your/include -L/path/to/your/lib -lyourdicom
  *
  * Fuzz it:
  *   "$AFLPP_PATH/afl-fuzz" -i fuzz/seeds/file -o fuzz/out/custom \
- *       -- fuzz/build-asan/parse_harness @@
+ *       -- fuzz/build-llvm/parse_harness @@
  *
- * (afl-clang-fast works for a harness you compile yourself; build_dcmtk.sh
- * uses afl-gcc only because clang's integrated assembler bypasses afl-as
- * when building DCMTK's own tree.)
+ * (build_dcmtk.sh builds the file/SCU targets with afl-clang-fast into
+ * fuzz/build-llvm and the AFLNet network targets with afl-gcc into
+ * fuzz/build-net; this harness belongs with the AFL++ file track.)
  */
 #include <stdio.h>
 #include <stdlib.h>

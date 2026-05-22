@@ -9,7 +9,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_DIR="${REPO_ROOT}/fuzz/build-asan"
+BUILD_DIR="${REPO_ROOT}/fuzz/build-net"
 SEEDS_DIR="${REPO_ROOT}/fuzz/seeds/net-dcmqrscp"
 OUT_DIR="${REPO_ROOT}/fuzz/out/net-dcmqrscp"
 STORAGE_DIR="${REPO_ROOT}/fuzz/storage/dcmqrscp"

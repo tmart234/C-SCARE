@@ -1,7 +1,19 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# Phase 1: Build DCMTK with afl-gcc + sanitizers.
+# Phase 1: Build DCMTK twice, once per fuzzing track.
+#
+# The file/SCU track is driven by AFL++ and the network track by AFLNet —
+# two AFL forks whose instrumentation is not interchangeable, so each gets
+# its own self-contained build:
+#
+#   fuzz/build-llvm — AFL++ afl-clang-fast. LLVM mode: PCGUARD edge
+#                     coverage, CMPLOG-ready, faster than afl-as. Targets
+#                     dcm2pnm / dcmdump (file + parser fuzz), storescu
+#                     (SCU/client fuzz), dcmconv (smoke).
+#   fuzz/build-net  — AFLNet afl-gcc. AFLNet is an AFL-2.x fork and can
+#                     only drive afl-as/afl-gcc instrumentation. Targets
+#                     storescp / dcmrecv / dcmqrscp (network fuzz).
 #
 # Source resolution (device-build parity):
 #   DCMTK_SRC_DIR  — absolute path to operator-supplied DCMTK tree.
@@ -9,23 +21,21 @@
 #   DCMTK_REF      — git ref/tag/SHA to check out inside the submodule.
 #                    Defaults to DCMTK-3.6.7. Ignored if DCMTK_SRC_DIR is set.
 #
-# Compile flags:
-#   OPT_LEVEL       — defaults to -O1 (ASAN-friendly).
-#   EXTRA_CFLAGS    — appended to CFLAGS / CXXFLAGS verbatim.
+# Compile flags (applied to both builds):
+#   OPT_LEVEL        — defaults to -O1 (ASAN-friendly).
+#   EXTRA_CFLAGS     — appended to CFLAGS / CXXFLAGS verbatim.
 #   EXTRA_CMAKE_ARGS — extra CMake -D args (whitespace-separated).
-#   SANITIZERS      — comma list. Recognised: address, undefined, memory.
-#                    Default: address.
+#   SANITIZERS       — comma list. Recognised: address, undefined, memory.
+#                      Default: address.
 #
-# Out-of-tree build dir: fuzz/build-asan/. Records provenance to
-# build_manifest.txt (consumed by scripts/campaign.sh run.json).
-#
-# Targets dcm2pnm / dcmdump (file + parser fuzz), dcmconv (smoke),
-# storescu (SCU/client fuzz), storescp / dcmrecv / dcmqrscp (network fuzz).
+# Each build dir records provenance to build_manifest.txt (consumed by
+# scripts/campaign.sh and scripts/coverage.sh).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DCMTK_SRC="${DCMTK_SRC_DIR:-${REPO_ROOT}/fuzz/dcmtk}"
-BUILD_DIR="${REPO_ROOT}/fuzz/build-asan"
+LLVM_BUILD_DIR="${REPO_ROOT}/fuzz/build-llvm"
+NET_BUILD_DIR="${REPO_ROOT}/fuzz/build-net"
 JOBS="${JOBS:-$(nproc 2>/dev/null || echo 4)}"
 USING_SUBMODULE=0
 [[ "${DCMTK_SRC}" == "${REPO_ROOT}/fuzz/dcmtk" ]] && USING_SUBMODULE=1
@@ -60,22 +70,22 @@ fi
 # shellcheck disable=SC1091
 source "${REPO_ROOT}/scripts/install_afl.sh"
 
-if [[ ! -x "${AFL_PATH:-}/afl-gcc" ]]; then
-    echo "[build_dcmtk] AFL_PATH/afl-gcc missing — install_afl.sh did not export AFL_PATH"
+# install_afl.sh points AFL_PATH at the AFLNet fork; capture it before the
+# per-build subshells override AFL_PATH for the toolchain they invoke.
+AFLNET_PATH="${AFL_PATH:-}"
+
+if [[ ! -x "${AFLNET_PATH}/afl-gcc" || ! -x "${AFLNET_PATH}/afl-g++" ]]; then
+    echo "[build_dcmtk] AFLNet afl-gcc/afl-g++ missing — install_afl.sh did not export AFL_PATH"
+    exit 1
+fi
+if [[ ! -x "${AFLPP_PATH:-}/afl-clang-fast" || ! -x "${AFLPP_PATH:-}/afl-clang-fast++" ]]; then
+    echo "[build_dcmtk] AFL++ afl-clang-fast(++) missing — install_afl.sh did not build AFL++"
     exit 1
 fi
 
-# Use afl-gcc / afl-g++ via absolute path. Modern clang's integrated
-# assembler bypasses afl-as so afl-clang doesn't instrument; system gcc
-# still spawns external 'as' and works correctly with AFL's wrapper.
-# afl-clang-fast (LLVM pass) would be faster but doesn't build against
-# LLVM 14+ on this AFLNet pin — see install_afl.sh.
-export CC="${AFL_PATH}/afl-gcc"
-export CXX="${AFL_PATH}/afl-g++"
-export AFL_QUIET=1
-
 # SANITIZERS → AFL_USE_* env vars. AFL_HARDEN intentionally never set;
-# it's mutually exclusive with the sanitizers.
+# it's mutually exclusive with the sanitizers. afl-gcc and afl-clang-fast
+# both honour these AFL_USE_* vars, so one set serves both builds.
 SANITIZERS="${SANITIZERS:-address}"
 unset AFL_USE_ASAN AFL_USE_UBSAN AFL_USE_MSAN
 IFS=',' read -ra _SAN <<<"${SANITIZERS}"
@@ -92,6 +102,7 @@ done
 OPT_LEVEL="${OPT_LEVEL:--O1}"
 export CFLAGS="-g ${OPT_LEVEL} -fno-omit-frame-pointer ${EXTRA_CFLAGS:-}"
 export CXXFLAGS="${CFLAGS}"
+export AFL_QUIET=1
 
 EXTRA_ARGS=()
 if [[ -n "${EXTRA_CMAKE_ARGS:-}" ]]; then
@@ -99,65 +110,95 @@ if [[ -n "${EXTRA_CMAKE_ARGS:-}" ]]; then
     read -ra EXTRA_ARGS <<<"${EXTRA_CMAKE_ARGS}"
 fi
 
-mkdir -p "${BUILD_DIR}"
-cd "${BUILD_DIR}"
+CMAKE_COMMON_ARGS=(
+    -DCMAKE_BUILD_TYPE=Debug
+    -DBUILD_SHARED_LIBS=OFF
+    -DBUILD_APPS=ON
+    -DDCMTK_WITH_TIFF=OFF
+    -DDCMTK_WITH_PNG=OFF
+    -DDCMTK_WITH_OPENSSL=OFF
+    -DDCMTK_WITH_SNDFILE=OFF
+    -DDCMTK_WITH_ICONV=OFF
+    -DDCMTK_WITH_ICU=OFF
+    -DDCMTK_WITH_XML=OFF
+    -DDCMTK_WITH_ZLIB=ON
+    -DDCMTK_ENABLE_PRIVATE_TAGS=ON
+    -DDCMTK_ENABLE_CHARSET_CONVERSION=OFF
+    -DDCMTK_WITH_THREADS=ON
+)
 
-cmake "${DCMTK_SRC}" \
-    -DCMAKE_BUILD_TYPE=Debug \
-    -DBUILD_SHARED_LIBS=OFF \
-    -DBUILD_APPS=ON \
-    -DDCMTK_WITH_TIFF=OFF \
-    -DDCMTK_WITH_PNG=OFF \
-    -DDCMTK_WITH_OPENSSL=OFF \
-    -DDCMTK_WITH_SNDFILE=OFF \
-    -DDCMTK_WITH_ICONV=OFF \
-    -DDCMTK_WITH_ICU=OFF \
-    -DDCMTK_WITH_XML=OFF \
-    -DDCMTK_WITH_ZLIB=ON \
-    -DDCMTK_ENABLE_PRIVATE_TAGS=ON \
-    -DDCMTK_ENABLE_CHARSET_CONVERSION=OFF \
-    -DDCMTK_WITH_THREADS=ON \
-    "${EXTRA_ARGS[@]}"
+# Provenance manifest — consumed by scripts/campaign.sh and scripts/coverage.sh.
+write_manifest() {
+    local build_dir="$1" cc="$2" variant="$3"
+    local manifest="${build_dir}/build_manifest.txt"
+    {
+        echo "build_timestamp_utc=$(date -u +%FT%TZ)"
+        echo "dcmtk_src=${DCMTK_SRC}"
+        if [[ -d "${DCMTK_SRC}/.git" ]]; then
+            echo "dcmtk_sha=$(git -C "${DCMTK_SRC}" rev-parse HEAD 2>/dev/null || echo unknown)"
+            echo "dcmtk_describe=$(git -C "${DCMTK_SRC}" describe --tags --always --dirty 2>/dev/null || echo unknown)"
+        else
+            echo "dcmtk_sha=unknown"
+            echo "dcmtk_describe=unknown"
+        fi
+        echo "compiler=${cc}"
+        echo "compiler_version=$("${cc}" --version 2>/dev/null | head -1)"
+        echo "cflags=${CFLAGS}"
+        echo "cxxflags=${CXXFLAGS}"
+        echo "opt_level=${OPT_LEVEL}"
+        echo "sanitizers=${SANITIZERS}"
+        echo "extra_cmake_args=${EXTRA_CMAKE_ARGS:-}"
+        if [[ -d "${REPO_ROOT}/fuzz/aflnet/.git" ]]; then
+            echo "aflnet_sha=$(git -C "${REPO_ROOT}/fuzz/aflnet" rev-parse HEAD)"
+        fi
+        if [[ -d "${REPO_ROOT}/fuzz/aflplusplus/.git" ]]; then
+            echo "aflpp_sha=$(git -C "${REPO_ROOT}/fuzz/aflplusplus" rev-parse HEAD)"
+            echo "aflpp_describe=$(git -C "${REPO_ROOT}/fuzz/aflplusplus" describe --tags --always 2>/dev/null || echo unknown)"
+        fi
+        echo "build_variant=${variant}"
+    } >"${manifest}"
+    echo "[build_dcmtk] manifest: ${manifest}"
+}
 
-TARGETS=(dcm2pnm dcmconv dcmdump storescu storescp dcmrecv dcmqrscp)
-cmake --build . --parallel "${JOBS}" --target "${TARGETS[@]}"
+# Configure + build one track. AFL_PATH is scoped to the subshell so the
+# chosen compiler resolves its own instrumentation runtime (afl-as for
+# afl-gcc, afl-compiler-rt for afl-clang-fast).
+build_track() {
+    local build_dir="$1" cc="$2" cxx="$3" afl_root="$4" variant="$5"
+    shift 5
+    local targets=("$@")
 
-# Provenance manifest — consumed by scripts/campaign.sh.
-MANIFEST="${BUILD_DIR}/build_manifest.txt"
-{
-    echo "build_timestamp_utc=$(date -u +%FT%TZ)"
-    echo "dcmtk_src=${DCMTK_SRC}"
-    if [[ -d "${DCMTK_SRC}/.git" ]]; then
-        echo "dcmtk_sha=$(git -C "${DCMTK_SRC}" rev-parse HEAD 2>/dev/null || echo unknown)"
-        echo "dcmtk_describe=$(git -C "${DCMTK_SRC}" describe --tags --always --dirty 2>/dev/null || echo unknown)"
-    else
-        echo "dcmtk_sha=unknown"
-        echo "dcmtk_describe=unknown"
-    fi
-    echo "compiler=${CC}"
-    echo "compiler_version=$("${CC}" --version 2>/dev/null | head -1)"
-    echo "cflags=${CFLAGS}"
-    echo "cxxflags=${CXXFLAGS}"
-    echo "opt_level=${OPT_LEVEL}"
-    echo "sanitizers=${SANITIZERS}"
-    echo "extra_cmake_args=${EXTRA_CMAKE_ARGS:-}"
-    if [[ -d "${REPO_ROOT}/fuzz/aflnet/.git" ]]; then
-        echo "aflnet_sha=$(git -C "${REPO_ROOT}/fuzz/aflnet" rev-parse HEAD)"
-    fi
-    if [[ -d "${REPO_ROOT}/fuzz/aflplusplus/.git" ]]; then
-        echo "aflpp_sha=$(git -C "${REPO_ROOT}/fuzz/aflplusplus" rev-parse HEAD)"
-        echo "aflpp_describe=$(git -C "${REPO_ROOT}/fuzz/aflplusplus" describe --tags --always 2>/dev/null || echo unknown)"
-    fi
-    echo "build_variant=asan"
-} >"${MANIFEST}"
+    echo "[build_dcmtk] === ${variant} track → ${build_dir}"
+    echo "[build_dcmtk]     CC=${cc}"
+    mkdir -p "${build_dir}"
+    (
+        cd "${build_dir}"
+        export CC="${cc}" CXX="${cxx}" AFL_PATH="${afl_root}"
+        cmake "${DCMTK_SRC}" "${CMAKE_COMMON_ARGS[@]}" "${EXTRA_ARGS[@]}"
+        cmake --build . --parallel "${JOBS}" --target "${targets[@]}"
+    )
+    write_manifest "${build_dir}" "${cc}" "${variant}"
 
-echo "[build_dcmtk] manifest: ${MANIFEST}"
-echo "[build_dcmtk] built:"
-for bin in "${TARGETS[@]}"; do
-    path=$(find "${BUILD_DIR}" -type f -name "${bin}" -executable | head -1)
-    if [[ -n "${path}" ]]; then
-        echo "  ${path}"
-    else
-        echo "  ${bin}: MISSING"
-    fi
-done
+    echo "[build_dcmtk] ${variant} built:"
+    for bin in "${targets[@]}"; do
+        local path
+        path=$(find "${build_dir}" -type f -name "${bin}" -executable | head -1)
+        if [[ -n "${path}" ]]; then
+            echo "  ${path}"
+        else
+            echo "  ${bin}: MISSING"
+        fi
+    done
+}
+
+# File / parser / SCU track — AFL++ afl-clang-fast (LLVM mode).
+build_track "${LLVM_BUILD_DIR}" \
+    "${AFLPP_PATH}/afl-clang-fast" "${AFLPP_PATH}/afl-clang-fast++" \
+    "${AFLPP_PATH}" llvm \
+    dcm2pnm dcmdump storescu dcmconv
+
+# Network track — AFLNet afl-gcc (afl-as classic instrumentation).
+build_track "${NET_BUILD_DIR}" \
+    "${AFLNET_PATH}/afl-gcc" "${AFLNET_PATH}/afl-g++" \
+    "${AFLNET_PATH}" aflnet \
+    storescp dcmrecv dcmqrscp
