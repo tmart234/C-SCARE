@@ -25,32 +25,34 @@ fi
 
 TARGET="$1"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ASAN_BUILD="${REPO_ROOT}/fuzz/build-asan"
 COV_BUILD="${REPO_ROOT}/fuzz/build-cov"
 OUT_BASE="${REPO_ROOT}/fuzz/out"
 COV_OUT="${REPO_ROOT}/fuzz/coverage/${TARGET}"
 GCOV_DATA="${COV_OUT}/gcov-data"
 
-# Resolve target → binary, fuzz output dir, mode.
+# Resolve target → binary, fuzz output dir, mode, instrumented build dir.
+# The instrumented build is split by fuzzer track (see scripts/build_dcmtk.sh):
+# file → build-llvm (AFL++), net-* → build-net (AFLNet).
 case "${TARGET}" in
-    file)         BIN_NAME=dcm2pnm  FUZZ_OUT="${OUT_BASE}/file"          MODE=file ;;
-    net-storescp) BIN_NAME=storescp FUZZ_OUT="${OUT_BASE}/net-storescp"  MODE=net  PORT=11212 ;;
-    net-dcmrecv)  BIN_NAME=dcmrecv  FUZZ_OUT="${OUT_BASE}/net-dcmrecv"   MODE=net  PORT=11213 ;;
-    net-dcmqrscp) BIN_NAME=dcmqrscp FUZZ_OUT="${OUT_BASE}/net-dcmqrscp"  MODE=net  PORT=11214 ;;
+    file)         BIN_NAME=dcm2pnm  FUZZ_OUT="${OUT_BASE}/file"          MODE=file INSTR_SUBDIR=build-llvm ;;
+    net-storescp) BIN_NAME=storescp FUZZ_OUT="${OUT_BASE}/net-storescp"  MODE=net  PORT=11212 INSTR_SUBDIR=build-net ;;
+    net-dcmrecv)  BIN_NAME=dcmrecv  FUZZ_OUT="${OUT_BASE}/net-dcmrecv"   MODE=net  PORT=11213 INSTR_SUBDIR=build-net ;;
+    net-dcmqrscp) BIN_NAME=dcmqrscp FUZZ_OUT="${OUT_BASE}/net-dcmqrscp"  MODE=net  PORT=11214 INSTR_SUBDIR=build-net ;;
     *) echo "[coverage] unknown target '${TARGET}'"; exit 2 ;;
 esac
+INSTR_BUILD="${REPO_ROOT}/fuzz/${INSTR_SUBDIR}"
 
 [[ -d "${COV_BUILD}" ]] || { echo "[coverage] coverage build missing — run scripts/build_dcmtk_cov.sh"; exit 1; }
 [[ -d "${FUZZ_OUT}" ]]  || { echo "[coverage] fuzz output missing: ${FUZZ_OUT}"; exit 1; }
 
 # Verify build parity. Both manifests must agree on dcmtk_sha; otherwise
 # replays are meaningless.
-asan_sha=$(awk -F= '/^dcmtk_sha=/{print $2}' "${ASAN_BUILD}/build_manifest.txt" 2>/dev/null || echo "")
+instr_sha=$(awk -F= '/^dcmtk_sha=/{print $2}' "${INSTR_BUILD}/build_manifest.txt" 2>/dev/null || echo "")
 cov_sha=$(awk -F= '/^dcmtk_sha=/{print $2}' "${COV_BUILD}/build_manifest.txt" 2>/dev/null || echo "")
-if [[ -z "${asan_sha}" || -z "${cov_sha}" || "${asan_sha}" != "${cov_sha}" ]]; then
+if [[ -z "${instr_sha}" || -z "${cov_sha}" || "${instr_sha}" != "${cov_sha}" ]]; then
     echo "[coverage] DCMTK SHA mismatch:"
-    echo "  asan build: ${asan_sha:-<missing manifest>}"
-    echo "  cov  build: ${cov_sha:-<missing manifest>}"
+    echo "  instrumented build: ${instr_sha:-<missing manifest>}"
+    echo "  coverage    build: ${cov_sha:-<missing manifest>}"
     echo "[coverage] rebuild with the same DCMTK_SRC_DIR/DCMTK_REF on both sides"
     exit 1
 fi

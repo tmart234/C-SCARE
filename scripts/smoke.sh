@@ -8,7 +8,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_DIR="${REPO_ROOT}/fuzz/build-asan"
+BUILD_DIR="${REPO_ROOT}/fuzz/build-llvm"
 SEEDS_DIR="${REPO_ROOT}/fuzz/seeds/file"
 TMP_DIR="$(mktemp -d -t cscare-smoke.XXXXXX)"
 trap 'rm -rf "${TMP_DIR}"' EXIT
@@ -67,9 +67,10 @@ cp "${BASELINE}" "${TMP_DIR}/in/seed.dcm"
 export AFL_SKIP_CPUFREQ=1
 export AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1
 
-# AFL++'s afl-fuzz drives the AFLNet-instrumented binary backwards-compatibly.
-# Wrap with `timeout` for a wall-clock budget; AFL++ flushes fuzzer_stats
-# every couple seconds so a SIGTERM at the deadline still leaves a usable file.
+# dcm2pnm is afl-clang-fast (LLVM mode) instrumented, so AFL++'s afl-fuzz
+# drives it natively. Wrap with `timeout` for a wall-clock budget; AFL++
+# flushes fuzzer_stats every couple seconds so a SIGTERM at the deadline
+# still leaves a usable file.
 timeout --signal=TERM 75 "${AFLPP_PATH}/afl-fuzz" \
     -i "${TMP_DIR}/in" -o "${TMP_DIR}/out" -m none \
     -- "${DCM2PNM}" @@ "${TMP_DIR}/dummy.pnm" >"${TMP_DIR}/afl.log" 2>&1 || true
@@ -86,9 +87,9 @@ execs_per_sec=$(awk -F': *' '/^execs_per_sec/ {print $2}' "${stats_file}")
 paths_total=$(awk -F': *' '/^paths_total|^corpus_count/ {print $2; exit}' "${stats_file}")
 
 echo "[smoke] (c) execs/sec=${execs_per_sec} paths=${paths_total}"
-# Threshold is 20 execs/sec — afl-as instrumentation is coarser than
-# afl-clang-fast LLVM mode (deferred). Real campaigns run for hours and
-# don't care about this; the smoke just verifies the forkserver works.
+# Threshold is a conservative 20 execs/sec — just enough to confirm the
+# forkserver is alive. afl-clang-fast LLVM mode is fast; real campaigns
+# run for hours and don't lean on this number.
 awk -v e="${execs_per_sec}" 'BEGIN{exit !(e+0 >= 20)}' \
     || { echo "[smoke] FAIL: execs/sec below 20"; exit 1; }
 awk -v p="${paths_total}" 'BEGIN{exit !(p+0 >= 1)}' \

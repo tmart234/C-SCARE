@@ -32,18 +32,20 @@ fi
 
 TARGET="$1"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ASAN_BUILD="${REPO_ROOT}/fuzz/build-asan"
 
-# Resolve target → fuzz script + binary name.
+# Resolve target → fuzz script + binary name + build dir. The file/SCU
+# targets live in the AFL++ afl-clang-fast build (build-llvm); the network
+# targets in the AFLNet afl-gcc build (build-net). See scripts/build_dcmtk.sh.
 case "${TARGET}" in
-    file)         FUZZ_SCRIPT=fuzz_file.sh    BIN_NAME=dcm2pnm  ;;
-    parse)        FUZZ_SCRIPT=fuzz_parse.sh   BIN_NAME=dcmdump  ;;
-    net-storescp) FUZZ_SCRIPT=fuzz_net.sh     BIN_NAME=storescp ;;
-    net-dcmrecv)  FUZZ_SCRIPT=fuzz_dcmrecv.sh BIN_NAME=dcmrecv  ;;
-    net-dcmqrscp) FUZZ_SCRIPT=fuzz_dcmqrscp.sh BIN_NAME=dcmqrscp ;;
-    scu)          FUZZ_SCRIPT=fuzz_scu.sh     BIN_NAME=storescu ;;
+    file)         FUZZ_SCRIPT=fuzz_file.sh    BIN_NAME=dcm2pnm  BUILD_SUBDIR=build-llvm ;;
+    parse)        FUZZ_SCRIPT=fuzz_parse.sh   BIN_NAME=dcmdump  BUILD_SUBDIR=build-llvm ;;
+    net-storescp) FUZZ_SCRIPT=fuzz_net.sh     BIN_NAME=storescp BUILD_SUBDIR=build-net  ;;
+    net-dcmrecv)  FUZZ_SCRIPT=fuzz_dcmrecv.sh BIN_NAME=dcmrecv  BUILD_SUBDIR=build-net  ;;
+    net-dcmqrscp) FUZZ_SCRIPT=fuzz_dcmqrscp.sh BIN_NAME=dcmqrscp BUILD_SUBDIR=build-net  ;;
+    scu)          FUZZ_SCRIPT=fuzz_scu.sh     BIN_NAME=storescu BUILD_SUBDIR=build-llvm ;;
     *) echo "[campaign] unknown target '${TARGET}'"; exit 2 ;;
 esac
+BUILD_DIR="${REPO_ROOT}/fuzz/${BUILD_SUBDIR}"
 
 CAMPAIGN_HOURS="${CAMPAIGN_HOURS:-24}"
 SATURATION_HOURS="${SATURATION_HOURS:-6}"
@@ -61,16 +63,16 @@ RUN_DIR="${REPO_ROOT}/fuzz/runs/${TARGET}/$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "${RUN_DIR}"
 
 # Resolve binary + sha. Built before launching the fuzz script.
-BIN_PATH="$(find "${ASAN_BUILD}" -type f -name "${BIN_NAME}" -executable | head -1 || true)"
+BIN_PATH="$(find "${BUILD_DIR}" -type f -name "${BIN_NAME}" -executable | head -1 || true)"
 if [[ -z "${BIN_PATH}" ]]; then
-    echo "[campaign] ${BIN_NAME} not found under ${ASAN_BUILD} — run scripts/build_dcmtk.sh"
+    echo "[campaign] ${BIN_NAME} not found under ${BUILD_DIR} — run scripts/build_dcmtk.sh"
     exit 1
 fi
 BIN_SHA=$(sha256sum "${BIN_PATH}" | awk '{print $1}')
 
 # Snapshot build manifest into the run dir.
-if [[ -f "${ASAN_BUILD}/build_manifest.txt" ]]; then
-    cp "${ASAN_BUILD}/build_manifest.txt" "${RUN_DIR}/build_manifest.txt"
+if [[ -f "${BUILD_DIR}/build_manifest.txt" ]]; then
+    cp "${BUILD_DIR}/build_manifest.txt" "${RUN_DIR}/build_manifest.txt"
 fi
 
 # Compute SHAs for inputs that affect the run (best-effort; missing → "").
