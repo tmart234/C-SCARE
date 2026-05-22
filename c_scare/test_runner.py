@@ -36,8 +36,8 @@ import tempfile
 try:
     from .attacks import (
         ParserAttacks, ProtocolAttacks, MemoryAttacks, LogicAttacks,
-        CommandInjectionAttacks, StateMachineAttacks, CVEAttacks,
-        ProtocolFuzzer, AttackResult, SCAPY_AVAILABLE
+        CommandInjectionAttacks, PathTraversalAttacks, StateMachineAttacks,
+        CVEAttacks, ProtocolFuzzer, AttackResult, SCAPY_AVAILABLE
     )
     from . import deliver
     from .monitor import (
@@ -48,8 +48,8 @@ try:
 except ImportError:
     from attacks import (
         ParserAttacks, ProtocolAttacks, MemoryAttacks, LogicAttacks,
-        CommandInjectionAttacks, StateMachineAttacks, CVEAttacks,
-        ProtocolFuzzer, AttackResult, SCAPY_AVAILABLE
+        CommandInjectionAttacks, PathTraversalAttacks, StateMachineAttacks,
+        CVEAttacks, ProtocolFuzzer, AttackResult, SCAPY_AVAILABLE
     )
     import deliver
     from monitor import (
@@ -472,6 +472,7 @@ def run_generate_corpus(args) -> int:
         ('Memory attacks', MemoryAttacks),
         ('Logic attacks', LogicAttacks),
         ('Command injection attacks', CommandInjectionAttacks),
+        ('Path traversal attacks', PathTraversalAttacks),
         ('CVE attacks', CVEAttacks),
         ('Protocol attacks', ProtocolAttacks),
         ('State machine attacks', StateMachineAttacks),
@@ -620,6 +621,33 @@ def run_command_injection_attacks(args) -> int:
     return 0
 
 
+def run_path_traversal_attacks(args) -> int:
+    """Run path-traversal attack tests (storescp/SCU stored filenames)."""
+    print("\n=== Path Traversal Attacks ===\n")
+
+    results = []
+    for i, result in enumerate(PathTraversalAttacks.all()):
+        try:
+            _maybe_deliver(args, result, i)
+            print_result(result, args.verbose)
+            results.append(result)
+        except Exception as e:
+            print(f"✗ {result.name}: {e}")
+
+    print(f"\nTotal path traversal attack tests: {len(results)}")
+    print("Note: confirming the write primitive needs a live storescp (SCP, "
+          "CVE-2022-2119) or a RawSCP rogue server feeding a client (SCU, "
+          "CVE-2022-2120); inspect where the received file lands.")
+    _collect_results(args, results)
+
+    if args.output:
+        os.makedirs(args.output, exist_ok=True)
+        for result in results:
+            _save_corpus_file(result, args.output)
+
+    return 0
+
+
 def run_state_machine_attacks(args) -> int:
     """Run state machine attack tests."""
     if not args.target:
@@ -728,6 +756,7 @@ def run_all_tests(args) -> int:
         ('Memory Attacks', run_memory_attacks),
         ('Logic Attacks', run_logic_attacks),
         ('Command Injection Attacks', run_command_injection_attacks),
+        ('Path Traversal Attacks', run_path_traversal_attacks),
         ('Fuzz Packets', run_fuzz_packets),
     ]
     
@@ -766,6 +795,7 @@ def run_command(command: str, args) -> int:
         'memory_attacks': run_memory_attacks,
         'logic_attacks': run_logic_attacks,
         'command_injection_attacks': run_command_injection_attacks,
+        'path_traversal_attacks': run_path_traversal_attacks,
         'state_machine_attacks': run_state_machine_attacks,
         'all': run_all_tests,
     }
@@ -931,7 +961,8 @@ def main(argv: Optional[List[str]] = None):
     parser.add_argument(
         '--category',
         choices=['parser', 'protocol', 'memory', 'logic', 'command_injection',
-                 'state_machine', 'cve', 'fuzz_packet', 'live_fuzz', 'all'],
+                 'path_traversal', 'state_machine', 'cve', 'fuzz_packet',
+                 'live_fuzz', 'all'],
         help='Test category to run (if not specified, runs all)'
     )
     
@@ -1000,6 +1031,7 @@ def main(argv: Optional[List[str]] = None):
         'memory': 'memory_attacks',
         'logic': 'logic_attacks',
         'command_injection': 'command_injection_attacks',
+        'path_traversal': 'path_traversal_attacks',
         'state_machine': 'state_machine_attacks',
         'cve': 'cve_attacks',
         'fuzz_packet': 'fuzz_packets',
