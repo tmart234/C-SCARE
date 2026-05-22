@@ -26,7 +26,7 @@ def _make_afl_out(tmp_path, layout='afl'):
 
 def test_targets_match_campaign_script():
     assert set(greybox.TARGETS) == {
-        'file', 'net-storescp', 'net-dcmrecv', 'net-dcmqrscp',
+        'file', 'parse', 'net-storescp', 'net-dcmrecv', 'net-dcmqrscp', 'scu',
     }
 
 

@@ -7,7 +7,7 @@
 #
 # Usage:
 #   scripts/campaign.sh <target>
-#       target ∈ {file, net-storescp, net-dcmrecv, net-dcmqrscp}
+#       target ∈ {file, parse, net-storescp, net-dcmrecv, net-dcmqrscp, scu}
 #
 # Env knobs:
 #   CAMPAIGN_HOURS   — wallclock cap (default 24, sample range 24–72)
@@ -26,7 +26,7 @@ set -euo pipefail
 
 if [[ $# -ne 1 ]]; then
     echo "Usage: $0 <target>"
-    echo "  target ∈ {file, net-storescp, net-dcmrecv, net-dcmqrscp}"
+    echo "  target ∈ {file, parse, net-storescp, net-dcmrecv, net-dcmqrscp, scu}"
     exit 2
 fi
 
@@ -37,9 +37,11 @@ ASAN_BUILD="${REPO_ROOT}/fuzz/build-asan"
 # Resolve target → fuzz script + binary name.
 case "${TARGET}" in
     file)         FUZZ_SCRIPT=fuzz_file.sh    BIN_NAME=dcm2pnm  ;;
+    parse)        FUZZ_SCRIPT=fuzz_parse.sh   BIN_NAME=dcmdump  ;;
     net-storescp) FUZZ_SCRIPT=fuzz_net.sh     BIN_NAME=storescp ;;
     net-dcmrecv)  FUZZ_SCRIPT=fuzz_dcmrecv.sh BIN_NAME=dcmrecv  ;;
     net-dcmqrscp) FUZZ_SCRIPT=fuzz_dcmqrscp.sh BIN_NAME=dcmqrscp ;;
+    scu)          FUZZ_SCRIPT=fuzz_scu.sh     BIN_NAME=storescu ;;
     *) echo "[campaign] unknown target '${TARGET}'"; exit 2 ;;
 esac
 
@@ -79,9 +81,11 @@ DICT_SHA=""
 SEEDS_DIR=""
 case "${TARGET}" in
     file)         SEEDS_DIR="${REPO_ROOT}/fuzz/seeds/file" ;;
+    parse)        SEEDS_DIR="${REPO_ROOT}/fuzz/seeds/file" ;;
     net-storescp) SEEDS_DIR="${REPO_ROOT}/fuzz/seeds/net-storescp" ;;
     net-dcmrecv)  SEEDS_DIR="${REPO_ROOT}/fuzz/seeds/net-dcmrecv" ;;
     net-dcmqrscp) SEEDS_DIR="${REPO_ROOT}/fuzz/seeds/net-dcmqrscp" ;;
+    scu)          SEEDS_DIR="${REPO_ROOT}/fuzz/seeds/scu" ;;
 esac
 SEEDS_SHA=""
 if [[ -d "${SEEDS_DIR}" ]]; then

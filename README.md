@@ -7,7 +7,7 @@ C-SCARE surgically crafts malformed DICOM files, datasets, and network traffic t
 |                  | **Black-box — DAST**                                                                 | **Grey-box — fuzzing**                                                              |
 |------------------|--------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------|
 | **SCP** (server) | Deliver the attack catalog live at a server, watch for protocol/health anomalies — `c-scare --ip … --category …` | Seed AFL++/AFLNet, fuzz instrumented DCMTK binaries, triage crashes — `c-scare greybox …` |
-| **SCU** (client) | `RawSCP` rogue server feeds malformed responses to a connecting client — `c-scare rogue …` | Instrument the client binary and drive it against `RawSCP` (experimental, out of scope) |
+| **SCU** (client) | `RawSCP` rogue server feeds malformed responses to a connecting client — `c-scare rogue …` | Instrument a DICOM client (DCMTK `storescu`) and AFL-fuzz the server-response stream via a desock shim — `c-scare greybox run scu` (experimental) |
 
 ### What C-SCARE is — and is not
 
@@ -195,7 +195,25 @@ See [PROTOCOL.md](PROTOCOL.md) for byte-level DICOM structure (file format, data
 
 ## DCMTK Fuzzing Toolchain
 
-This is the **grey-box** half of the matrix. The `fuzz/` tree and `scripts/` shell harnesses run AFL++ / AFLNet — the actual fuzzing engines — against DCMTK binaries (`dcm2pnm`, `storescp`, `dcmrecv`, `dcmqrscp`). C-SCARE supplies the seed corpus (`c-scare corpus`), the dictionary, the harnesses, and crash triage (`c-scare greybox triage`); AFL++/AFLNet own the mutation loop and coverage feedback. For coverage and campaign reporting see `scripts/coverage.sh` and `scripts/campaign.sh` below.
+This is the **grey-box** half of the matrix. The `fuzz/` tree and `scripts/` shell harnesses run AFL++ / AFLNet — the actual fuzzing engines — against DCMTK binaries. C-SCARE supplies the seed corpus (`c-scare corpus`), the dictionary, the harnesses, and crash triage (`c-scare greybox triage`); AFL++/AFLNet own the mutation loop and coverage feedback. For coverage and campaign reporting see `scripts/coverage.sh` and `scripts/campaign.sh` below.
+
+Grey-box targets (`scripts/campaign.sh <target>` / `c-scare greybox run <target>`):
+
+| Target | Binary | Quadrant |
+|--------|--------|----------|
+| `file` | `dcm2pnm` | SCP grey-box — file + pixel pipeline (AFL++) |
+| `parse` | `dcmdump` | SCP grey-box — dataset/element parser (AFL++) |
+| `net-storescp` / `net-dcmrecv` / `net-dcmqrscp` | `storescp` / `dcmrecv` / `dcmqrscp` | SCP grey-box — network (AFLNet) |
+| `scu` | `storescu` | SCU grey-box — client response parser (AFL++ + desock, experimental) |
+
+### Fuzzing a custom DICOM binary
+
+The harnesses default to DCMTK's stock tools, but the framework targets any DICOM binary:
+
+- **Black-box** — point `c-scare --ip … --port …` (DAST) or `c-scare rogue` at your live service. No build access or instrumentation needed; works against a real device or a container.
+- **Grey-box** — coverage-guided fuzzing needs the target *instrumented*, so it cannot run from a stock container image. Build your binary with the AFL compiler wrappers (`$AFLPP_PATH/afl-clang-fast` or `afl-gcc` — see `scripts/install_afl.sh`).
+  - *File / parser path*: if your binary has no standalone file mode, copy `fuzz/harness/parse_harness.c`, wire in your parse entry point, and fuzz it with AFL++.
+  - *Network path*: AFLNet's `-P DICOM` parser drives any DICOM listener — adapt `scripts/fuzz_net.sh` to your binary's launch command.
 
 ### Device parity (READ THIS)
 
@@ -249,7 +267,7 @@ scripts/coverage.sh file      # replays fuzz/out/file/{queue,crashes}
 | `SATURATION_HOURS` | 6       | Stop early if no new edges/paths for this long. Effective floor is `max(SATURATION_HOURS, CAMPAIGN_HOURS/10)`. |
 | `POLL_SECONDS`     | 60      | Poll cadence on `fuzzer_stats`.                                 |
 
-Targets: `file` (dcm2pnm), `net-storescp`, `net-dcmrecv`, `net-dcmqrscp`.
+Targets: `file` (dcm2pnm), `parse` (dcmdump), `net-storescp`, `net-dcmrecv`, `net-dcmqrscp`, `scu` (storescu, experimental).
 
 ## License
 

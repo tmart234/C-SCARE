@@ -19,8 +19,8 @@
 # Out-of-tree build dir: fuzz/build-asan/. Records provenance to
 # build_manifest.txt (consumed by scripts/campaign.sh run.json).
 #
-# Targets dcm2pnm (file fuzz), dcmconv (smoke), storescp / dcmrecv /
-# dcmqrscp (network fuzz).
+# Targets dcm2pnm / dcmdump (file + parser fuzz), dcmconv (smoke),
+# storescu (SCU/client fuzz), storescp / dcmrecv / dcmqrscp (network fuzz).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -114,7 +114,7 @@ cmake "${DCMTK_SRC}" \
     -DDCMTK_WITH_THREADS=ON \
     "${EXTRA_ARGS[@]}"
 
-TARGETS=(dcm2pnm dcmconv storescp dcmrecv dcmqrscp)
+TARGETS=(dcm2pnm dcmconv dcmdump storescu storescp dcmrecv dcmqrscp)
 cmake --build . --parallel "${JOBS}" --target "${TARGETS[@]}"
 
 # Provenance manifest — consumed by scripts/campaign.sh.

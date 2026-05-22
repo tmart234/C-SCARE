@@ -29,12 +29,17 @@ __all__ = [
     'TARGETS', 'repo_root', 'run', 'list_crashes', 'triage', 'triage_to_sarif',
 ]
 
-# target -> fuzz harness script (mirrors scripts/campaign.sh)
+# target -> fuzz harness script (mirrors scripts/campaign.sh).
+# file/parse  = SCP grey-box, file path (AFL++)
+# net-*       = SCP grey-box, network path (AFLNet)
+# scu         = SCU grey-box, client path (AFL++ + desock)
 TARGETS = {
     'file': 'fuzz_file.sh',
+    'parse': 'fuzz_parse.sh',
     'net-storescp': 'fuzz_net.sh',
     'net-dcmrecv': 'fuzz_dcmrecv.sh',
     'net-dcmqrscp': 'fuzz_dcmqrscp.sh',
+    'scu': 'fuzz_scu.sh',
 }
 
 
