@@ -63,8 +63,21 @@ flowchart TD
 
 ### Install
 
+C-SCARE is not published on PyPI — install it from source:
+
 ```bash
-pip install c_scare scapy pydicom  # pydicom is a hard dependency
+git clone https://github.com/tmart234/C-SCARE
+cd C-SCARE
+pip install -e .            # core install: pydicom + scapy
+pip install -e ".[test]"    # also installs pytest + pynetdicom (test suite)
+```
+
+The grey-box fuzzing toolchain additionally needs the git submodules and a
+DCMTK build (see [Grey-box fuzzing](#dcmtk-fuzzing-toolchain) below):
+
+```bash
+git submodule update --init   # AFL++, AFLNet, DCMTK
+scripts/build_dcmtk.sh        # build DCMTK instrumented with ASan
 ```
 
 ### 1. Corrupt a real DICOM file

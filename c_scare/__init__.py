@@ -6,7 +6,7 @@ A comprehensive framework for testing DICOM protocol implementations
 using Scapy-based packet crafting and fuzzing.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __author__ = "Tyler M"
 
 # Import all symbols from scapy_dicom
@@ -140,6 +140,26 @@ from .scapy_dicom import (
     STATUS_ERR_NOT_AUTHORIZED,
 )
 
+# DICOM dataset & Part-10 file construction
+from .element import Tag, VR, Element, Dataset, Sequence, hexdump
+from .file import FileMetaInformation, DicomFile, make_secondary_capture
+
+# pydicom-bridged surgical corruption (parse with pydicom, emit invalid bytes)
+from .corruptor import (
+    Corruptor, InjectionPoint, Override, Injection, SequencePath,
+    corrupt_vr, corrupt_length, duplicate_tag,
+)
+
+# Encapsulated pixel-data corruption
+from .pixel import (
+    Fragment, EncapsulatedPixelData, PixelData, PixelFuzzer,
+    extract_frames, extract_frames_from_file,
+)
+
+# Rogue SCP (SCU / client fuzzing) and raw network delivery
+from .server import RawSCP, ConnectionState, Connection
+from .deliver import send_pdu, send_sequence, send_cstore
+
 __all__ = [
     # Version
     "__version__",
@@ -271,6 +291,18 @@ __all__ = [
     "STATUS_ERR_UNRECOGNIZED_OPERATION",
     "STATUS_ERR_NO_SUCH_ACTION_TYPE",
     "STATUS_ERR_NOT_AUTHORIZED",
+    # DICOM dataset & file construction
+    "Tag", "VR", "Element", "Dataset", "Sequence", "hexdump",
+    "FileMetaInformation", "DicomFile", "make_secondary_capture",
+    # Surgical corruption
+    "Corruptor", "InjectionPoint", "Override", "Injection", "SequencePath",
+    "corrupt_vr", "corrupt_length", "duplicate_tag",
+    # Pixel data
+    "Fragment", "EncapsulatedPixelData", "PixelData", "PixelFuzzer",
+    "extract_frames", "extract_frames_from_file",
+    # Rogue server & network delivery
+    "RawSCP", "ConnectionState", "Connection",
+    "send_pdu", "send_sequence", "send_cstore",
     # Monitor framework
     "BaseMonitor",
     "MonitorReport",

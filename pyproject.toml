@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "c-scare"
+version = "0.2.0"
+description = "DICOM Security Testing Framework - black-box DAST and grey-box fuzzing for DICOM implementations"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "GPL-2.0-only" }
+authors = [{ name = "Tyler M" }]
+keywords = ["dicom", "security", "fuzzing", "dast", "medical-devices"]
+dependencies = [
+    "pydicom>=2.4",
+    "scapy>=2.5",
+]
+
+[project.optional-dependencies]
+# Test suite + the optional pynetdicom-backed valid-association helper.
+test = ["pytest", "pynetdicom"]
+
+[project.urls]
+Homepage = "https://github.com/tmart234/C-SCARE"
+
+[project.scripts]
+c-scare = "c_scare.test_runner:main"
+
+[tool.setuptools]
+packages = ["c_scare"]
