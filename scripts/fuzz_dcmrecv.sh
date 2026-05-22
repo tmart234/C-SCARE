@@ -49,5 +49,6 @@ exec "${AFL_PATH}/afl-fuzz" \
     -D 10000 \
     -W 30 \
     -m none \
+    -E \
     -q 3 \
     -- "${DCMRECV}" "${PORT}" --output-directory "${STORAGE_DIR}" --eostudy-timeout 1

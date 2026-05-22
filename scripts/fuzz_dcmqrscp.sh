@@ -54,5 +54,6 @@ exec "${AFL_PATH}/afl-fuzz" \
     -D 10000 \
     -W 30 \
     -m none \
+    -E \
     -q 3 \
     -- "${DCMQRSCP}" -c "${CFG_RUNTIME}" "${PORT}"
