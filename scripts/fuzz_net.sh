@@ -47,10 +47,14 @@ fi
 
 # AFLNet flags:
 #   -N tcp://...    target socket address (informs AFLNet, not bound by it)
-#   -D 10000        delay (us) between requests so the SCP can settle
+#   -D 10000        wait (us) for the SCP to initialize before the first request
 #   -W 30           wait (ms) for response after sending each message
 #   -m none         no memory limit (ASAN needs ample VM)
-#   -q 3            timeout-aware mode (kill stuck targets cleanly)
+#   -E              state-aware mode: build the IPSM from server responses.
+#                   Required — AFLNet defaults the seed schedule to IPSM
+#                   (-h 2), which afl-fuzz rejects unless -E is set.
+#   -q 3            state selection algorithm: FAVOR. Only takes effect in
+#                   state-aware mode.
 exec "${AFL_PATH}/afl-fuzz" \
     -i "${INPUT_ARG}" \
     -o "${OUT_DIR}" \
@@ -59,5 +63,6 @@ exec "${AFL_PATH}/afl-fuzz" \
     -D 10000 \
     -W 30 \
     -m none \
+    -E \
     -q 3 \
     -- "${STORESCP}" "${PORT}" --eostudy-timeout 1
