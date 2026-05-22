@@ -160,6 +160,14 @@ c-scare greybox run net-storescp      # fuzz storescp via AFLNet
 c-scare greybox triage fuzz/out/file \
     --binary fuzz/build-llvm/bin/dcm2pnm --arg @@ --arg /tmp/out.pnm \
     --sarif crashes.sarif
+
+# Add --include-queue to also hunt leak-class bugs: a memory leak is not a
+# crash, so its trigger sits in queue/, not crashes/. The triage replay is a
+# clean one-shot process, so it forces detect_leaks=1 and LeakSanitizer's
+# atexit scan reports the leak (works for file targets — dcm2pnm/dcmdump).
+c-scare greybox triage fuzz/out/file \
+    --binary fuzz/build-llvm/bin/dcm2pnm --arg @@ --arg /tmp/out.pnm \
+    --include-queue --sarif findings.sarif
 ```
 
 ## Attack Categories
@@ -170,7 +178,8 @@ c-scare greybox triage fuzz/out/file \
 | **Protocol** | PDU malformation, AE title overflow, missing items | `ProtocolAttacks` |
 | **Memory** | Pixel dimension overflow, fragment bombs, LUT overflow | `MemoryAttacks` |
 | **Logic** | Transfer syntax mismatch, SSRF via URI, file:// injection | `LogicAttacks` |
-| **Command Injection** | Shell metacharacters in SOP/Study Instance UID & Patient Name that feed storescp's `--exec-on-reception` placeholders (DCMTK #1194) | `CommandInjectionAttacks` |
+| **Command Injection** | Shell metacharacters in SOP/Study Instance UID & Patient Name that feed storescp's `--exec-on-reception` placeholders (DCMTK #1194 / CVE-2026-5663) | `CommandInjectionAttacks` |
+| **Path Traversal** | `../` sequences in SOP/Study Instance UID & Patient Name that escape the storescp/SCU storage directory (CVE-2022-2119/2120) | `PathTraversalAttacks` |
 | **State Machine** | Out-of-order PDUs (Sta1–Sta13 violations) | `StateMachineAttacks` |
 | **CVE** | CVE-2023-32135, CVE-2024-24793/94, CVE-2024-33606, CVE-2019-11687, and more | `CVEAttacks` |
 

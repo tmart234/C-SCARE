@@ -16,6 +16,13 @@ AFLNet replays these byte streams against the live SCP, then mutates within
 them. The DICOM PDU header (1B type + 1B reserved + 4B BE length) is the
 natural message boundary for AFLNet's built-in `-P DICOM` parser.
 
+The net-dcmqrscp C-FIND/C-MOVE/C-GET flow drives the dcmqrdb Q/R database
+back end — the grey-box coverage for its query-handling bug class:
+CVE-2021-41687 / -41688 / -41689 / -41690 (memory leak, double free,
+heap overflow, memory leak). The leak-class entries need ASan/LSan to
+surface; see the campaign notes. The net-storescp / net-dcmrecv C-STORE
+flow exercises the dcmnet receive path (CVE-2024-34508, invalid DIMSE).
+
 Determinism: a fixed seed (env C_SCARE_SERIALIZER_SEED, default 0xC5CA8E)
 drives random.Random for message IDs. The seed is written to SEED.txt
 alongside the .raw files so reruns are reproducible.

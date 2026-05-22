@@ -71,6 +71,18 @@ ASAN_DEADLYSIGNAL = """\
     #1 0x4f1111 in caller /src/dcmdata/libsrc/caller.cc:100
 """
 
+LSAN_MEMORY_LEAK = """\
+=================================================================
+==45678==ERROR: LeakSanitizer: detected memory leaks
+
+Direct leak of 1024 byte(s) in 1 object(s) allocated from:
+    #0 0x7f9876543210 in malloc (/usr/lib/x86_64-linux-gnu/libasan.so.6+0xb0321)
+    #1 0x4a0000 in DcmQueryRetrieveConfig::readPeerList /src/dcmqrdb/libsrc/dcmqrcnf.cc:512
+    #2 0x4b1111 in main /src/apps/dcmqrscp.cc:201
+
+SUMMARY: AddressSanitizer: 1024 byte(s) leaked in 1 allocation(s).
+"""
+
 UBSAN_SIGNED_OVERFLOW = """\
 /src/dcmdata/libsrc/dcvr.cc:123:5: runtime error: signed integer overflow: 2147483647 + 1 cannot be represented in type 'int'
 """
@@ -131,6 +143,15 @@ class TestParseSanitizerOutput:
         assert f.sanitizer == 'asan'
         assert f.error_kind == 'DEADLYSIGNAL'
         assert 'bad_function' in f.stack_trace
+
+    def test_lsan_memory_leak(self):
+        findings = parse_sanitizer_output(LSAN_MEMORY_LEAK)
+        assert len(findings) == 1
+        f = findings[0]
+        assert f.sanitizer == 'lsan'
+        assert f.error_kind == 'memory-leak'
+        assert 'leaked' in f.summary
+        assert 'readPeerList' in f.stack_trace
 
     def test_ubsan_signed_overflow(self):
         findings = parse_sanitizer_output(UBSAN_SIGNED_OVERFLOW)

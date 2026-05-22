@@ -36,8 +36,8 @@ import tempfile
 try:
     from .attacks import (
         ParserAttacks, ProtocolAttacks, MemoryAttacks, LogicAttacks,
-        CommandInjectionAttacks, StateMachineAttacks, CVEAttacks,
-        ProtocolFuzzer, AttackResult, SCAPY_AVAILABLE
+        CommandInjectionAttacks, PathTraversalAttacks, StateMachineAttacks,
+        CVEAttacks, ProtocolFuzzer, AttackResult, SCAPY_AVAILABLE
     )
     from . import deliver
     from .monitor import (
@@ -48,8 +48,8 @@ try:
 except ImportError:
     from attacks import (
         ParserAttacks, ProtocolAttacks, MemoryAttacks, LogicAttacks,
-        CommandInjectionAttacks, StateMachineAttacks, CVEAttacks,
-        ProtocolFuzzer, AttackResult, SCAPY_AVAILABLE
+        CommandInjectionAttacks, PathTraversalAttacks, StateMachineAttacks,
+        CVEAttacks, ProtocolFuzzer, AttackResult, SCAPY_AVAILABLE
     )
     import deliver
     from monitor import (
@@ -243,10 +243,7 @@ def run_cve_attacks(args) -> int:
     if args.output:
         os.makedirs(args.output, exist_ok=True)
         for result in all_results:
-            filepath = os.path.join(args.output, f"{result.name}.dcm")
-            file_data = b'\x00' * 128 + b'DICM' + result.payload
-            with open(filepath, 'wb') as f:
-                f.write(file_data)
+            filepath = _save_corpus_file(result, args.output)
             if args.verbose:
                 print(f"Saved: {filepath}")
 
@@ -442,10 +439,16 @@ def _save_corpus_file(result: AttackResult, output_dir: str) -> str:
         file_data = result.payload
     else:
         ext = '.dcm'
-        if result.payload and not result.payload.startswith(b'DICM'):
-            file_data = b'\x00' * 128 + b'DICM' + result.payload
+        payload = result.payload or b''
+        # A payload already carrying the Part 10 magic — a raw file (DICM at
+        # offset 0) or a complete file with a 128-byte preamble (DICM at
+        # offset 128, e.g. the CVE-2019-11687 polyglots) — must be written
+        # verbatim. Re-wrapping a polyglot buries its executable preamble at
+        # offset 132 and destroys the seed.
+        if payload.startswith(b'DICM') or payload[128:132] == b'DICM':
+            file_data = payload
         else:
-            file_data = result.payload
+            file_data = b'\x00' * 128 + b'DICM' + payload
 
     filepath = os.path.join(output_dir, f"{result.name}{ext}")
     with open(filepath, 'wb') as f:
@@ -469,6 +472,7 @@ def run_generate_corpus(args) -> int:
         ('Memory attacks', MemoryAttacks),
         ('Logic attacks', LogicAttacks),
         ('Command injection attacks', CommandInjectionAttacks),
+        ('Path traversal attacks', PathTraversalAttacks),
         ('CVE attacks', CVEAttacks),
         ('Protocol attacks', ProtocolAttacks),
         ('State machine attacks', StateMachineAttacks),
@@ -617,6 +621,33 @@ def run_command_injection_attacks(args) -> int:
     return 0
 
 
+def run_path_traversal_attacks(args) -> int:
+    """Run path-traversal attack tests (storescp/SCU stored filenames)."""
+    print("\n=== Path Traversal Attacks ===\n")
+
+    results = []
+    for i, result in enumerate(PathTraversalAttacks.all()):
+        try:
+            _maybe_deliver(args, result, i)
+            print_result(result, args.verbose)
+            results.append(result)
+        except Exception as e:
+            print(f"✗ {result.name}: {e}")
+
+    print(f"\nTotal path traversal attack tests: {len(results)}")
+    print("Note: confirming the write primitive needs a live storescp (SCP, "
+          "CVE-2022-2119) or a RawSCP rogue server feeding a client (SCU, "
+          "CVE-2022-2120); inspect where the received file lands.")
+    _collect_results(args, results)
+
+    if args.output:
+        os.makedirs(args.output, exist_ok=True)
+        for result in results:
+            _save_corpus_file(result, args.output)
+
+    return 0
+
+
 def run_state_machine_attacks(args) -> int:
     """Run state machine attack tests."""
     if not args.target:
@@ -725,6 +756,7 @@ def run_all_tests(args) -> int:
         ('Memory Attacks', run_memory_attacks),
         ('Logic Attacks', run_logic_attacks),
         ('Command Injection Attacks', run_command_injection_attacks),
+        ('Path Traversal Attacks', run_path_traversal_attacks),
         ('Fuzz Packets', run_fuzz_packets),
     ]
     
@@ -763,6 +795,7 @@ def run_command(command: str, args) -> int:
         'memory_attacks': run_memory_attacks,
         'logic_attacks': run_logic_attacks,
         'command_injection_attacks': run_command_injection_attacks,
+        'path_traversal_attacks': run_path_traversal_attacks,
         'state_machine_attacks': run_state_machine_attacks,
         'all': run_all_tests,
     }
@@ -859,6 +892,9 @@ def _cmd_greybox(argv: List[str]) -> int:
                      help='binary argument; use @@ for the crash file path')
     trp.add_argument('--sarif', help='write a SARIF v2.1.0 report here')
     trp.add_argument('--timeout', type=float, default=10.0)
+    trp.add_argument('--include-queue', action='store_true',
+                     help='also triage queue inputs — required to catch '
+                          'leak-class bugs, which do not crash')
     a = p.parse_args(argv)
 
     if a.gbcmd == 'run':
@@ -866,9 +902,10 @@ def _cmd_greybox(argv: List[str]) -> int:
 
     cmd = ([a.binary] + a.args) if a.binary else None
     results = greybox.triage_to_sarif(
-        a.crashes, cmd=cmd, sarif_path=a.sarif, timeout=a.timeout)
+        a.crashes, cmd=cmd, sarif_path=a.sarif, timeout=a.timeout,
+        include_queue=a.include_queue)
     detected = sum(1 for r in results if r.success)
-    print(f"\nTriaged {len(results)} crash input(s); "
+    print(f"\nTriaged {len(results)} fuzz input(s); "
           f"{detected} reproduced a sanitizer/crash finding")
     for r in results:
         mark = '!' if r.success else ('.' if cmd else '?')
@@ -928,7 +965,8 @@ def main(argv: Optional[List[str]] = None):
     parser.add_argument(
         '--category',
         choices=['parser', 'protocol', 'memory', 'logic', 'command_injection',
-                 'state_machine', 'cve', 'fuzz_packet', 'live_fuzz', 'all'],
+                 'path_traversal', 'state_machine', 'cve', 'fuzz_packet',
+                 'live_fuzz', 'all'],
         help='Test category to run (if not specified, runs all)'
     )
     
@@ -997,6 +1035,7 @@ def main(argv: Optional[List[str]] = None):
         'memory': 'memory_attacks',
         'logic': 'logic_attacks',
         'command_injection': 'command_injection_attacks',
+        'path_traversal': 'path_traversal_attacks',
         'state_machine': 'state_machine_attacks',
         'cve': 'cve_attacks',
         'fuzz_packet': 'fuzz_packets',
