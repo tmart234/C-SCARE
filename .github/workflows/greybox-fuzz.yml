@@ -1,11 +1,13 @@
 name: Grey-box fuzz smoke (DCMTK + AFL)
 
-# The grey-box quadrant. Two jobs, both heavy, so this runs on merge to
-# main and on demand rather than per-PR:
+# The grey-box quadrant. Two jobs, both heavy:
 #   greybox-smoke - build DCMTK 3.6.7 instrumented with AFL + ASan, then run
-#                   scripts/smoke.sh. The fastest-fuzzing path.
+#                   scripts/smoke.sh. The fastest-fuzzing path. The full
+#                   instrumented build is slow, so this job is manual-only
+#                   (workflow_dispatch).
 #   qemu-smoke    - fuzz the *prebuilt* (apt) DCMTK 3.6.7 via AFL++ QEMU mode,
-#                   proving the no-recompilation path works.
+#                   proving the no-recompilation path works. Runs on every
+#                   merge to main and on demand.
 on:
   push:
     branches: [main]
@@ -14,6 +16,9 @@ on:
 jobs:
   greybox-smoke:
     name: Instrumented build (DCMTK 3.6.7 + AFL + ASan)
+    # Manual-only: the full instrumented DCMTK build is slow. The qemu-smoke
+    # job below covers merge-to-main.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -71,8 +76,11 @@ jobs:
           sudo apt-get update
           # graphviz/libcap dev libs: install_afl.sh builds AFLNet, whose
           # Makefile links afl-* against -lgvc -lcgraph -lcap on Linux.
+          # meson + ninja-build: AFL++ qemuafl builds QEMU with the Meson
+          # build system; without meson build_qemu_support.sh aborts early
+          # with "ERROR: Meson not found".
           sudo apt-get install -y dcmtk build-essential clang llvm-dev \
-            libglib2.0-dev ninja-build flex bison libtool libtool-bin \
+            libglib2.0-dev meson ninja-build flex bison libtool libtool-bin \
             automake pkg-config graphviz libgraphviz-dev libcap-dev
           python -m pip install --upgrade pip
           pip install -e .
