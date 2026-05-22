@@ -168,6 +168,12 @@ c-scare greybox triage fuzz/out/file \
 c-scare greybox triage fuzz/out/file \
     --binary fuzz/build-llvm/bin/dcm2pnm --arg @@ --arg /tmp/out.pnm \
     --include-queue --sarif findings.sarif
+
+# Triage AFLNet network crashes. A network input is a DICOM message stream,
+# not a file, so --net replays it at a freshly launched instrumented server
+# with aflnet-replay and parses the server's own sanitizer output.
+c-scare greybox triage fuzz/out/net-storescp --net net-storescp \
+    --binary fuzz/build-net/bin/storescp --include-queue --sarif net.sarif
 ```
 
 ## Attack Categories
@@ -280,6 +286,15 @@ c-scare greybox triage fuzz/out/file --sand dcm2pnm \
 ```
 
 `--binary <path>` (repeatable) names worker binaries explicitly instead. The triage replay also forces a full one-shot sanitizer report — `symbolize=1`, `detect_leaks=1`, and UBSan `print_stacktrace=1` — overriding the throughput-tuned options a campaign runs with.
+
+AFLNet network targets cannot use a SAND `-w` worker, so they are triaged a different way: `--net <target>` replays each crash/queue input at a freshly launched instrumented server with `aflnet-replay` and parses the **server's** own sanitizer output. A fresh server per input keeps every finding attributable to one input.
+
+```bash
+c-scare greybox triage fuzz/out/net-storescp --net net-storescp \
+    --binary fuzz/build-net/bin/storescp --include-queue --sarif net.sarif
+```
+
+Crashes triage reliably this way; a leak is reported only if the server runs its atexit LeakSanitizer scan on the triage shutdown signal, so file targets stay the dependable path for leak-class bugs.
 
 ### Coverage measurement
 
