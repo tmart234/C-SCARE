@@ -1,0 +1,39 @@
+name: Grey-box fuzz smoke (DCMTK + AFL)
+
+# The grey-box quadrant: build DCMTK instrumented with AFL + ASan and run
+# scripts/smoke.sh (valid-baseline parse, ASan-instrumentation check, and a
+# ~60s afl-fuzz forkserver run). The DCMTK + AFL build takes ~20-40 min, so
+# this runs nightly and on demand rather than on every PR.
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+jobs:
+  greybox-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake zlib1g-dev clang llvm-dev
+
+      - name: Build DCMTK under AFL + ASan
+        run: bash scripts/build_dcmtk.sh
+
+      - name: Grey-box smoke (dcm2pnm baseline + ASan + afl-fuzz)
+        run: bash scripts/smoke.sh
+
+      - name: Upload build manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: greybox-build-manifest
+          path: fuzz/build-asan/build_manifest.txt
+          if-no-files-found: ignore

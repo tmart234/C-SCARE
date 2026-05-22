@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """Tests for the grey-box fuzzing bridge (crash triage)."""
 
+import shutil
+import subprocess
 import sys
 import textwrap
+
+import pytest
 
 from c_scare import greybox
 
@@ -87,3 +91,38 @@ def test_triage_to_sarif_writes_report(tmp_path):
     doc = json.loads(sarif_path.read_text())
     assert doc['version'] == '2.1.0'
     assert len(doc['runs'][0]['results']) == 2
+
+
+@pytest.mark.skipif(shutil.which('gcc') is None, reason='gcc not available')
+def test_triage_real_asan_binary(tmp_path):
+    """End-to-end: replay a crash through a real ASan-instrumented binary."""
+    src = tmp_path / 'target.c'
+    src.write_text(textwrap.dedent('''\
+        #include <stdio.h>
+        int main(int argc, char **argv) {
+            if (argc < 2) return 0;
+            FILE *f = fopen(argv[1], "rb");
+            if (!f) return 0;
+            char buf[8];
+            size_t n = fread(buf, 1, 4096, f);  /* overflow if input > 8 */
+            fclose(f);
+            return (int)n;
+        }
+    '''))
+    binary = tmp_path / 'asan_target'
+    subprocess.run(
+        ['gcc', '-fsanitize=address', '-g', '-o', str(binary), str(src)],
+        check=True,
+    )
+    crash_dir = tmp_path / 'crashes'
+    crash_dir.mkdir()
+    (crash_dir / 'id:000000,sig:06').write_bytes(b'A' * 40)
+
+    results = greybox.triage(
+        greybox.list_crashes(str(tmp_path)),
+        cmd=[str(binary), '@@'], timeout=30,
+    )
+    assert len(results) == 1
+    assert results[0].success is True
+    kinds = ' '.join(r.finding_type for r in results[0].monitor_reports)
+    assert 'overflow' in kinds
