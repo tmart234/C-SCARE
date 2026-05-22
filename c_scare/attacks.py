@@ -12,7 +12,7 @@ The catalog has two roles in C-SCARE:
 
 Pre-built attack patterns derived from:
 1. DICOM protocol specification edge cases
-2. Real-world CVEs (2019-2024)
+2. Real-world CVEs (2019-2026)
 3. Fuzzer test cases
 
 Attack Categories:
@@ -29,10 +29,12 @@ CVE Coverage:
     CVE-2024-24793  - Use-After-Free in File Meta Info
     CVE-2024-24794  - Use-After-Free in Sequence parsing
     CVE-2024-33606  - SSRF via URI Value Representation
-    CVE-2019-11687  - Executable embedding (PEDICOM/ELFDICOM)
+    CVE-2019-11687  - Executable embedding (PEDICOM/ELFDICOM/TIFF)
     CVE-2024-22100  - Heap-based buffer overflow
     CVE-2024-25578  - Out-of-bounds write
     CVE-2024-28877  - Stack-based buffer overflow
+    CVE-2024-34509  - dcmdata segfault via invalid DIMSE message
+    CVE-2026-5663   - OS command injection via storescp exec placeholders
 
 Example:
     from c_scare.attacks import ParserAttacks, CVEAttacks, ProtocolSeedGenerator
@@ -650,7 +652,13 @@ class ProtocolAttacks:
 
     @staticmethod
     def invalid_command_field() -> AttackResult:
-        """DIMSE command with invalid command field (0xDEAD)."""
+        """DIMSE command with invalid command field (0xDEAD).
+
+        Black-box analogue of the invalid-DIMSE-message segfault class:
+        CVE-2024-34509 (dcmdata command-set parsing). The dcmnet sibling
+        CVE-2024-34508 is covered by the AFLNet net campaign, which mutates
+        full DIMSE sessions on the network-receive path.
+        """
         if not SCAPY_AVAILABLE:
             payload = b''
         else:
@@ -667,6 +675,7 @@ class ProtocolAttacks:
             payload=payload,
             description='DIMSE command with invalid field 0xDEAD',
             expected_behavior='Target should reject invalid command',
+            metadata={'cve': 'CVE-2024-34509'},
         )
 
     @classmethod
@@ -1049,7 +1058,7 @@ class LogicAttacks:
 class CommandInjectionAttacks:
     """
     Shell command injection via storescp's execution-option placeholders
-    (DCMTK issue #1194).
+    (DCMTK issue #1194, CVE-2026-5663).
 
     ``storescp`` substitutes attacker-controlled DICOM values into a command
     run through ``/bin/sh -c`` whenever ``--exec-on-reception`` (``-xcr``) or
@@ -1127,6 +1136,7 @@ class CommandInjectionAttacks:
             expected_behavior='storescp must sanitise shell metacharacters '
                               'before substituting the #f placeholder',
             metadata={
+                'cve': 'CVE-2026-5663',
                 'dcmtk_issue': 1194,
                 'placeholder': '#f',
                 'requires_option': '--exec-on-reception / --exec-on-eostudy',
@@ -1156,6 +1166,7 @@ class CommandInjectionAttacks:
             expected_behavior='storescp must sanitise shell metacharacters '
                               'before substituting the #p placeholder',
             metadata={
+                'cve': 'CVE-2026-5663',
                 'dcmtk_issue': 1194,
                 'placeholder': '#p',
                 'requires_option': '--exec-on-* with --sort-on-study-uid (-su)',
@@ -1185,6 +1196,7 @@ class CommandInjectionAttacks:
             expected_behavior='storescp must sanitise shell metacharacters '
                               'before substituting the #p placeholder',
             metadata={
+                'cve': 'CVE-2026-5663',
                 'dcmtk_issue': 1194,
                 'placeholder': '#p',
                 'requires_option': '--exec-on-* with --sort-on-patientname (-sp)',

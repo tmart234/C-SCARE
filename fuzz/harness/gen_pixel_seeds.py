@@ -90,6 +90,10 @@ def _ybr_full_planar_undersize() -> Dataset:
     the pixel buffer. The hardened path renders an empty (black) frame and
     logs a warning instead. This seed reproduces that shape so the dcm2pnm
     colour pipeline exercises the new stored-vs-expected length check.
+
+    Grey-box seed for CVE-2025-9732 — memory corruption in the YBR pixel
+    template (dcmimage/.../diybrpxt.h) reachable through any dcmimage
+    front-end (dcm2img, dcm2pnm).
     """
     ds = _baseline(EXPLICIT_VR_LE)
     ds.SamplesPerPixel = 3
