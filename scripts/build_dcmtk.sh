@@ -7,7 +7,7 @@
 #   DCMTK_SRC_DIR  — absolute path to operator-supplied DCMTK tree.
 #                    When set, the submodule and DCMTK_REF are ignored.
 #   DCMTK_REF      — git ref/tag/SHA to check out inside the submodule.
-#                    Ignored if DCMTK_SRC_DIR is set.
+#                    Defaults to DCMTK-3.6.7. Ignored if DCMTK_SRC_DIR is set.
 #
 # Compile flags:
 #   OPT_LEVEL       — defaults to -O1 (ASAN-friendly).
@@ -19,8 +19,8 @@
 # Out-of-tree build dir: fuzz/build-asan/. Records provenance to
 # build_manifest.txt (consumed by scripts/campaign.sh run.json).
 #
-# Targets dcm2pnm (file fuzz), dcmconv (smoke), storescp / dcmrecv /
-# dcmqrscp (network fuzz).
+# Targets dcm2pnm / dcmdump (file + parser fuzz), dcmconv (smoke),
+# storescu (SCU/client fuzz), storescp / dcmrecv / dcmqrscp (network fuzz).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -40,7 +40,12 @@ if [[ ! -f "${DCMTK_SRC}/CMakeLists.txt" ]]; then
     exit 1
 fi
 
-# DCMTK_REF only honoured for the submodule; never touch an operator-supplied tree.
+# DCMTK_REF only honoured for the submodule; never touch an operator-supplied
+# tree. Default to the 3.6.7 release tag so the submodule build matches the
+# commonly deployed DCMTK version; override DCMTK_REF for device parity.
+if [[ "${USING_SUBMODULE}" == 1 ]]; then
+    DCMTK_REF="${DCMTK_REF:-DCMTK-3.6.7}"
+fi
 if [[ "${USING_SUBMODULE}" == 1 && -n "${DCMTK_REF:-}" ]]; then
     if [[ -d "${DCMTK_SRC}/.git" ]]; then
         echo "[build_dcmtk] checking out DCMTK ref ${DCMTK_REF}"
@@ -114,7 +119,7 @@ cmake "${DCMTK_SRC}" \
     -DDCMTK_WITH_THREADS=ON \
     "${EXTRA_ARGS[@]}"
 
-TARGETS=(dcm2pnm dcmconv storescp dcmrecv dcmqrscp)
+TARGETS=(dcm2pnm dcmconv dcmdump storescu storescp dcmrecv dcmqrscp)
 cmake --build . --parallel "${JOBS}" --target "${TARGETS[@]}"
 
 # Provenance manifest — consumed by scripts/campaign.sh.

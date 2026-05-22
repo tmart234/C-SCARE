@@ -1,6 +1,14 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """
-C-Scare Attack Patterns - Comprehensive DICOM Security Test Cases
+C-SCARE Attack Catalog - static DICOM security test payloads
+
+This module is a STATIC CATALOG of hand-built malformed DICOM payloads. It
+is not a fuzzing engine: there is no mutation loop and no coverage feedback.
+The catalog has two roles in C-SCARE:
+  * Black-box DAST  - deliver payloads live at a target and watch for
+                      anomalies (see c_scare.deliver / test_runner).
+  * Grey-box seeds  - write payloads to disk as the initial corpus for
+                      AFL++ / AFLNet, which own the actual mutation loop.
 
 Pre-built attack patterns derived from:
 1. DICOM protocol specification edge cases
@@ -26,7 +34,7 @@ CVE Coverage:
     CVE-2024-28877  - Stack-based buffer overflow
 
 Example:
-    from c_scare.attacks import ParserAttacks, CVEAttacks, ProtocolFuzzer
+    from c_scare.attacks import ParserAttacks, CVEAttacks, ProtocolSeedGenerator
     
     # Generate test corpus
     corpus = ParserAttacks.generate_corpus('/output', count=100)
@@ -35,11 +43,9 @@ Example:
     for attack in CVEAttacks.cve_2024_24793_duplicate_meta_tags():
         test_target(attack.payload)
     
-    # Protocol fuzzing
-    fuzzer = ProtocolFuzzer(('192.168.1.100', 11112))
-    for result in fuzzer.fuzz_association(count=100):
-        if result.interesting:
-            save_for_analysis(result)
+    # Seed an AFL++/AFLNet corpus (the engines own the mutation loop)
+    for result in ProtocolSeedGenerator.all(count=100):
+        save_seed(result.payload)
 """
 
 from dataclasses import dataclass, field
@@ -101,10 +107,13 @@ __all__ = [
     'LogicAttacks',
     'StateMachineAttacks',
     'CVEAttacks',
-    # Fuzzing infrastructure
+    # Seed generators (corpus emitters for AFL++/AFLNet; not fuzzing engines)
+    'ProtocolSeedGenerator',
+    'TargetedSeedGenerator',
+    'CombinedAttacks',
+    # Deprecated aliases
     'ProtocolFuzzer',
     'TargetedFuzzer',
-    'CombinedAttacks',
 ]
 
 
@@ -1535,15 +1544,20 @@ class CVEAttacks:
 
 
 # =============================================================================
-# Protocol Fuzzer - Interactive fuzzing infrastructure
+# Protocol Seed Generator - emit varied PDU payloads for an AFL/AFLNet corpus
 # =============================================================================
 
-class ProtocolFuzzer:
+class ProtocolSeedGenerator:
     """
-    Protocol fuzzer for DICOM — pure payload generator, no network I/O.
+    Emit varied A-ASSOCIATE-RQ / C-STORE-RQ payloads.
+
+    This is a seed generator, not a fuzzer: it produces a finite set of
+    payloads with no coverage feedback. Use it to seed an AFL++/AFLNet
+    corpus (grey-box) or as one-shot black-box DAST probes. The actual
+    mutation loop belongs to AFL++/AFLNet.
 
     Example:
-        for result in ProtocolFuzzer.fuzz_association(count=100):
+        for result in ProtocolSeedGenerator.fuzz_association(count=100):
             deliver.send_pdu(target, result.payload)
     """
 
@@ -1650,19 +1664,27 @@ class ProtocolFuzzer:
 
     @classmethod
     def all(cls, count: int = 10) -> Generator[AttackResult, None, None]:
-        """Yield fuzzed payloads from both association and cstore fuzzers."""
+        """Yield seed payloads from both the association and cstore generators."""
         yield from cls.fuzz_association(count=count)
         yield from cls.fuzz_cstore(count=count)
 
 
+# Deprecated alias - kept for backward compatibility.
+ProtocolFuzzer = ProtocolSeedGenerator
+
+
 # =============================================================================
-# Targeted Fuzzer - Pydicom-aware fuzzing
+# Targeted Seed Generator - pydicom-structure-aware corpus emitter
 # =============================================================================
 
-class TargetedFuzzer:
+class TargetedSeedGenerator:
     """
-    Targeted fuzzer that uses pydicom to understand structure,
-    then applies intelligent corruptions.
+    Generate structure-aware seed payloads from a real pydicom dataset.
+
+    Uses pydicom to understand a dataset's structure, then emits targeted
+    corruptions of it. Like ProtocolSeedGenerator this is a seed emitter,
+    not a fuzzing engine - feed its output to AFL++ as a corpus, or deliver
+    it as black-box DAST probes.
     """
     
     def __init__(self, pydicom_dataset):
@@ -1727,6 +1749,10 @@ class TargetedFuzzer:
                 expected_behavior='Parser should validate dimensions',
                 metadata={'rows': val}
             )
+
+
+# Deprecated alias - kept for backward compatibility.
+TargetedFuzzer = TargetedSeedGenerator
 
 
 # =============================================================================

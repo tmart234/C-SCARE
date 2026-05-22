@@ -1,70 +1,85 @@
 # C-SCARE
 
-**DICOM Security Testing Framework** — fuzz, corrupt, and probe DICOM implementations at every layer of the stack.
+**DICOM Security Testing Framework** — black-box DAST and grey-box fuzzing for DICOM implementations.
 
-C-SCARE lets you surgically craft malformed DICOM files, datasets, and network traffic to find vulnerabilities in PACS servers, viewers, and medical device software. It combines Scapy-based protocol fuzzing with pydicom-aware dataset corruption.
+C-SCARE surgically crafts malformed DICOM files, datasets, and network traffic to probe PACS servers, viewers, and medical-device software. It is organised around a **role × method matrix** — *who* you test (a DICOM server / SCP, or a client / SCU) and *how* (black-box DAST, or grey-box fuzzing):
 
-## Capabilities
+|                  | **Black-box — DAST**                                                                 | **Grey-box — fuzzing**                                                              |
+|------------------|--------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------|
+| **SCP** (server) | Deliver the attack catalog live at a server, watch for protocol/health anomalies — `c-scare --ip … --category …` | Seed AFL++/AFLNet, fuzz instrumented DCMTK binaries, triage crashes — `c-scare greybox …` |
+| **SCU** (client) | `RawSCP` rogue server feeds malformed responses to a connecting client — `c-scare rogue …` | Instrument a DICOM client (DCMTK `storescu`) and AFL-fuzz the server-response stream via a desock shim — `c-scare greybox run scu` (experimental) |
 
-- **Dataset corruption** — Modify VRs, lengths, values, and tag ordering in real DICOM files while keeping everything else valid (pydicom parses, our encoder corrupts)
-- **Protocol fuzzing** — Craft and fuzz A-ASSOCIATE, P-DATA-TF, and DIMSE packets with full Scapy integration (`fuzz()`, `raw()`, layer stacking)
-- **Pre-built attack patterns** — Parser attacks, memory attacks, logic/SSRF attacks, state machine violations, and CVE reproductions (2019–2024)
-- **Rogue server** — `RawSCP` lets you fuzz DICOM *clients* by controlling exactly what bytes the server sends
-- **Pixel data fuzzing** — Fragment-level control over encapsulated JPEG/JPEG2000/RLE with Scapy layers and a hybrid fuzzing pipeline
-- **Corpus generation** — Output malformed `.dcm` files for AFL/libFuzzer/honggfuzz
-- **CI-ready test runner** — `python -m c_scare` runs categorized tests against live DICOM servers
+### What C-SCARE is — and is not
+
+C-SCARE **does not contain a fuzzing engine.** The mutation loop and coverage feedback belong to **AFL++** (file targets) and **AFLNet** (network targets). C-SCARE provides the parts around them:
+
+- **Crafting & corruption** — `Corruptor` parses a real `.dcm` with pydicom and re-emits it *invalid* (pydicom alone cannot write malformed files); `scapy_dicom` crafts malformed PDUs/DIMSE that a compliant library refuses to send.
+- **A static attack catalog** — ~50 hand-built payloads (parser, protocol, memory, logic, state-machine, CVE) used two ways: delivered live for black-box DAST, or written to disk as an AFL/AFLNet **seed corpus**.
+- **Seed generators** — `ProtocolSeedGenerator` / `TargetedSeedGenerator` emit varied seeds for that corpus. They are *not* fuzzers — there is no mutation loop.
+- **Rogue server** — `RawSCP` fuzzes DICOM *clients* by controlling exactly what bytes the server sends.
+- **Grey-box bridge** — `greybox` launches the AFL++/AFLNet harnesses and triages their crashes into SARIF.
+- **Monitoring & reporting** — sanitizer / protocol / process-health monitors and SARIF v2.1.0 output.
 
 ## Architecture
 
 ```mermaid
 flowchart TD
-
     USER[Operator / Researcher]
 
-    USER --> ATTACKS
-    USER --> RAWAPI
-    USER --> AFL
-
-    ATTACKS[attacks.py - Prebuilt Attack Recipes]
-
-    subgraph DATA [DICOM Data Manipulation]
+    subgraph CRAFT [Crafting and corruption]
         ELEMENT[element.py]
         CORRUPTOR[corruptor.py]
         PIXEL[pixel.py]
         FILE[file.py]
-    end
-
-    subgraph NET [DICOM Networking]
         SCAPY[scapy_dicom.py]
-        SERVER[server.py]
-        DELIVER[deliver.py]
     end
 
-    RAWAPI[Direct Module Usage]
-    AFL[AFL++ / AFLNet]
+    CATALOG[attacks.py - static attack catalog + seed generators]
 
-    ATTACKS --> ELEMENT
-    ATTACKS --> CORRUPTOR
-    ATTACKS --> PIXEL
-    ATTACKS --> SCAPY
+    subgraph BLACKBOX [Black-box / DAST]
+        DELIVER[deliver.py]
+        SERVER[server.py - RawSCP]
+    end
 
-    ELEMENT --> FILE
-    CORRUPTOR --> FILE
-    PIXEL --> FILE
+    subgraph GREYBOX [Grey-box]
+        AFL[AFL++ / AFLNet engines]
+        GB[greybox.py - harness + crash triage]
+    end
 
-    SCAPY --> DELIVER
-    SERVER --> SCAPY
+    MONITOR[monitor.py + SARIF report]
 
-    FILE --> AFL
-    FILE --> DELIVER
+    USER --> CATALOG
+    USER --> SERVER
+    USER --> GB
+    CATALOG --> CRAFT
+    CRAFT --> CATALOG
+    CATALOG -->|live delivery| DELIVER
+    CATALOG -->|seed corpus| AFL
+    DELIVER --> MONITOR
+    AFL --> GB
+    GB --> MONITOR
+    SERVER --> MONITOR
 ```
 
 ## Quick Start
 
 ### Install
 
+C-SCARE is not published on PyPI — install it from source:
+
 ```bash
-pip install c_scare scapy pydicom  # pydicom is a hard dependency
+git clone https://github.com/tmart234/C-SCARE
+cd C-SCARE
+pip install -e .            # core install: pydicom + scapy
+pip install -e ".[test]"    # also installs pytest + pynetdicom (test suite)
+```
+
+The grey-box fuzzing toolchain additionally needs the git submodules and a
+DCMTK build (see [Grey-box fuzzing](#dcmtk-fuzzing-toolchain) below):
+
+```bash
+git submodule update --init   # AFL++, AFLNet, DCMTK
+scripts/build_dcmtk.sh        # build DCMTK instrumented with ASan
 ```
 
 ### 1. Corrupt a real DICOM file
@@ -99,18 +114,20 @@ with DICOMSocket('192.168.1.100', 11112, 'PACS', 'ATTACKER') as sock:
         sock.release()
 ```
 
-### 3. Run pre-built attacks against a server
+### 3. Black-box DAST — run the attack catalog against a server
 
 ```bash
-# All categories
-python -m c_scare --ip 127.0.0.1 --port 4242 --ae-title ORTHANC
+# All categories against a live DICOM server
+c-scare --ip 127.0.0.1 --port 4242 --ae-title ORTHANC
 
-# Specific category
-python -m c_scare --ip 127.0.0.1 --port 4242 --ae-title ORTHANC --category cve
+# A single category, with a SARIF report
+c-scare --ip 127.0.0.1 --port 4242 --ae-title ORTHANC --category cve --sarif cve.sarif
 
-# Generate fuzzing corpus
-python -m c_scare --generate-corpus ./corpus --category parser
+# Generate an AFL++/AFLNet seed corpus
+c-scare corpus -o ./corpus
 ```
+
+(`python -m c_scare …` is equivalent to the `c-scare` console command.)
 
 ### 4. Fuzz DICOM clients with a rogue server
 
@@ -132,6 +149,19 @@ def on_associated(conn):
 scp.start()
 ```
 
+### 5. Grey-box fuzzing — drive AFL++/AFLNet and triage crashes
+
+```bash
+# Launch a fuzz harness (AFL++/AFLNet own the mutation loop)
+c-scare greybox run file              # fuzz dcm2pnm via AFL++
+c-scare greybox run net-storescp      # fuzz storescp via AFLNet
+
+# Triage the crashes a campaign produced into a SARIF report
+c-scare greybox triage fuzz/out/file \
+    --binary fuzz/build-asan/bin/dcm2pnm --arg @@ --arg /tmp/out.pnm \
+    --sarif crashes.sarif
+```
+
 ## Attack Categories
 
 | Category | What it targets | Key classes |
@@ -148,14 +178,16 @@ scp.start()
 | Module | Purpose |
 |--------|---------|
 | `element.py` | Dataset/Element building with Scapy-style `/` chaining |
-| `corruptor.py` | Pydicom bridge — read with pydicom, corrupt with our encoder |
+| `corruptor.py` | pydicom bridge — read with pydicom, re-emit *invalid* with our encoder |
 | `pixel.py` | Encapsulated pixel data with fragment-level control + Scapy layers |
 | `file.py` | Part 10 file handling (preamble, meta header, transfer syntax via `pydicom.uid.UID`) |
-| `scapy_dicom.py` | Full protocol stack — PDUs, DIMSE-C/N, `DICOMSocket` |
-| `server.py` | `RawSCP` rogue server for fuzzing clients |
-| `attacks.py` | Pure payload generators — all classes expose `all()` iterators yielding `AttackResult` |
-| `deliver.py` | Network delivery — `send_pdu()`, `send_sequence()`, `send_cstore()` |
-| `test_runner.py` | CLI test runner (`python -m c_scare`) |
+| `scapy_dicom.py` | DICOM crafting engine — PDUs, DIMSE-C/N, `DICOMSocket`; crafts malformed traffic |
+| `server.py` | `RawSCP` rogue server for fuzzing clients (SCU) |
+| `attacks.py` | Static attack catalog + seed generators — classes expose `all()` iterators of `AttackResult` |
+| `deliver.py` | Black-box delivery — `send_pdu()`, `send_sequence()`, `send_cstore()` |
+| `greybox.py` | Grey-box bridge — launches AFL++/AFLNet harnesses, triages crashes to SARIF |
+| `monitor.py` | Crash/anomaly detection — sanitizer, protocol and process-health monitors |
+| `test_runner.py` | CLI (`c-scare` / `python -m c_scare`) |
 
 ## Protocol Reference
 
@@ -163,7 +195,27 @@ See [PROTOCOL.md](PROTOCOL.md) for byte-level DICOM structure (file format, data
 
 ## DCMTK Fuzzing Toolchain
 
-The `fuzz/` tree and `scripts/` shell harnesses run AFL++ / AFLNet against DCMTK binaries (`dcm2pnm`, `storescp`, `dcmrecv`, `dcmqrscp`). For coverage and campaign reporting see `scripts/coverage.sh` and `scripts/campaign.sh` below.
+This is the **grey-box** half of the matrix. The `fuzz/` tree and `scripts/` shell harnesses run AFL++ / AFLNet — the actual fuzzing engines — against DCMTK binaries. C-SCARE supplies the seed corpus (`c-scare corpus`), the dictionary, the harnesses, and crash triage (`c-scare greybox triage`); AFL++/AFLNet own the mutation loop and coverage feedback. For coverage and campaign reporting see `scripts/coverage.sh` and `scripts/campaign.sh` below.
+
+Grey-box targets (`scripts/campaign.sh <target>` / `c-scare greybox run <target>`):
+
+| Target | Binary | Quadrant |
+|--------|--------|----------|
+| `file` | `dcm2pnm` | SCP grey-box — file + pixel pipeline (AFL++) |
+| `parse` | `dcmdump` | SCP grey-box — dataset/element parser (AFL++) |
+| `net-storescp` / `net-dcmrecv` / `net-dcmqrscp` | `storescp` / `dcmrecv` / `dcmqrscp` | SCP grey-box — network (AFLNet) |
+| `scu` | `storescu` | SCU grey-box — client response parser (AFL++ + desock, experimental) |
+
+### Fuzzing a custom DICOM binary
+
+The harnesses default to DCMTK's stock tools, but the framework targets any DICOM binary:
+
+- **Black-box** — point `c-scare --ip … --port …` (DAST) or `c-scare rogue` at your live service. No build access or instrumentation needed; works against a real device, a container, or a vendor-prebuilt binary.
+- **Grey-box** — coverage-guided fuzzing needs the target instrumented. Two ways to get that:
+  - *Recompiled instrumentation (fast)* — build your binary **and its `.so` dependencies** with the AFL compiler wrappers (`$AFLPP_PATH/afl-clang-fast` or `afl-gcc`, see `scripts/install_afl.sh`). Fastest fuzzing; requires source/build access.
+  - *QEMU mode (no recompile)* — `scripts/fuzz_qemu.sh <binary> [args…]` runs `afl-fuzz -Q`, instrumenting at runtime. It fuzzes vendor-prebuilt binaries — the official DCMTK 3.6.7 release, or your own `.so`-backed binaries — with **no recompilation**, ~2-5× slower. Use this when rebuilding the target is impractical.
+  - *File / parser path*: if your binary has no standalone file mode, copy `fuzz/harness/parse_harness.c`, wire in your parse entry point, and fuzz it with AFL++.
+  - *Network path*: AFLNet's `-P DICOM` parser drives any DICOM listener — adapt `scripts/fuzz_net.sh` to your binary's launch command.
 
 ### Device parity (READ THIS)
 
@@ -172,7 +224,7 @@ The fuzz build must match the device's DCMTK source rev and build flags or the r
 | Env var            | Purpose                                                                          |
 |--------------------|----------------------------------------------------------------------------------|
 | `DCMTK_SRC_DIR`    | Absolute path to operator-supplied DCMTK source. Submodule and `DCMTK_REF` ignored when set. |
-| `DCMTK_REF`        | Git ref/tag/SHA to check out inside the submodule. Ignored if `DCMTK_SRC_DIR` set. |
+| `DCMTK_REF`        | Git ref/tag/SHA inside the submodule. Default `DCMTK-3.6.7`. Ignored if `DCMTK_SRC_DIR` set. |
 | `OPT_LEVEL`        | Compiler optimization (default `-O1`). Set to match the device build.            |
 | `EXTRA_CFLAGS`     | Appended to `CFLAGS`/`CXXFLAGS` verbatim — match device defines.                  |
 | `EXTRA_CMAKE_ARGS` | Extra `-D...` CMake args (whitespace-separated) — match device DCMTK feature flags. |
@@ -217,7 +269,7 @@ scripts/coverage.sh file      # replays fuzz/out/file/{queue,crashes}
 | `SATURATION_HOURS` | 6       | Stop early if no new edges/paths for this long. Effective floor is `max(SATURATION_HOURS, CAMPAIGN_HOURS/10)`. |
 | `POLL_SECONDS`     | 60      | Poll cadence on `fuzzer_stats`.                                 |
 
-Targets: `file` (dcm2pnm), `net-storescp`, `net-dcmrecv`, `net-dcmqrscp`.
+Targets: `file` (dcm2pnm), `parse` (dcmdump), `net-storescp`, `net-dcmrecv`, `net-dcmqrscp`, `scu` (storescu, experimental).
 
 ## License
 

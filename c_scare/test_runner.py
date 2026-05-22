@@ -1,23 +1,28 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """
-C-Scare Test Runner - CLI interface for running attack tests.
+C-SCARE CLI - DICOM security testing across the role x method matrix.
 
-Usage:
-    python -m c_scare.test_runner <command> [options]
-    
-Commands:
-    cve_attacks       - Run CVE-specific attack reproductions
-    fuzz_packets      - Test fuzzed DIMSE packets
-    protocol_fuzzing  - Live protocol fuzzing against a target
-    generate_corpus   - Generate fuzzing corpus files
-    parser_attacks    - Run parser attack tests
-    memory_attacks    - Run memory corruption tests
-    all               - Run all tests
+                   | black-box (DAST)         | grey-box (fuzzing)
+  -----------------+--------------------------+---------------------------
+  SCP  (server)    | c-scare [--category X]   | c-scare greybox ...
+  SCU  (client)    | c-scare rogue ...        | (instrument the client)
+
+Subcommands:
+    rogue    - SCU/client fuzzing: run a rogue DICOM SCP that feeds
+               malformed responses to a connecting client
+    corpus   - generate a seed corpus (.dcm/.bin) for AFL++/AFLNet
+    greybox  - grey-box bridge: launch an AFL++/AFLNet harness, or
+               triage its crashes into a SARIF report
+
+With no subcommand, C-SCARE runs in black-box DAST mode: it delivers the
+static attack catalog at a live DICOM server (--ip/--port/--category).
+The grey-box mutation loop itself is owned by AFL++/AFLNet (see scripts/).
 
 Examples:
-    python -m c_scare.test_runner cve_attacks
-    python -m c_scare.test_runner protocol_fuzzing --target 192.168.1.100:11112
-    python -m c_scare.test_runner generate_corpus --output ./corpus --count 100
+    c-scare --ip 127.0.0.1 --port 4242 --category cve
+    c-scare corpus -o ./corpus
+    c-scare rogue --port 11112 --mode malformed-ac
+    c-scare greybox triage fuzz/out/file --binary dcm2pnm --arg @@ --sarif x.sarif
 """
 
 import sys
@@ -738,8 +743,128 @@ def run_command(command: str, args) -> int:
     return commands[command](args)
 
 
+def _cmd_corpus(argv: List[str]) -> int:
+    """`corpus` subcommand: generate a seed corpus for AFL++/AFLNet."""
+    p = argparse.ArgumentParser(
+        prog='c-scare corpus',
+        description='Generate a seed corpus (.dcm/.bin) for AFL++/AFLNet.')
+    p.add_argument('-o', '--out', required=True, help='output directory')
+    a = p.parse_args(argv)
+    return run_generate_corpus(argparse.Namespace(output=a.out))
+
+
+def _cmd_rogue(argv: List[str]) -> int:
+    """`rogue` subcommand: SCU/client fuzzing via a rogue DICOM SCP."""
+    p = argparse.ArgumentParser(
+        prog='c-scare rogue',
+        description='Run a rogue DICOM SCP that feeds malformed responses '
+                    'to a connecting DICOM client (SCU/client fuzzing).')
+    p.add_argument('--host', default='0.0.0.0')
+    p.add_argument('--port', type=int, default=11112)
+    p.add_argument('--ae-title', dest='ae_title', default='C_SCARE')
+    p.add_argument('--mode', choices=['malformed-ac', 'reject', 'abort'],
+                   default='malformed-ac',
+                   help='response sent on A-ASSOCIATE-RQ (default: malformed-ac)')
+    a = p.parse_args(argv)
+
+    from .server import RawSCP
+    try:
+        from .scapy_dicom import DICOM, A_ASSOCIATE_AC, A_ASSOCIATE_RJ, A_ABORT
+        from scapy.packet import raw
+    except Exception as e:  # pragma: no cover - scapy is a hard dependency
+        print(f"ERROR: rogue server requires scapy: {e}")
+        return 1
+
+    def _response() -> bytes:
+        if a.mode == 'reject':
+            return raw(DICOM() / A_ASSOCIATE_RJ())
+        if a.mode == 'abort':
+            return raw(DICOM() / A_ABORT())
+        return raw(DICOM() / A_ASSOCIATE_AC(protocol_version=0xFFFF))
+
+    scp = RawSCP(host=a.host, port=a.port, ae_title=a.ae_title)
+
+    @scp.on_connect
+    def _on_connect(conn):
+        print(f"[rogue] client connected: {conn.address}")
+
+    @scp.on_associate_rq
+    def _on_assoc(conn, pdu_bytes, pkt):
+        print(f"[rogue] A-ASSOCIATE-RQ ({len(pdu_bytes)} bytes) -> {a.mode}")
+        return _response()
+
+    @scp.on_pdata
+    def _on_pdata(conn, pdu_bytes, pkt):
+        print(f"[rogue] P-DATA-TF ({len(pdu_bytes)} bytes)")
+        return None
+
+    print(f"[rogue] mode={a.mode}  listening on {a.host}:{a.port}  (Ctrl-C to stop)")
+    try:
+        scp.start()
+    except KeyboardInterrupt:
+        print("\n[rogue] stopping")
+        scp.stop()
+    return 0
+
+
+def _cmd_greybox(argv: List[str]) -> int:
+    """`greybox` subcommand: AFL++/AFLNet harness launch + crash triage."""
+    from . import greybox
+
+    p = argparse.ArgumentParser(
+        prog='c-scare greybox',
+        description='Grey-box bridge to the AFL++/AFLNet fuzzing engines.')
+    sub = p.add_subparsers(dest='gbcmd', required=True)
+
+    runp = sub.add_parser('run', help='launch an AFL++/AFLNet fuzz harness')
+    runp.add_argument('target', choices=sorted(greybox.TARGETS))
+
+    trp = sub.add_parser('triage', help='triage AFL/AFLNet crashes into SARIF')
+    trp.add_argument('crashes', help='AFL/AFLNet output directory or crashes dir')
+    trp.add_argument('--binary',
+                     help='instrumented binary to replay crashes through')
+    trp.add_argument('--arg', action='append', default=[], dest='args',
+                     help='binary argument; use @@ for the crash file path')
+    trp.add_argument('--sarif', help='write a SARIF v2.1.0 report here')
+    trp.add_argument('--timeout', type=float, default=10.0)
+    a = p.parse_args(argv)
+
+    if a.gbcmd == 'run':
+        return greybox.run(a.target)
+
+    cmd = ([a.binary] + a.args) if a.binary else None
+    results = greybox.triage_to_sarif(
+        a.crashes, cmd=cmd, sarif_path=a.sarif, timeout=a.timeout)
+    detected = sum(1 for r in results if r.success)
+    print(f"\nTriaged {len(results)} crash input(s); "
+          f"{detected} reproduced a sanitizer/crash finding")
+    for r in results:
+        mark = '!' if r.success else ('.' if cmd else '?')
+        print(f"  {mark} {r.name} ({r.metadata.get('size', 0)} bytes)")
+        for report in r.monitor_reports:
+            print(f"      {report.finding_type}: {report.description}")
+    if a.sarif:
+        print(f"\nSARIF report written to: {a.sarif}")
+    return 0
+
+
 def main(argv: Optional[List[str]] = None):
     """Main entry point."""
+    if argv is None:
+        argv = sys.argv[1:]
+
+    # Matrix subcommands. With no subcommand, fall through to black-box DAST
+    # mode (the --ip/--port/--category flag interface below).
+    if argv and argv[0] in ('rogue', 'corpus', 'greybox', 'dast'):
+        sub = argv[0]
+        if sub == 'rogue':
+            return _cmd_rogue(argv[1:])
+        if sub == 'corpus':
+            return _cmd_corpus(argv[1:])
+        if sub == 'greybox':
+            return _cmd_greybox(argv[1:])
+        argv = argv[1:]  # 'dast' is the default mode: strip and continue
+
     parser = argparse.ArgumentParser(
         description='C-Scare DICOM Security Testing Framework',
         formatter_class=argparse.RawDescriptionHelpFormatter,
