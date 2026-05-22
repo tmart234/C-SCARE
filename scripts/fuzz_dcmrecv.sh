@@ -28,7 +28,10 @@ if [[ ! -d "${SEEDS_DIR}" || -z "$(find "${SEEDS_DIR}" -maxdepth 1 -name '*.raw'
 fi
 
 mkdir -p "${OUT_DIR}" "${STORAGE_DIR}"
-export ASAN_OPTIONS="detect_leaks=0:abort_on_error=1:symbolize=1:halt_on_error=1"
+# symbolize=0 is mandatory: AFLNet's afl-fuzz check_asan_opts() FATALs on a
+# custom ASAN_OPTIONS that omits it. Crash traces are symbolized at triage
+# time instead (see c_scare/greybox.py).
+export ASAN_OPTIONS="detect_leaks=0:abort_on_error=1:symbolize=0:halt_on_error=1"
 export DCMDICTPATH="${REPO_ROOT}/fuzz/dcmtk/dcmdata/data/dicom.dic"
 export AFL_SKIP_CPUFREQ=1
 export AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1
