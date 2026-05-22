@@ -1,24 +1,17 @@
 name: Grey-box fuzz smoke (DCMTK + AFL)
 
-# The grey-box quadrant. Two jobs, both heavy:
+# The grey-box quadrant. Manual-only (workflow_dispatch): both jobs are heavy
+# and the instrumented / QEMU builds are slow, so they never run on push.
 #   greybox-smoke - build DCMTK 3.6.7 instrumented with AFL + ASan, then run
-#                   scripts/smoke.sh. The fastest-fuzzing path. The full
-#                   instrumented build is slow, so this job is manual-only
-#                   (workflow_dispatch).
+#                   scripts/smoke.sh. The fastest-fuzzing path.
 #   qemu-smoke    - fuzz the *prebuilt* (apt) DCMTK 3.6.7 via AFL++ QEMU mode,
-#                   proving the no-recompilation path works. Runs on every
-#                   merge to main and on demand.
+#                   proving the no-recompilation path works.
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 jobs:
   greybox-smoke:
     name: Instrumented build (DCMTK 3.6.7 + AFL + ASan)
-    # Manual-only: the full instrumented DCMTK build is slow. The qemu-smoke
-    # job below covers merge-to-main.
-    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
