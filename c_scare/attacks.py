@@ -1700,7 +1700,29 @@ class CVEAttacks:
             expected_behavior='Scanner should detect batch script',
             metadata={'cve': 'CVE-2019-11687', 'polyglot': 'batch'}
         ))
-        
+
+        # Test 5: TIFF header in preamble (dual-purpose TIFF/DICOM)
+        # The CVE explicitly cites whole-slide-imaging TIFF/DICOM polyglots
+        # as a real-world dual-purpose case.
+        tiff = b'II*\x00'                     # TIFF little-endian (Intel) magic
+        tiff += struct.pack('<I', 8)          # offset to first IFD
+        tiff += struct.pack('<H', 0)          # IFD with 0 directory entries
+        tiff += struct.pack('<I', 0)          # no next IFD
+        tiff += b'\x00' * (128 - len(tiff))   # pad out the 128-byte preamble
+
+        file_data = tiff + b'DICM'
+        file_data += struct.pack('<HH', 0x0008, 0x0016) + b'UI' + struct.pack('<H', 26)
+        file_data += b'1.2.840.10008.5.1.4.1.1.7\x00'
+
+        results.append(AttackResult(
+            name='cve_2019_11687_05_tiff_header',
+            category='cve',
+            payload=file_data,
+            description='TIFF header in DICOM preamble (dual-purpose TIFF/DICOM)',
+            expected_behavior='Scanner should detect TIFF signature',
+            metadata={'cve': 'CVE-2019-11687', 'polyglot': 'TIFF'}
+        ))
+
         return results
 
     @classmethod

@@ -243,10 +243,7 @@ def run_cve_attacks(args) -> int:
     if args.output:
         os.makedirs(args.output, exist_ok=True)
         for result in all_results:
-            filepath = os.path.join(args.output, f"{result.name}.dcm")
-            file_data = b'\x00' * 128 + b'DICM' + result.payload
-            with open(filepath, 'wb') as f:
-                f.write(file_data)
+            filepath = _save_corpus_file(result, args.output)
             if args.verbose:
                 print(f"Saved: {filepath}")
 
@@ -442,10 +439,16 @@ def _save_corpus_file(result: AttackResult, output_dir: str) -> str:
         file_data = result.payload
     else:
         ext = '.dcm'
-        if result.payload and not result.payload.startswith(b'DICM'):
-            file_data = b'\x00' * 128 + b'DICM' + result.payload
+        payload = result.payload or b''
+        # A payload already carrying the Part 10 magic — a raw file (DICM at
+        # offset 0) or a complete file with a 128-byte preamble (DICM at
+        # offset 128, e.g. the CVE-2019-11687 polyglots) — must be written
+        # verbatim. Re-wrapping a polyglot buries its executable preamble at
+        # offset 132 and destroys the seed.
+        if payload.startswith(b'DICM') or payload[128:132] == b'DICM':
+            file_data = payload
         else:
-            file_data = result.payload
+            file_data = b'\x00' * 128 + b'DICM' + payload
 
     filepath = os.path.join(output_dir, f"{result.name}{ext}")
     with open(filepath, 'wb') as f:
