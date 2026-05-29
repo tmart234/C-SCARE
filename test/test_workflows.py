@@ -71,6 +71,61 @@ def test_ae_brute_reads_ac_payload_of_accepted_aet():
         _shutdown(server)
 
 
+def test_ae_brute_and_cred_brute_are_independent_axes():
+    """A wrong AE title and a bad credential reject with *different* codes, so
+    each axis is brute-forceable on its own.
+
+    Isolate the AET axis by NOT sending credentials (servers commonly check
+    identity before the AET, so sending creds can mask the AET code). Then
+    brute credentials against the discovered AET.
+    """
+    from pynetdicom import AE, evt
+    from pynetdicom.sop_class import Verification
+
+    def handle_user_id(event):
+        return (event.primary_field == b"GOOD"), None
+
+    ae = AE()
+    ae.ae_title = "REAL_AET"
+    ae.require_called_aet = True
+    ae.add_supported_context(Verification)
+    server = ae.start_server(
+        (HOST, 11624), block=False,
+        evt_handlers=[(evt.EVT_USER_ID, handle_user_id)],
+    )
+    time.sleep(0.4)
+    try:
+        # AE-title axis: no identity sent, so the AET check is what fails.
+        ae_results = {
+            r.aet: r for r in ae_brute(
+                HOST, 11624, ["WRONG_AET", "REAL_AET"],
+                calling_ae="C_SCARE", timeout=5.0)
+        }
+        # Wrong AET -> called-AE-title-not-recognized; AET axis not solved.
+        assert ae_results["WRONG_AET"].accepted is False
+        assert ae_results["WRONG_AET"].aet_recognized is False
+        assert ae_results["WRONG_AET"].reason == "called-AE-title-not-recognized"
+        # Right AET (no identity required for a bare association here) -> the
+        # AET axis is solved.
+        assert ae_results["REAL_AET"].aet_recognized is True
+        wrong_reject = ae_results["WRONG_AET"].reject
+
+        # Credential axis against the discovered AET: GOOD passes, BAD fails
+        # with an ACSE reject that is NOT an AET problem and whose reject code
+        # differs from the wrong-AET case.
+        cred_results = cred_brute(
+            HOST, 11624, "REAL_AET", creds=[("BAD", ""), ("GOOD", "")],
+            identity_type=3, stop_on_success=False, timeout=5.0)
+        by_user = {r.username: r for r in cred_results}
+        assert by_user["GOOD"].accepted is True
+        assert by_user["BAD"].accepted is False
+        assert by_user["BAD"].aet_problem is False
+        # The decisive point: the two failure modes are distinguishable.
+        assert by_user["BAD"].reject != wrong_reject
+    finally:
+        _shutdown(server)
+
+
 # --------------------------------------------------------------------------
 # W2 — User Identity credential brute force (0x58 / 0x59)
 # --------------------------------------------------------------------------

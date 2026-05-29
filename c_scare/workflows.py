@@ -27,6 +27,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from .element import Dataset, Element
 from .scapy_dicom import (
     DICOMSocket,
+    classify_reject,
+    reject_is_called_aet_unrecognized,
     PATIENT_ROOT_QR_FIND_SOP_CLASS_UID,
     STUDY_ROOT_QR_FIND_SOP_CLASS_UID,
     PATIENT_ROOT_QR_GET_SOP_CLASS_UID,
@@ -98,7 +100,13 @@ class WorkflowResult:
 
 @dataclass
 class AETResult:
-    """Outcome of one Called AE Title attempt in :func:`ae_brute`."""
+    """Outcome of one Called AE Title attempt in :func:`ae_brute`.
+
+    ``aet_recognized`` separates the two failure modes that make AE-title and
+    credential brute force independent axes: it is True when the association
+    was accepted *or* rejected for any reason other than
+    ``called-AE-title-not-recognized`` — i.e. the AET is valid even if a later
+    step (e.g. user identity) is still required."""
 
     aet: str
     accepted: bool
@@ -106,16 +114,24 @@ class AETResult:
     implementation_class_uid: Optional[str] = None
     implementation_version_name: Optional[str] = None
     reject: Optional[Dict[str, int]] = None
+    reason: Optional[str] = None
+    aet_recognized: bool = False
 
 
 @dataclass
 class CredResult:
-    """Outcome of one credential attempt in :func:`cred_brute`."""
+    """Outcome of one credential attempt in :func:`cred_brute`.
+
+    ``aet_problem`` is True when the reject was ``called-AE-title-not-recognized``
+    — a signal that the Called AE Title, not the credential, is wrong, so the
+    operator should fix the AET axis (W1) before brute-forcing credentials."""
 
     username: str
     accepted: bool
     server_response: Optional[bytes] = None
     reject: Optional[Dict[str, int]] = None
+    reason: Optional[str] = None
+    aet_problem: bool = False
 
 
 def build_query(level: str = "study",
@@ -184,13 +200,18 @@ def ae_brute(ip: str, port: int, aets: Sequence[str],
                 results.append(AETResult(
                     aet=aet,
                     accepted=True,
+                    aet_recognized=True,
                     application_context_uid=info.get("application_context_uid"),
                     implementation_class_uid=info.get("implementation_class_uid"),
                     implementation_version_name=info.get("implementation_version_name"),
                 ))
             else:
-                results.append(AETResult(aet=aet, accepted=False,
-                                         reject=sock.last_reject))
+                rj = sock.last_reject
+                results.append(AETResult(
+                    aet=aet, accepted=False, reject=rj,
+                    reason=classify_reject(rj),
+                    aet_recognized=not reject_is_called_aet_unrecognized(rj),
+                ))
         except Exception:
             results.append(AETResult(aet=aet, accepted=False))
         finally:
@@ -240,8 +261,12 @@ def cred_brute(ip: str, port: int, called_ae: str,
                 if stop_on_success:
                     break
             else:
-                results.append(CredResult(username=username, accepted=False,
-                                          reject=sock.last_reject))
+                rj = sock.last_reject
+                results.append(CredResult(
+                    username=username, accepted=False, reject=rj,
+                    reason=classify_reject(rj),
+                    aet_problem=reject_is_called_aet_unrecognized(rj),
+                ))
         except Exception:
             results.append(CredResult(username=username, accepted=False))
         finally:

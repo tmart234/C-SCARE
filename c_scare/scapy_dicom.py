@@ -205,6 +205,8 @@ __all__ = [
     "parse_dimse_status",
     "parse_dimse_command_us",
     "parse_dimse_command_field",
+    "classify_reject",
+    "reject_is_called_aet_unrecognized",
     "_uid_to_bytes",
     "_uid_to_bytes_raw",
     "build_presentation_context_rq",
@@ -2546,6 +2548,36 @@ def build_user_identity(identity):
     if id_type == 2:
         kwargs["secondary_field"] = secondary
     return DICOMUserIdentity(**kwargs)
+
+
+def classify_reject(reject):
+    # type: (Optional[Dict[str, int]]) -> Optional[str]
+    """Map an A-ASSOCIATE-RJ ``{result, source, reason}`` to a canonical slug.
+
+    This is what lets AE-title and credential brute force be run as *separate*
+    axes: a wrong Called AE Title rejects with source 1 / reason 7
+    (``called-AE-title-not-recognized``), whereas a bad credential rejects with
+    a source 2 (ACSE) code — pynetdicom uses ``(2, 2, 1)`` per PS3.8 — so the
+    two failure modes are distinguishable on the wire."""
+    if not reject:
+        return None
+    source = reject.get("source")
+    reason = reject.get("reason")
+    table = {
+        1: A_ASSOCIATE_RJ.REASON_USER,
+        2: A_ASSOCIATE_RJ.REASON_ACSE,
+        3: A_ASSOCIATE_RJ.REASON_PRESENTATION,
+    }.get(source, {})
+    return table.get(reason, "source%s-reason%s" % (source, reason))
+
+
+def reject_is_called_aet_unrecognized(reject):
+    # type: (Optional[Dict[str, int]]) -> bool
+    """True iff the reject is specifically ``called-AE-title-not-recognized``
+    (source 1, reason 7) — i.e. *this* Called AE Title is wrong. Any other
+    reject means the AET was recognised and the problem lies elsewhere
+    (commonly user-identity/auth), so the AET axis can be considered solved."""
+    return bool(reject) and reject.get("source") == 1 and reject.get("reason") == 7
 
 
 def build_presentation_context_rq(context_id, abstract_syntax_uid, transfer_syntax_uids):

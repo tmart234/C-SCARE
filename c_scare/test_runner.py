@@ -951,8 +951,13 @@ def _cmd_workflow(argv: List[str]) -> int:
                       f"appctx={r.application_context_uid} "
                       f"impl_uid={r.implementation_class_uid} "
                       f"impl_ver={r.implementation_version_name}")
+            elif r.aet_recognized:
+                # Recognised AET that rejected for another reason (e.g. auth) —
+                # the AET axis is solved; pursue the next axis (W2).
+                print(f"[~] {r.aet}: RECOGNIZED but rejected ({r.reason}) "
+                      f"— AET valid, another gate remains")
             else:
-                print(f"[-] {r.aet}: rejected ({r.reject})")
+                print(f"[-] {r.aet}: rejected ({r.reason})")
         return 0
 
     if a.wfcmd == 'cred-brute':
@@ -973,8 +978,11 @@ def _cmd_workflow(argv: List[str]) -> int:
             if r.accepted:
                 payload = r.server_response
                 print(f"[+] {r.username}: ACCEPTED  0x59={payload!r}")
+            elif r.aet_problem:
+                print(f"[!] {r.username}: rejected ({r.reason}) — the Called AE "
+                      f"Title is wrong, not the credential; fix --ae-title first")
             else:
-                print(f"[-] {r.username}: rejected ({r.reject})")
+                print(f"[-] {r.username}: rejected ({r.reason})")
         return 0
 
     # find / move / get share the query-building path.
