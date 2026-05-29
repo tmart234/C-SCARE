@@ -175,7 +175,9 @@ from .workflows import (
 # acceptor, DIMSE response builders, and a dispatching WorkflowResponder.
 from .responders import (
     accept_association, reject_association,
+    parse_proposed_contexts, parse_user_identity,
     build_cecho_rsp, build_cstore_rsp, build_cfind_rsp, build_cfind_rsp_stream,
+    build_cmove_rsp, build_cget_rsp,
     WorkflowResponder,
 )
 
@@ -330,8 +332,10 @@ __all__ = [
     "build_query", "ae_brute", "cred_brute",
     # SCP-side workflow responders
     "accept_association", "reject_association",
+    "parse_proposed_contexts", "parse_user_identity",
     "build_cecho_rsp", "build_cstore_rsp", "build_cfind_rsp",
-    "build_cfind_rsp_stream", "WorkflowResponder",
+    "build_cfind_rsp_stream", "build_cmove_rsp", "build_cget_rsp",
+    "WorkflowResponder",
     # Monitor framework
     "BaseMonitor",
     "MonitorReport",

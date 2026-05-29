@@ -29,13 +29,13 @@ from .scapy_dicom import (
     P_DATA_TF, PresentationDataValueItem,
     DICOMVariableItem, DICOMApplicationContext, DICOMUserInformation,
     DICOMMaximumLength, DICOMImplementationClassUID,
-    DICOMImplementationVersionName, DICOMUserIdentityResponse,
-    DICOMPresentationContextAC, DICOMTransferSyntax,
-    C_ECHO_RSP, C_STORE_RSP, C_FIND_RSP, C_MOVE_RSP, C_GET_RSP,
-    parse_dimse_command_us,
+    DICOMImplementationVersionName, DICOMUserIdentity, DICOMUserIdentityResponse,
+    DICOMPresentationContextAC, DICOMAbstractSyntax, DICOMTransferSyntax,
+    C_ECHO_RSP, C_STORE_RQ, C_STORE_RSP, C_FIND_RSP, C_MOVE_RSP, C_GET_RSP,
+    parse_dimse_command_us, parse_dimse_status,
     _uid_to_bytes,
     IMPLEMENTATION_CLASS_UID, DEFAULT_TRANSFER_SYNTAX_UID,
-    IMPLICIT_VR_LITTLE_ENDIAN_UID,
+    IMPLICIT_VR_LITTLE_ENDIAN_UID, CT_IMAGE_STORAGE_SOP_CLASS_UID,
     STATUS_SUCCESS, STATUS_PENDING,
 )
 from .server import RawSCP, ConnectionState
@@ -44,10 +44,14 @@ from scapy.packet import raw
 __all__ = [
     "accept_association",
     "reject_association",
+    "parse_proposed_contexts",
+    "parse_user_identity",
     "build_cecho_rsp",
     "build_cstore_rsp",
     "build_cfind_rsp",
     "build_cfind_rsp_stream",
+    "build_cmove_rsp",
+    "build_cget_rsp",
     "WorkflowResponder",
 ]
 
@@ -86,6 +90,62 @@ def _proposed_contexts(rq):
             yield cid, ts_uids
         except Exception:
             continue
+
+
+def parse_proposed_contexts(rq_bytes):
+    # type: (bytes) -> Dict[str, Any]
+    """Map ``abstract_syntax_uid -> (context_id, [transfer_syntax_uid, ...])``
+    from an A-ASSOCIATE-RQ, so a responder knows which negotiated context to
+    send a C-STORE sub-operation on (W4 C-GET)."""
+    out = {}  # type: Dict[str, Any]
+    rq = _parse_rq(rq_bytes)
+    if rq is None:
+        return out
+    for item in rq.variable_items:
+        if item.item_type != 0x20:
+            continue
+        try:
+            pctx = item.payload
+            cid = pctx.context_id
+            abs_uid = None
+            ts_uids = []
+            for sub in pctx.sub_items:
+                if sub.item_type == 0x30 and sub.haslayer(DICOMAbstractSyntax):
+                    abs_uid = sub[DICOMAbstractSyntax].uid.rstrip(b"\x00").decode(
+                        "ascii", "replace")
+                elif sub.item_type == 0x40 and sub.haslayer(DICOMTransferSyntax):
+                    ts_uids.append(sub[DICOMTransferSyntax].uid.rstrip(
+                        b"\x00").decode("ascii", "replace"))
+            if abs_uid:
+                out[abs_uid] = (cid, ts_uids)
+        except Exception:
+            continue
+    return out
+
+
+def parse_user_identity(rq_bytes):
+    # type: (bytes) -> Optional[Dict[str, Any]]
+    """Extract the Type 0x58 User Identity sub-item from an A-ASSOCIATE-RQ.
+
+    Returns ``{"type", "primary", "secondary", "positive_response_requested"}``
+    or ``None`` if the RQ carried no identity — what a require-and-validate
+    responder (W2) checks credentials against."""
+    rq = _parse_rq(rq_bytes)
+    if rq is None:
+        return None
+    for item in rq.variable_items:
+        if item.item_type != 0x50 or not item.haslayer(DICOMUserInformation):
+            continue
+        for sub in item[DICOMUserInformation].sub_items:
+            if sub.item_type == 0x58 and sub.haslayer(DICOMUserIdentity):
+                ui = sub[DICOMUserIdentity]
+                return {
+                    "type": ui.user_identity_type,
+                    "primary": bytes(ui.getfieldval("primary_field")),
+                    "secondary": bytes(ui.getfieldval("secondary_field") or b""),
+                    "positive_response_requested": ui.positive_response_requested,
+                }
+    return None
 
 
 def accept_association(rq_bytes,
@@ -247,6 +307,34 @@ def build_cfind_rsp_stream(ctx_id, message_id, identifiers,
     return out
 
 
+def build_cmove_rsp(ctx_id, message_id, status=STATUS_SUCCESS,
+                    remaining=0, completed=0, failed=0, warning=0,
+                    sop_class_uid=None):
+    # type: (int, int, int, int, int, int, int, Optional[str]) -> bytes
+    """One C-MOVE-RSP carrying sub-operation counts (W5 responder)."""
+    rsp = C_MOVE_RSP(
+        message_id_responded=message_id, status=status, data_set_type=0x0101,
+        num_remaining=remaining, num_completed=completed,
+        num_failed=failed, num_warning=warning)
+    if sop_class_uid:
+        rsp.affected_sop_class_uid = sop_class_uid
+    return _pdata(ctx_id, bytes(rsp))
+
+
+def build_cget_rsp(ctx_id, message_id, status=STATUS_SUCCESS,
+                   remaining=0, completed=0, failed=0, warning=0,
+                   sop_class_uid=None):
+    # type: (int, int, int, int, int, int, int, Optional[str]) -> bytes
+    """One C-GET-RSP carrying sub-operation counts (W4 responder)."""
+    rsp = C_GET_RSP(
+        message_id_responded=message_id, status=status, data_set_type=0x0101,
+        num_remaining=remaining, num_completed=completed,
+        num_failed=failed, num_warning=warning)
+    if sop_class_uid:
+        rsp.affected_sop_class_uid = sop_class_uid
+    return _pdata(ctx_id, bytes(rsp))
+
+
 class WorkflowResponder:
     """An SCP that exercises a connecting SCU client.
 
@@ -261,12 +349,20 @@ class WorkflowResponder:
 
     def __init__(self, host="0.0.0.0", port=11112, ae_title="C_SCARE",
                  implementation_version_name=None, user_identity_response=None,
-                 transfer_syntax=None):
+                 transfer_syntax=None, known_aets=None, require_identity=None):
+        # ``known_aets`` (W1): {called_ae: {"implementation_version_name":...,
+        #   "user_identity_response":...}}. If set, an AET not in the map is
+        #   rejected with called-AE-title-not-recognized (1/1/7).
+        # ``require_identity`` (W2): callable(ident_dict) -> (is_valid, response
+        #   bytes or None). A bad credential is rejected with an ACSE 2/2/1.
         self.scp = RawSCP(host=host, port=port, ae_title=ae_title)
         self.implementation_version_name = implementation_version_name
         self.user_identity_response = user_identity_response
         self.transfer_syntax = transfer_syntax
+        self.known_aets = known_aets
+        self.require_identity = require_identity
         self._dimse_handlers = {}  # type: Dict[int, Callable]
+        self._subop_id = 0
         self._wire()
 
     # -- handler registration ------------------------------------------------
@@ -303,11 +399,38 @@ class WorkflowResponder:
 
         @scp.on_associate_rq
         def _assoc(conn, pdu_bytes, pkt):
+            # Record negotiated contexts so a C-GET can pick the storage context.
+            conn._wf_contexts = parse_proposed_contexts(pdu_bytes)
+            called = (getattr(conn, "called_ae", "") or "").strip()
+
+            impl_ver = self.implementation_version_name
+            uid_resp = self.user_identity_response
+
+            # W1: AET-keyed acceptance.
+            if self.known_aets is not None:
+                if called not in self.known_aets:
+                    return reject_association(result=1, source=1, reason=7)
+                entry = self.known_aets[called] or {}
+                impl_ver = entry.get("implementation_version_name", impl_ver)
+                uid_resp = entry.get("user_identity_response", uid_resp)
+
+            # W2: require + validate User Identity.
+            if self.require_identity is not None:
+                ident = parse_user_identity(pdu_bytes)
+                if ident is None:
+                    # Identity required but none offered.
+                    return reject_association(result=1, source=1, reason=1)
+                valid, resp = self.require_identity(ident)
+                if not valid:
+                    return reject_association(result=2, source=2, reason=1)
+                if resp is not None:
+                    uid_resp = resp
+
             return accept_association(
                 pdu_bytes,
                 responding_ae=self.scp.ae_title,
-                implementation_version_name=self.implementation_version_name,
-                user_identity_response=self.user_identity_response,
+                implementation_version_name=impl_ver,
+                user_identity_response=uid_resp,
                 transfer_syntax=self.transfer_syntax,
             )
 
@@ -365,6 +488,55 @@ class WorkflowResponder:
 
         return self._dispatch(conn, ctx_id, cmd, data)
 
+    # -- C-GET sub-operation serving (W4 responder) --------------------------
+    def _next_subop_id(self):
+        self._subop_id = (self._subop_id + 1) & 0xFFFF
+        return self._subop_id or 1
+
+    def _storage_ctx_id(self, conn, sop_class_uid, default_ctx):
+        ctxs = getattr(conn, "_wf_contexts", {}) or {}
+        entry = ctxs.get(sop_class_uid)
+        return entry[0] if entry else default_ctx
+
+    def _read_status(self, conn):
+        """Read one DIMSE response PDU from the client and return its status."""
+        pdu = self.scp._recv_pdu(conn)
+        if not pdu:
+            return None
+        try:
+            p = DICOM(pdu)
+            if p.haslayer(P_DATA_TF):
+                for pdv in p[P_DATA_TF].pdv_items:
+                    if pdv.is_command:
+                        return parse_dimse_status(bytes(pdv.data))
+        except Exception:
+            pass
+        return None
+
+    def serve_cget(self, conn, ctx_id, command_bytes, objects):
+        """Deliver ``objects`` to a C-GET SCU as inbound C-STORE sub-operations
+        on the negotiated storage context, then send the final C-GET-RSP with
+        the sub-op counts.
+
+        ``objects``: list of ``(sop_class_uid, sop_instance_uid, dataset)``.
+        Call this from an ``on_c_get`` handler and return ``None``."""
+        msg_id = parse_dimse_command_us(command_bytes, 0x0000, 0x0110) or 1
+        completed = 0
+        failed = 0
+        for sop_class, sop_inst, ds in objects:
+            store_ctx = self._storage_ctx_id(conn, sop_class, ctx_id)
+            rq = C_STORE_RQ(
+                affected_sop_class_uid=sop_class,
+                affected_sop_instance_uid=sop_inst,
+                message_id=self._next_subop_id())
+            conn.send(_pdata(store_ctx, bytes(rq), _encode_ds(ds)))
+            if self._read_status(conn) == STATUS_SUCCESS:
+                completed += 1
+            else:
+                failed += 1
+        conn.send(build_cget_rsp(ctx_id, msg_id, STATUS_SUCCESS,
+                                 completed=completed, failed=failed))
+
     def _dispatch(self, conn, ctx_id, cmd, data):
         command_field = parse_dimse_command_us(cmd, 0x0000, 0x0100)
         message_id = parse_dimse_command_us(cmd, 0x0000, 0x0110) or 1
@@ -386,4 +558,8 @@ class WorkflowResponder:
             return build_cstore_rsp(ctx_id, message_id, STATUS_SUCCESS)
         if command_field == CMD_C_FIND_RQ:
             return build_cfind_rsp(ctx_id, message_id, STATUS_SUCCESS)
+        if command_field == CMD_C_MOVE_RQ:
+            return build_cmove_rsp(ctx_id, message_id, STATUS_SUCCESS)
+        if command_field == CMD_C_GET_RQ:
+            return build_cget_rsp(ctx_id, message_id, STATUS_SUCCESS)
         return None

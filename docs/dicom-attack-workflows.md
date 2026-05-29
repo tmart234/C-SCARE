@@ -33,16 +33,23 @@ directions of every workflow — the same length-lie or out-of-spec field that
 probes a server's RQ parser probes a client's RSP parser when served the other
 way. Where a workflow only makes sense in one direction, the plan says so.
 
-### Direction coverage today
+### Direction coverage today — both halves of every workflow ✅
 
 | Workflow | Issuer (attack an SCP) | Responder (attack an SCU) |
 |----------|------------------------|----------------------------|
-| W1 AE brute | ✅ `ae_brute` | ⚠️ `accept_association` / `reject_association` (no AET-keyed convenience yet) |
-| W2 cred brute | ✅ `cred_brute` | ⚠️ 0x59 injection only (no require-and-validate helper yet) |
+| W1 AE brute | ✅ `ae_brute` | ✅ `WorkflowResponder(known_aets=…)` (AET-keyed AC / reject) |
+| W2 cred brute | ✅ `cred_brute` | ✅ `WorkflowResponder(require_identity=…)` (validate + 0x59) |
 | W3 C-FIND | ✅ `c_find` | ✅ `build_cfind_rsp_stream` |
-| W4 C-GET | ✅ `c_get` (experimental) | ❌ no inbound-sub-op sender yet |
-| W5 C-MOVE | ✅ `c_move` | ⚠️ `on_c_move` dispatch, no helper yet |
+| W4 C-GET | ✅ `c_get` | ✅ `WorkflowResponder.serve_cget()` (inbound C-STORE sub-ops) |
+| W5 C-MOVE | ✅ `c_move` | ✅ `build_cmove_rsp` (sub-op counts) |
 | W6 C-STORE | ✅ `c_store` + `Corruptor` | ✅ `build_cstore_rsp` |
+
+Each pair is exercised by an issuer↔responder round-trip test
+(`test/test_responders.py`) — which also retired the `c_get` "experimental"
+caveat: it now round-trips end to end. Between two C-SCARE endpoints C-GET needs
+no SCP/SCU role negotiation; a *strict* third-party SCU (e.g. pynetdicom doing
+C-GET) would still need role-selection sub-items in the AC — the remaining
+real-world gap.
 
 ## The decisive capability: read the response, don't just classify
 
@@ -264,7 +271,7 @@ SCP in `test/test_workflows.py`:
 | `cred_brute()` (W2) | `workflows.py` | surfaces 0x59 bytes; note: 0x59 is a types-3/4/5 artifact per PS3.7, type-2 acceptance is signalled by association success |
 | `c_find()` (W3) | `DICOMSocket` | Pending→Success stream enumeration + pydicom identifier decode |
 | `c_move()` (W5) | `DICOMSocket` | status + sub-op counts; objects land at the destination AE (retrieve out-of-band) |
-| `c_get()` (W4) | `DICOMSocket` | experimental — inbound C-STORE sub-op collection; pixel render + role-negotiation still TODO |
+| `c_get()` (W4) | `DICOMSocket` | inbound C-STORE sub-op collection; round-trips with the C-GET responder. Pixel render + strict-peer role-negotiation still TODO |
 | `build_query()` sculpted return-key set | `workflows.py` | empty value = return key; private tags supported |
 | CLI | `c-scare wf {ae-brute,cred-brute,find,move,get}` | shares `DICOMSocket` with the DAST path |
 
@@ -297,10 +304,12 @@ SCU-exercising (client-fuzzing) half usable. Note Implementation Version Name is
 SH (≤16 chars) — a strict SCU rejects longer values, so a long flag belongs in
 the Implementation Class UID arc, not 0x55.
 
-**Phase 2 — fill the missing direction + malformation + reporting.**
-- **Complete the pairs** so every workflow is genuinely role-agnostic: the
-  W4 responder (inbound C-STORE sub-op sender for C-GET), W5 `c_move` responder
-  helper, and AET-keyed / require-and-validate convenience responders for W1/W2.
+**Phase 1.5 — complete the direction pairs. ✅ landed.** Every workflow now has
+both halves (see the coverage table above): W1 `known_aets`, W2
+`require_identity`, W4 `serve_cget`, W5 `build_cmove_rsp`. Each is covered by an
+issuer↔responder round-trip test.
+
+**Phase 2 — malformation + reporting.**
 - **Hostile mode:** let each direction optionally pass its dataset/PDU through
   the malformation catalog (`Corruptor`, `attacks.py`, scapy `fuzz()`), so a
   workflow can run clean (recon) or hostile (malformed).
