@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# SCP grey-box, file path (AFL++) — dcmdump dataset/element parser.
+schema: 1
+name: parse
+engine: aflpp
+kind: file
+harness: fuzz_parse.sh
+
+binary: dcmdump
+build_subdir: build-llvm
+port: null
+
+input:
+  mode: file
+  placeholder: "@@"
+
+seeds:
+  dir: "{{REPO_ROOT}}/fuzz/seeds/file"   # shares the file seed corpus
+  glob: "*"
+  generators:
+    - "python3 {{REPO_ROOT}}/fuzz/harness/gen_file_seeds.py file"
+    - "python3 {{REPO_ROOT}}/fuzz/harness/gen_pixel_seeds.py"
+
+dictionary:
+  path: "{{REPO_ROOT}}/fuzz/dict/dicom.dict"
+  generator: "python3 {{REPO_ROOT}}/fuzz/harness/build_dict.py"
+
+output:
+  dir: "{{REPO_ROOT}}/fuzz/out/parse"
+  storage_dir: null
+
+env:
+  ASAN_OPTIONS: "abort_on_error=1:symbolize=0:detect_leaks=0:halt_on_error=1"
+  DCMDICTPATH: "{{REPO_ROOT}}/fuzz/dcmtk/dcmdata/data/dicom.dic"
+  AFL_SKIP_CPUFREQ: "1"
+  AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES: "1"
+
+sand:
+  enabled: true
+
+argv:
+  - "@@"
+
+triage:
+  mode: file-arg
+  server_argv: null

@@ -33,18 +33,18 @@ fi
 TARGET="$1"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# Resolve target → fuzz script + binary name + build dir. The file/SCU
-# targets live in the AFL++ afl-clang-fast build (build-llvm); the network
-# targets in the AFLNet afl-gcc build (build-net). See scripts/build_dcmtk.sh.
-case "${TARGET}" in
-    file)         FUZZ_SCRIPT=fuzz_file.sh    BIN_NAME=dcm2pnm  BUILD_SUBDIR=build-llvm ;;
-    parse)        FUZZ_SCRIPT=fuzz_parse.sh   BIN_NAME=dcmdump  BUILD_SUBDIR=build-llvm ;;
-    net-storescp) FUZZ_SCRIPT=fuzz_net.sh     BIN_NAME=storescp BUILD_SUBDIR=build-net  ;;
-    net-dcmrecv)  FUZZ_SCRIPT=fuzz_dcmrecv.sh BIN_NAME=dcmrecv  BUILD_SUBDIR=build-net  ;;
-    net-dcmqrscp) FUZZ_SCRIPT=fuzz_dcmqrscp.sh BIN_NAME=dcmqrscp BUILD_SUBDIR=build-net  ;;
-    scu)          FUZZ_SCRIPT=fuzz_scu.sh     BIN_NAME=storescu BUILD_SUBDIR=build-llvm ;;
-    *) echo "[campaign] unknown target '${TARGET}'"; exit 2 ;;
-esac
+# Resolve target → fuzz script + binary name + build dir + seeds dir from the
+# declarative profile (fuzz/targets/<target>.yaml) via scripts/profile_lib.sh.
+# No per-target case statement: adding a target is a matter of dropping in one
+# YAML. The file/SCU targets live in the AFL++ afl-clang-fast build
+# (build-llvm); the network targets in the AFLNet afl-gcc build (build-net).
+# See scripts/build_dcmtk.sh.
+# shellcheck source=scripts/profile_lib.sh
+source "${REPO_ROOT}/scripts/profile_lib.sh"
+if ! load_profile "${TARGET}"; then
+    echo "[campaign] unknown target '${TARGET}'"; exit 2
+fi
+FUZZ_SCRIPT="${HARNESS}"
 BUILD_DIR="${REPO_ROOT}/fuzz/${BUILD_SUBDIR}"
 
 CAMPAIGN_HOURS="${CAMPAIGN_HOURS:-24}"
@@ -80,15 +80,7 @@ DICT_SHA=""
 [[ -f "${REPO_ROOT}/fuzz/dict/dicom.dict" ]] && \
     DICT_SHA=$(sha256sum "${REPO_ROOT}/fuzz/dict/dicom.dict" | awk '{print $1}')
 
-SEEDS_DIR=""
-case "${TARGET}" in
-    file)         SEEDS_DIR="${REPO_ROOT}/fuzz/seeds/file" ;;
-    parse)        SEEDS_DIR="${REPO_ROOT}/fuzz/seeds/file" ;;
-    net-storescp) SEEDS_DIR="${REPO_ROOT}/fuzz/seeds/net-storescp" ;;
-    net-dcmrecv)  SEEDS_DIR="${REPO_ROOT}/fuzz/seeds/net-dcmrecv" ;;
-    net-dcmqrscp) SEEDS_DIR="${REPO_ROOT}/fuzz/seeds/net-dcmqrscp" ;;
-    scu)          SEEDS_DIR="${REPO_ROOT}/fuzz/seeds/scu" ;;
-esac
+# SEEDS_DIR was set from the profile by load_profile above.
 SEEDS_SHA=""
 if [[ -d "${SEEDS_DIR}" ]]; then
     SEEDS_SHA=$(find "${SEEDS_DIR}" -maxdepth 1 -type f \( -name '*.raw' -o -name '*.dcm' \) -print0 \

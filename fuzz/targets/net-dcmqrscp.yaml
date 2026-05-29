@@ -1,0 +1,91 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# SCP grey-box, network path (AFLNet) — dcmqrscp Query/Retrieve SCP.
+schema: 1
+name: net-dcmqrscp
+engine: aflnet
+kind: net-scp
+harness: fuzz_dcmqrscp.sh
+
+binary: dcmqrscp
+build_subdir: build-net
+port: 11114
+
+input:
+  mode: network
+  placeholder: "@@"
+
+seeds:
+  dir: "{{REPO_ROOT}}/fuzz/seeds/net-dcmqrscp"
+  glob: "*.raw"
+  generators:
+    - "python3 {{REPO_ROOT}}/fuzz/harness/seed_serializer.py net-dcmqrscp"
+
+dictionary:
+  path: null
+
+output:
+  dir: "{{REPO_ROOT}}/fuzz/out/net-dcmqrscp"
+  storage_dir: "{{REPO_ROOT}}/fuzz/storage/dcmqrscp"
+
+config:
+  template: "{{REPO_ROOT}}/fuzz/configs/dcmqrscp.cfg.template"
+  runtime: "{{REPO_ROOT}}/fuzz/configs/dcmqrscp.cfg"
+
+env:
+  ASAN_OPTIONS: "detect_leaks=0:abort_on_error=1:symbolize=0:halt_on_error=1"
+  DCMDICTPATH: "{{REPO_ROOT}}/fuzz/dcmtk/dcmdata/data/dicom.dic"
+  AFL_SKIP_CPUFREQ: "1"
+  AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES: "1"
+
+sand:
+  enabled: false
+
+# Single source feeding the seed A-ASSOCIATE-RQ AND the rendered dcmqrscp.cfg
+# (HostTable caller = calling_ae, AETable entry = called_ae) — they must match
+# or the Q/R SCP rejects the association.
+association:
+  calling_ae: C-SCARE-FZ
+  called_ae: DCMQRSCP
+  max_pdu_length: 16384
+
+flows:
+  - name: echo
+    dimse: C_ECHO_RQ
+    abstract_syntax: VERIFICATION_SOP_CLASS_UID
+    transfer_syntaxes: [DEFAULT_TRANSFER_SYNTAX_UID]
+  - name: find
+    dimse: C_FIND_RQ
+    abstract_syntax: PATIENT_ROOT_QR_FIND_SOP_CLASS_UID
+    transfer_syntaxes: [DEFAULT_TRANSFER_SYNTAX_UID]
+    dimse_kwargs:
+      priority: 0x0000
+  - name: move
+    dimse: C_MOVE_RQ
+    abstract_syntax: PATIENT_ROOT_QR_MOVE_SOP_CLASS_UID
+    transfer_syntaxes: [DEFAULT_TRANSFER_SYNTAX_UID]
+    dimse_kwargs:
+      move_destination: "@calling_ae"
+      priority: 0x0000
+  - name: get
+    dimse: C_GET_RQ
+    abstract_syntax: PATIENT_ROOT_QR_GET_SOP_CLASS_UID
+    transfer_syntaxes: [DEFAULT_TRANSFER_SYNTAX_UID]
+    dimse_kwargs:
+      priority: 0x0000
+
+argv:
+  - "-c"
+  - "{{CONFIG}}"
+  - "{{PORT}}"
+
+triage:
+  mode: net-replay
+  server_argv:
+    - "-c"
+    - "{{CONFIG}}"
+    - "{{PORT}}"
+
+readiness:
+  port_wait_s: 5.0
+shutdown:
+  signal: SIGINT

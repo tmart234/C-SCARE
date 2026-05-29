@@ -16,12 +16,15 @@ AFLNet replays these byte streams against the live SCP, then mutates within
 them. The DICOM PDU header (1B type + 1B reserved + 4B BE length) is the
 natural message boundary for AFLNet's built-in `-P DICOM` parser.
 
-The net-dcmqrscp C-FIND/C-MOVE/C-GET flow drives the dcmqrdb Q/R database
-back end — the grey-box coverage for its query-handling bug class:
-CVE-2021-41687 / -41688 / -41689 / -41690 (memory leak, double free,
-heap overflow, memory leak). The leak-class entries need ASan/LSan to
-surface; see the campaign notes. The net-storescp / net-dcmrecv C-STORE
-flow exercises the dcmnet receive path (CVE-2024-34508, invalid DIMSE).
+The AE titles, presentation-context abstract syntaxes (SOP classes), transfer
+syntaxes, and per-DIMSE flows are NOT hardcoded here — they come from the
+declarative target profiles (``fuzz/targets/<target>.yaml``, see
+``c_scare.profiles``). The same ``calling_ae`` / ``called_ae`` a profile feeds
+into the A-ASSOCIATE-RQ is what scripts/fuzz_dcmqrscp.sh substitutes into
+``dcmqrscp.cfg``, so the Q/R SCP recognises the peer.
+
+Usage:
+    seed_serializer.py [<target>]   # default: every net-scp profile
 
 Determinism: a fixed seed (env C_SCARE_SERIALIZER_SEED, default 0xC5CA8E)
 drives random.Random for message IDs. The seed is written to SEED.txt
@@ -35,52 +38,39 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
+import c_scare  # noqa: E402
 from scapy.packet import raw  # noqa: E402
 
 from c_scare import (  # noqa: E402
     A_ASSOCIATE_RQ,
     A_RELEASE_RQ,
-    C_ECHO_RQ,
-    C_FIND_RQ,
-    C_GET_RQ,
-    C_MOVE_RQ,
-    C_STORE_RQ,
-    CT_IMAGE_STORAGE_SOP_CLASS_UID,
-    DEFAULT_TRANSFER_SYNTAX_UID,
     DICOM,
     DICOMApplicationContext,
     DICOMVariableItem,
     P_DATA_TF,
-    PATIENT_ROOT_QR_FIND_SOP_CLASS_UID,
-    PATIENT_ROOT_QR_GET_SOP_CLASS_UID,
-    PATIENT_ROOT_QR_MOVE_SOP_CLASS_UID,
     PresentationDataValueItem,
-    VERIFICATION_SOP_CLASS_UID,
     build_presentation_context_rq,
     build_user_information,
 )
+from c_scare.profiles import load_profile, load_profiles  # noqa: E402
 
 SEEDS_ROOT = REPO_ROOT / "fuzz" / "seeds"
 DEFAULT_SEED = 0xC5CA8E
-CALLING_AE = "C-SCARE-FZ"
-
-# Q/R SCP requires the calling AE to match a known peer in its config; the
-# dcmqrscp.cfg.template (fuzz/configs/) accepts CALLING_AE as a recognised peer.
 
 
-def _associate_rq(called_ae: str, abstract_syntax_uid: str) -> bytes:
+def _associate_rq(profile, flow) -> bytes:
     variable_items = [
         DICOMVariableItem() / DICOMApplicationContext(),
         build_presentation_context_rq(
             context_id=1,
-            abstract_syntax_uid=abstract_syntax_uid,
-            transfer_syntax_uids=[DEFAULT_TRANSFER_SYNTAX_UID],
+            abstract_syntax_uid=flow.abstract_syntax,
+            transfer_syntax_uids=list(flow.transfer_syntaxes),
         ),
-        build_user_information(max_pdu_length=16384),
+        build_user_information(max_pdu_length=profile.max_pdu_length),
     ]
     pkt = DICOM() / A_ASSOCIATE_RQ(
-        called_ae_title=called_ae,
-        calling_ae_title=CALLING_AE,
+        called_ae_title=profile.called_ae,
+        calling_ae_title=profile.calling_ae,
         variable_items=variable_items,
     )
     return bytes(raw(pkt))
@@ -100,92 +90,53 @@ def _release_rq() -> bytes:
     return bytes(raw(DICOM() / A_RELEASE_RQ()))
 
 
-def _flow(called_ae: str, abstract_syntax_uid: str, dimse_pkt) -> bytes:
+def _build_dimse(flow, rng: random.Random):
+    """Construct a DIMSE command packet for ``flow`` from the profile.
+
+    ``affected_sop_class_uid`` defaults to the flow's presentation-context
+    abstract syntax (the same UID for every flow today); per-flow extras
+    (instance UID, priority, C-MOVE destination) come from ``dimse_kwargs``.
+    """
+    dimse_cls = getattr(c_scare, flow.dimse)
+    kwargs = {"affected_sop_class_uid": flow.abstract_syntax}
+    kwargs.update(flow.dimse_kwargs)
+    kwargs["message_id"] = rng.randint(1, 0xFFFF)
+    return dimse_cls(**kwargs)
+
+
+def _flow_bytes(profile, flow, rng: random.Random) -> bytes:
     return (
-        _associate_rq(called_ae, abstract_syntax_uid)
-        + _p_data_command(dimse_pkt)
+        _associate_rq(profile, flow)
+        + _p_data_command(_build_dimse(flow, rng))
         + _release_rq()
     )
 
 
-def _write_seeds(out_dir: Path, called_ae: str, flows, seed: int) -> None:
+def _write_target(profile, seed: int) -> None:
+    out_dir = SEEDS_ROOT / profile.name
     out_dir.mkdir(parents=True, exist_ok=True)
-    for name, abs_syntax, dimse in flows:
-        blob = _flow(called_ae, abs_syntax, dimse)
-        out = out_dir / f"{name}.raw"
+    rng = random.Random(seed)  # reset per-target so seeds are deterministic
+    for flow in profile.flows:
+        blob = _flow_bytes(profile, flow, rng)
+        out = out_dir / f"{flow.name}.raw"
         out.write_bytes(blob)
         print(f"  wrote {out.relative_to(REPO_ROOT)} ({len(blob)} bytes)")
     (out_dir / "SEED.txt").write_text(f"{seed}\n")
 
 
-def seeds_storescp(rng: random.Random):
-    return [
-        ("echo", VERIFICATION_SOP_CLASS_UID,
-         C_ECHO_RQ(message_id=rng.randint(1, 0xFFFF))),
-        ("store", CT_IMAGE_STORAGE_SOP_CLASS_UID,
-         C_STORE_RQ(
-             message_id=rng.randint(1, 0xFFFF),
-             affected_sop_class_uid=CT_IMAGE_STORAGE_SOP_CLASS_UID,
-             affected_sop_instance_uid="1.2.3.4.5.6.7.8.9.10",
-             priority=0x0000,
-         )),
-    ]
-
-
-def seeds_dcmrecv(rng: random.Random):
-    return [
-        ("echo", VERIFICATION_SOP_CLASS_UID,
-         C_ECHO_RQ(message_id=rng.randint(1, 0xFFFF))),
-        ("store", CT_IMAGE_STORAGE_SOP_CLASS_UID,
-         C_STORE_RQ(
-             message_id=rng.randint(1, 0xFFFF),
-             affected_sop_class_uid=CT_IMAGE_STORAGE_SOP_CLASS_UID,
-             affected_sop_instance_uid="1.2.3.4.5.6.7.8.9.11",
-             priority=0x0000,
-         )),
-    ]
-
-
-def seeds_dcmqrscp(rng: random.Random):
-    return [
-        ("echo", VERIFICATION_SOP_CLASS_UID,
-         C_ECHO_RQ(message_id=rng.randint(1, 0xFFFF))),
-        ("find", PATIENT_ROOT_QR_FIND_SOP_CLASS_UID,
-         C_FIND_RQ(
-             message_id=rng.randint(1, 0xFFFF),
-             affected_sop_class_uid=PATIENT_ROOT_QR_FIND_SOP_CLASS_UID,
-             priority=0x0000,
-         )),
-        ("move", PATIENT_ROOT_QR_MOVE_SOP_CLASS_UID,
-         C_MOVE_RQ(
-             message_id=rng.randint(1, 0xFFFF),
-             affected_sop_class_uid=PATIENT_ROOT_QR_MOVE_SOP_CLASS_UID,
-             move_destination=CALLING_AE,
-             priority=0x0000,
-         )),
-        ("get", PATIENT_ROOT_QR_GET_SOP_CLASS_UID,
-         C_GET_RQ(
-             message_id=rng.randint(1, 0xFFFF),
-             affected_sop_class_uid=PATIENT_ROOT_QR_GET_SOP_CLASS_UID,
-             priority=0x0000,
-         )),
-    ]
-
-
-def main() -> int:
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
     seed = int(os.environ.get("C_SCARE_SERIALIZER_SEED", str(DEFAULT_SEED)), 0)
 
-    targets = [
-        ("net-storescp", "STORESCP", seeds_storescp),
-        ("net-dcmrecv",  "DCMRECV",  seeds_dcmrecv),
-        ("net-dcmqrscp", "DCMQRSCP", seeds_dcmqrscp),
-    ]
+    if argv:
+        profiles = [load_profile(argv[0])]
+    else:
+        profiles = [p for p in load_profiles().values() if p.kind == "net-scp"]
 
-    for sub, called_ae, builder in targets:
-        rng = random.Random(seed)  # reset per-target so seeds are deterministic
-        flows = builder(rng)
-        out_dir = SEEDS_ROOT / sub
-        _write_seeds(out_dir, called_ae, flows, seed)
+    for profile in profiles:
+        if profile.kind != "net-scp" or not profile.flows:
+            continue
+        _write_target(profile, seed)
 
     print(f"  serializer seed={hex(seed)}")
     return 0
