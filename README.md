@@ -127,6 +127,28 @@ c-scare --ip 127.0.0.1 --port 4242 --ae-title ORTHANC --category cve --sarif cve
 c-scare corpus -o ./corpus
 ```
 
+### 3a. SCU attack workflows — recon → query against a live server
+
+```bash
+# Brute Called AE Titles and read each accepted AET's AC payload (W1)
+c-scare wf --ip 127.0.0.1 --port 4242 ae-brute --aets PACS,RADIOLOGY_BACKUP_2017
+
+# Brute User Identity credentials, surfacing the 0x59 server response (W2)
+c-scare wf --ip 127.0.0.1 --port 4242 cred-brute --ae-title PACS \
+    --creds admin:admin,svc:changeme
+
+# Sculpted C-FIND: request exactly the keys you want back (W3)
+c-scare wf --ip 127.0.0.1 --port 4242 find --ae-title PACS --model study \
+    --return-key 0008,1030 --return-key 0020,000D
+
+# C-MOVE pivot: redirect matched objects to a third AE (W5)
+c-scare wf --ip 127.0.0.1 --port 4242 move --ae-title PACS \
+    --dest-ae RESEARCH_VIEWER --match 0020,000D,UI=1.2.3
+```
+
+These issuer drivers share `DICOMSocket` with the DAST path; use them to reach
+the state (discovered AE title, valid credential) a DAST run should start from.
+
 (`python -m c_scare …` is equivalent to the `c-scare` console command.)
 
 ### 4. Fuzz DICOM clients with a rogue server
@@ -200,7 +222,8 @@ c-scare greybox triage fuzz/out/net-storescp --net net-storescp \
 | `scapy_dicom.py` | DICOM crafting engine — PDUs, DIMSE-C/N, `DICOMSocket`; crafts malformed traffic |
 | `server.py` | `RawSCP` rogue server for fuzzing clients (SCU) |
 | `attacks.py` | Static attack catalog + seed generators — classes expose `all()` iterators of `AttackResult` |
-| `deliver.py` | Black-box delivery — `send_pdu()`, `send_sequence()`, `send_cstore()` |
+| `workflows.py` | SCU-side attack workflows — `ae_brute()`, `cred_brute()`, `build_query()`; query/retrieve flows (`c_find`/`c_get`/`c_move`) live on `DICOMSocket` |
+| `deliver.py` | Black-box delivery — `send_pdu()`, `send_sequence()`, `send_cstore()` (optional `user_identity=` to authenticate first) |
 | `greybox.py` | Grey-box bridge — launches AFL++/AFLNet harnesses, triages crashes to SARIF |
 | `monitor.py` | Crash/anomaly detection — sanitizer, protocol and process-health monitors |
 | `test_runner.py` | CLI (`c-scare` / `python -m c_scare`) |

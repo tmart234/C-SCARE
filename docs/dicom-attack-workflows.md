@@ -228,12 +228,33 @@ won't do for you. The plan must keep that boundary honest.
 
 ## Phasing
 
-**Phase 0 — issuer helpers (SCU role).** Land the association/result-classify
-primitive (with AC-payload extraction), then `ae_brute()`, `cred_brute()`
-(identity in `associate()` + 0x59 reader), `c_find()` (return-key set + stream
-count), `c_get()` (+ pixel render), `c_move()` (+ sub-op status). Prove them
-against a real PACS (Orthanc / dcmqrscp container) and against the acceptance
-scenarios above. Low risk, immediately useful for black-box DAST against servers.
+**Phase 0 — issuer helpers (SCU role). ✅ landed.** Implemented on
+`DICOMSocket` and `c_scare/workflows.py`, validated against a live pynetdicom
+SCP in `test/test_workflows.py`:
+
+| Piece | Where | Notes |
+|-------|-------|-------|
+| association + AC-payload parse (0x10/0x52/0x55) + reject classification | `DICOMSocket.associate` / `peer_info` / `last_reject` | also fixed a latent `sr1` answer-matching bug — association now uses send+recv |
+| User Identity in association (0x58) + 0x59 reader | `associate(user_identity=…)` / `user_identity_response` | dict or `DICOMUserIdentity`; `build_user_identity` |
+| `ae_brute()` (W1) | `workflows.py` | reads AC payload per accepted AET |
+| `cred_brute()` (W2) | `workflows.py` | surfaces 0x59 bytes; note: 0x59 is a types-3/4/5 artifact per PS3.7, type-2 acceptance is signalled by association success |
+| `c_find()` (W3) | `DICOMSocket` | Pending→Success stream enumeration + pydicom identifier decode |
+| `c_move()` (W5) | `DICOMSocket` | status + sub-op counts; objects land at the destination AE (retrieve out-of-band) |
+| `c_get()` (W4) | `DICOMSocket` | experimental — inbound C-STORE sub-op collection; pixel render + role-negotiation still TODO |
+| `build_query()` sculpted return-key set | `workflows.py` | empty value = return key; private tags supported |
+| CLI | `c-scare wf {ae-brute,cred-brute,find,move,get}` | shares `DICOMSocket` with the DAST path |
+
+**DAST synergy (no redundant transport):** the flows reuse the same
+`DICOMSocket` as `deliver.send_cstore`, and `send_cstore(…, user_identity=…)`
+now lets a black-box C-STORE attack authenticate first — so a DAST run can
+start from the associated/authenticated *state* a workflow established (e.g.
+feed an AET discovered by `ae_brute` into `--ae-title`, or a credential
+recovered by `cred_brute`). Workflow findings convert to `AttackResult`
+(`WorkflowResult.to_attack_result`) to ride the existing SARIF writer.
+
+Remaining for a later pass: `c_get()` SCP/SCU role negotiation + pixel
+rendering (W4 burned-in-text solve), and proving the flows against
+Orthanc/dcmqrscp in addition to pynetdicom.
 
 **Phase 1 — responder helpers (SCP role).** Per-verb responders on `RawSCP`
 (serve RSP streams / parse RQ) so each workflow exercises a client too.

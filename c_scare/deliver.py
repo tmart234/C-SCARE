@@ -54,11 +54,17 @@ def send_cstore(target: Tuple[str, int],
                 sop_class_uid: str,
                 sop_instance_uid: str = '1.2.3.4.5',
                 transfer_syntax: str = None,
-                timeout: float = 5.0) -> Optional[int]:
+                timeout: float = 5.0,
+                user_identity=None) -> Optional[int]:
     """Perform a DICOM C-STORE with the given dataset payload.
 
     Returns the DIMSE status code, or ``None`` if the operation failed.
     Requires Scapy and scapy_dicom.
+
+    ``user_identity`` (a dict / ``DICOMUserIdentity``) lets a DAST C-STORE
+    attack authenticate via User Identity Negotiation first, so payload
+    delivery can start from an associated state against an auth-gated SCP —
+    the workflow-as-precondition synergy.
     """
     try:
         from .scapy_dicom import (
@@ -70,7 +76,7 @@ def send_cstore(target: Tuple[str, int],
     ts = transfer_syntax or DEFAULT_TRANSFER_SYNTAX_UID
     try:
         with DICOMSocket(target[0], target[1], 'TARGET', 'ATTACKER') as sock:
-            if not sock.associate({sop_class_uid: [ts]}):
+            if not sock.associate({sop_class_uid: [ts]}, user_identity=user_identity):
                 return None
             return sock.c_store(payload, sop_class_uid, sop_instance_uid, ts)
     except Exception:
