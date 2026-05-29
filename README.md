@@ -28,7 +28,9 @@ C-SCARE is organised around *who* you test (a DICOM server / SCP, or a client / 
 | **SCP** (server) | Deliver the attack catalog live at a server, watch for protocol/health anomalies — `c-scare --ip … --category …` | Seed AFL++/AFLNet, fuzz instrumented DCMTK binaries, triage crashes — `c-scare greybox …` |
 | **SCU** (client) | `RawSCP` rogue server feeds malformed responses to a connecting client — `c-scare rogue …` | Instrument a DICOM client (DCMTK `storescu`) and AFL-fuzz the server-response stream via a desock shim — `c-scare greybox run scu` (experimental) |
 
-> **C-SCARE does not contain a fuzzing engine.** The mutation loop and coverage feedback belong to AFL++ (file targets) and AFLNet (network targets); C-SCARE crafts, corrupts, seeds, monitors, and triages around them. See [docs/architecture.md](docs/architecture.md) for what C-SCARE is — and is not.
+## What C-SCARE is — and is not
+
+**C-SCARE does not contain a fuzzing engine.** The mutation loop and coverage feedback belong to AFL++ (file targets) and AFLNet (network targets). C-SCARE supplies everything around them: crafting & corruption (`Corruptor` re-emits a real `.dcm` *invalid*, which pydicom alone cannot; `scapy_dicom` crafts malformed PDUs/DIMSE a compliant library refuses to send), the static attack catalog and its seed generators, the `RawSCP` rogue server for fuzzing clients, the grey-box bridge that drives AFL++/AFLNet and triages crashes, and sanitizer/protocol/process-health monitors emitting SARIF v2.1.0.
 
 ## Architecture
 
@@ -82,7 +84,23 @@ flowchart TD
     WORKFLOWS -->|findings| SARIF
 ```
 
-See [docs/architecture.md](docs/architecture.md) for the module-by-module reference.
+### Module reference
+
+| Module | Purpose |
+|--------|---------|
+| `element.py` | Dataset/Element building with Scapy-style `/` chaining |
+| `corruptor.py` | pydicom bridge — read with pydicom, re-emit *invalid* with our encoder |
+| `pixel.py` | Encapsulated pixel data with fragment-level control + Scapy layers |
+| `file.py` | Part 10 file handling (preamble, meta header, transfer syntax via `pydicom.uid.UID`) |
+| `scapy_dicom.py` | DICOM crafting engine — PDUs, DIMSE-C/N, `DICOMSocket`; crafts malformed traffic |
+| `server.py` | `RawSCP` rogue server for fuzzing clients (SCU) |
+| `attacks.py` | Static attack catalog + seed generators — classes expose `all()` iterators of `AttackResult` |
+| `workflows.py` | SCU-side attack workflows (issuer) — `ae_brute()`, `cred_brute()`, `build_query()`; query/retrieve flows (`c_find`/`c_get`/`c_move`) live on `DICOMSocket` |
+| `responders.py` | SCP-side workflow responders (exercise an SCU client) — `accept_association()`, DIMSE RSP builders, `WorkflowResponder` |
+| `deliver.py` | Black-box delivery — `send_pdu()`, `send_sequence()`, `send_cstore()` (optional `user_identity=` to authenticate first) |
+| `greybox.py` | Grey-box bridge — launches AFL++/AFLNet harnesses, triages crashes to SARIF |
+| `monitor.py` | Crash/anomaly detection — sanitizer, protocol and process-health monitors |
+| `test_runner.py` | CLI (`c-scare` / `python -m c_scare`) |
 
 ## Quick start
 
@@ -124,7 +142,6 @@ c-scare greybox run file
 | [docs/dast.md](docs/dast.md) | Black-box DAST — attack catalog (8 categories / 68 payloads / 13 CVEs), corruptor & scapy crafting, live delivery, rogue server |
 | [docs/workflows.md](docs/workflows.md) | Pentest workflows — W1–W5 issuer drivers, SCP-side responders |
 | [docs/fuzzing.md](docs/fuzzing.md) | Grey-box fuzzing — DCMTK toolchain, targets, device parity, SAND mode, coverage, campaigns |
-| [docs/architecture.md](docs/architecture.md) | What C-SCARE is/is not, dataflow, module reference |
 | [PROTOCOL.md](PROTOCOL.md) | Byte-level DICOM structure (file format, data elements, PDUs, DIMSE, state machine) |
 
 ## License
