@@ -73,6 +73,14 @@ tests a client), **Solve requirement**, **abuse/malformation angle**, **build**,
   — and for every accepted AET **extract the AC payload**: Application Context
   UID and Implementation Version Name (0x55). Throttle/concurrency controls so
   the loop is usable against a real server.
+- **Independent from W2:** a wrong AET rejects with source 1 / reason 7
+  (*called-AE-title-not-recognized*) while a bad credential rejects with an ACSE
+  source-2 code, so the two are distinguishable on the wire and brute-forceable
+  separately. `classify_reject()` exposes the slug; `ae_brute` reports
+  `aet_recognized` (the AET is valid if rejected for *any other* reason) and
+  `cred_brute` reports `aet_problem`. Isolate the AET axis by **not** sending
+  credentials — servers often check identity before the AET, which would mask
+  the AET code.
 - **Solve requirement:** report, per accepted AET, the *contents* of its AC
   (App Context UID + 0x55), not merely "accepted". A brute that only diffs
   accept-vs-reject fails the scenario — the payoff lives in the AC payload that
@@ -256,8 +264,22 @@ Remaining for a later pass: `c_get()` SCP/SCU role negotiation + pixel
 rendering (W4 burned-in-text solve), and proving the flows against
 Orthanc/dcmqrscp in addition to pynetdicom.
 
-**Phase 1 — responder helpers (SCP role).** Per-verb responders on `RawSCP`
-(serve RSP streams / parse RQ) so each workflow exercises a client too.
+**Phase 1 — responder helpers (SCP role). ✅ landed.** `c_scare/responders.py`,
+validated against a real pynetdicom SCU in `test/test_responders.py`:
+
+| Piece | Where | Notes |
+|-------|-------|-------|
+| valid association acceptor | `accept_association()` | the piece `RawSCP` lacked — echoes proposed presentation contexts so a real SCU associates; injects custom 0x55 Impl Version Name and a 0x59 user-identity response |
+| `reject_association()` | `responders.py` | craft any result/source/reason (e.g. 1/1/7 to exercise a client's AE-title handling) |
+| DIMSE response builders | `build_cecho_rsp` / `build_cstore_rsp` / `build_cfind_rsp` / `build_cfind_rsp_stream` | serve sculpted or malformed RSP streams |
+| `WorkflowResponder` | `responders.py` | wraps `RawSCP`: auto-accepts, reassembles DIMSE across P-DATA PDUs, dispatches by command field to `on_c_*` handlers (default C-ECHO success) |
+| CLI | `c-scare wf respond` | runs a `WorkflowResponder` to exercise a connecting client |
+
+Contrast with `test_rogue.py` (malformed AC blocks the client): a conformant AC
+now lets a client through to the DIMSE stage, which is what makes the
+SCU-exercising (client-fuzzing) half usable. Note Implementation Version Name is
+SH (≤16 chars) — a strict SCU rejects longer values, so a long flag belongs in
+the Implementation Class UID arc, not 0x55.
 
 **Phase 2 — malformation wiring + reporting.** Route both directions of every
 workflow through the existing catalog (`Corruptor`, `attacks.py`, scapy `fuzz()`)

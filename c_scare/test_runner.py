@@ -908,6 +908,15 @@ def _cmd_workflow(argv: List[str]) -> int:
     ab.add_argument('--aets', help='comma-separated AE titles')
     ab.add_argument('--aet-file', help='file with one AE title per line')
 
+    rp = sub.add_parser('respond',
+                        help='run an SCP that exercises a connecting SCU client')
+    rp.add_argument('--host', default='0.0.0.0')
+    rp.add_argument('--ae-title', dest='ae_title', default='C_SCARE')
+    rp.add_argument('--impl-version', dest='impl_version',
+                    help='Implementation Version Name to advertise (<=16 chars)')
+    rp.add_argument('--user-id-response', dest='user_id_response',
+                    help='Type 0x59 user-identity server response to return')
+
     cb = sub.add_parser('cred-brute', help='brute-force User Identity creds (W2)')
     cb.add_argument('--ae-title', dest='ae_title', required=True)
     cb.add_argument('--creds', help='comma-separated user:pass pairs')
@@ -932,6 +941,21 @@ def _cmd_workflow(argv: List[str]) -> int:
                            help='C-MOVE destination AE (the pivot target)')
 
     a = p.parse_args(argv)
+
+    if a.wfcmd == 'respond':
+        from .responders import WorkflowResponder
+        responder = WorkflowResponder(
+            host=a.host, port=a.port, ae_title=a.ae_title,
+            implementation_version_name=a.impl_version,
+            user_identity_response=a.user_id_response)
+        print(f"[respond] WorkflowResponder on {a.host}:{a.port} "
+              f"(accepts associations, answers C-ECHO/C-FIND)  Ctrl-C to stop")
+        try:
+            responder.start(blocking=True)
+        except KeyboardInterrupt:
+            print("\n[respond] stopping")
+            responder.stop()
+        return 0
 
     if a.wfcmd == 'ae-brute':
         aets: List[str] = []

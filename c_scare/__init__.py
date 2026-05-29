@@ -171,6 +171,14 @@ from .workflows import (
     build_query, ae_brute, cred_brute,
 )
 
+# SCP-side workflow responders (exercise an SCU client): valid association
+# acceptor, DIMSE response builders, and a dispatching WorkflowResponder.
+from .responders import (
+    accept_association, reject_association,
+    build_cecho_rsp, build_cstore_rsp, build_cfind_rsp, build_cfind_rsp_stream,
+    WorkflowResponder,
+)
+
 __all__ = [
     # Version
     "__version__",
@@ -320,6 +328,10 @@ __all__ = [
     # SCU-side attack workflows
     "WorkflowResult", "AETResult", "CredResult", "QR_MODELS",
     "build_query", "ae_brute", "cred_brute",
+    # SCP-side workflow responders
+    "accept_association", "reject_association",
+    "build_cecho_rsp", "build_cstore_rsp", "build_cfind_rsp",
+    "build_cfind_rsp_stream", "WorkflowResponder",
     # Monitor framework
     "BaseMonitor",
     "MonitorReport",
