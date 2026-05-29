@@ -107,10 +107,13 @@ from .scapy_dicom import (
     # Utilities
     DICOMSocket,
     parse_dimse_status,
+    parse_dimse_command_us,
+    parse_dimse_command_field,
     _uid_to_bytes,
     _uid_to_bytes_raw,
     build_presentation_context_rq,
     build_user_information,
+    build_user_identity,
     # DIMSE Status Codes (PS3.7 Annex C)
     STATUS_SUCCESS,
     STATUS_CANCEL,
@@ -159,6 +162,24 @@ from .pixel import (
 # Rogue SCP (SCU / client fuzzing) and raw network delivery
 from .server import RawSCP, ConnectionState, Connection
 from .deliver import send_pdu, send_sequence, send_cstore
+
+# SCU-side attack workflows (issuer drivers): AE brute, credential brute,
+# sculpted query builder. Query/retrieve flows (c_find/c_get/c_move) live on
+# DICOMSocket; these compose them into operations.
+from .workflows import (
+    WorkflowResult, AETResult, CredResult, QR_MODELS,
+    build_query, ae_brute, cred_brute,
+)
+
+# SCP-side workflow responders (exercise an SCU client): valid association
+# acceptor, DIMSE response builders, and a dispatching WorkflowResponder.
+from .responders import (
+    accept_association, reject_association,
+    parse_proposed_contexts, parse_user_identity,
+    build_cecho_rsp, build_cstore_rsp, build_cfind_rsp, build_cfind_rsp_stream,
+    build_cmove_rsp, build_cget_rsp,
+    WorkflowResponder,
+)
 
 __all__ = [
     # Version
@@ -260,10 +281,13 @@ __all__ = [
     # Utilities
     "DICOMSocket",
     "parse_dimse_status",
+    "parse_dimse_command_us",
+    "parse_dimse_command_field",
     "_uid_to_bytes",
     "_uid_to_bytes_raw",
     "build_presentation_context_rq",
     "build_user_information",
+    "build_user_identity",
     # Status Codes
     "STATUS_SUCCESS",
     "STATUS_CANCEL",
@@ -303,6 +327,15 @@ __all__ = [
     # Rogue server & network delivery
     "RawSCP", "ConnectionState", "Connection",
     "send_pdu", "send_sequence", "send_cstore",
+    # SCU-side attack workflows
+    "WorkflowResult", "AETResult", "CredResult", "QR_MODELS",
+    "build_query", "ae_brute", "cred_brute",
+    # SCP-side workflow responders
+    "accept_association", "reject_association",
+    "parse_proposed_contexts", "parse_user_identity",
+    "build_cecho_rsp", "build_cstore_rsp", "build_cfind_rsp",
+    "build_cfind_rsp_stream", "build_cmove_rsp", "build_cget_rsp",
+    "WorkflowResponder",
     # Monitor framework
     "BaseMonitor",
     "MonitorReport",

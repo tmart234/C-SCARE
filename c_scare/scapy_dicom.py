@@ -203,10 +203,15 @@ __all__ = [
      # Utilities
      "DICOMSocket",
     "parse_dimse_status",
+    "parse_dimse_command_us",
+    "parse_dimse_command_field",
+    "classify_reject",
+    "reject_is_called_aet_unrecognized",
     "_uid_to_bytes",
     "_uid_to_bytes_raw",
     "build_presentation_context_rq",
     "build_user_information",
+    "build_user_identity",
      # DIMSE Status Codes (PS3.7 Annex C)
      "STATUS_SUCCESS",
     "STATUS_CANCEL",
@@ -2482,6 +2487,99 @@ def parse_dimse_status(dimse_bytes):
 
     return None
 
+def parse_dimse_command_us(dimse_bytes, group, element):
+    # type: (bytes, int, int) -> Optional[int]
+    """Extract an unsigned-short command element (e.g. Data Set Type 0000,0800,
+    or the C-MOVE/C-GET sub-operation counts 0000,1020-1023) from DIMSE command
+    bytes. Generalises ``parse_dimse_status`` to any 2-byte command field."""
+    try:
+        if len(dimse_bytes) < 12:
+            return None
+        cmd_group_len = struct.unpack("<I", dimse_bytes[8:12])[0]
+        offset = 12
+        group_end_offset = offset + cmd_group_len
+        while offset < group_end_offset and offset + 8 <= len(dimse_bytes):
+            tag_group, tag_elem = struct.unpack("<HH", dimse_bytes[offset:offset + 4])
+            value_len = struct.unpack("<I", dimse_bytes[offset + 4:offset + 8])[0]
+            if tag_group == group and tag_elem == element and value_len == 2:
+                if offset + 10 > len(dimse_bytes) or offset + 10 > group_end_offset:
+                    break
+                return struct.unpack("<H", dimse_bytes[offset + 8:offset + 10])[0]
+            offset += 8 + value_len
+    except struct.error:
+        return None
+    return None
+
+
+def parse_dimse_command_field(dimse_bytes):
+    # type: (bytes) -> Optional[int]
+    """Return the DIMSE Command Field (0000,0100) — lets a receiver tell a
+    C-STORE-RQ sub-operation (0x0001) apart from a C-GET/C-MOVE-RSP (0x8010 /
+    0x8021) on the same association."""
+    return parse_dimse_command_us(dimse_bytes, 0x0000, 0x0100)
+
+
+def build_user_identity(identity):
+    # type: (Any) -> Packet
+    """Coerce a user-identity spec into a ``DICOMUserIdentity`` sub-item.
+
+    Accepts a ready ``DICOMUserIdentity`` packet, or a dict such as
+    ``{"type": 2, "primary": b"user", "secondary": b"pass",
+    "positive_response_requested": 1}``. ``primary``/``secondary`` may be str
+    or bytes; for type 2 (username+passcode) ``secondary`` is the passcode, for
+    types 3-5 ``primary`` carries the Kerberos/SAML/JWT token bytes."""
+    if isinstance(identity, DICOMUserIdentity):
+        return identity
+
+    def _b(v):
+        if v is None:
+            return b""
+        return v if isinstance(v, bytes) else str(v).encode("utf-8")
+
+    id_type = int(identity.get("type", 2))
+    primary = _b(identity.get("primary"))
+    secondary = _b(identity.get("secondary"))
+    positive = int(identity.get("positive_response_requested", 1))
+    kwargs = {
+        "user_identity_type": id_type,
+        "positive_response_requested": positive,
+        "primary_field": primary,
+    }
+    if id_type == 2:
+        kwargs["secondary_field"] = secondary
+    return DICOMUserIdentity(**kwargs)
+
+
+def classify_reject(reject):
+    # type: (Optional[Dict[str, int]]) -> Optional[str]
+    """Map an A-ASSOCIATE-RJ ``{result, source, reason}`` to a canonical slug.
+
+    This is what lets AE-title and credential brute force be run as *separate*
+    axes: a wrong Called AE Title rejects with source 1 / reason 7
+    (``called-AE-title-not-recognized``), whereas a bad credential rejects with
+    a source 2 (ACSE) code — pynetdicom uses ``(2, 2, 1)`` per PS3.8 — so the
+    two failure modes are distinguishable on the wire."""
+    if not reject:
+        return None
+    source = reject.get("source")
+    reason = reject.get("reason")
+    table = {
+        1: A_ASSOCIATE_RJ.REASON_USER,
+        2: A_ASSOCIATE_RJ.REASON_ACSE,
+        3: A_ASSOCIATE_RJ.REASON_PRESENTATION,
+    }.get(source, {})
+    return table.get(reason, "source%s-reason%s" % (source, reason))
+
+
+def reject_is_called_aet_unrecognized(reject):
+    # type: (Optional[Dict[str, int]]) -> bool
+    """True iff the reject is specifically ``called-AE-title-not-recognized``
+    (source 1, reason 7) — i.e. *this* Called AE Title is wrong. Any other
+    reject means the AET was recognised and the problem lies elsewhere
+    (commonly user-identity/auth), so the AET axis can be considered solved."""
+    return bool(reject) and reject.get("source") == 1 and reject.get("reason") == 7
+
+
 def build_presentation_context_rq(context_id, abstract_syntax_uid, transfer_syntax_uids):
     # type: (int, str, List[str]) -> Packet
     """Build a Presentation Context RQ item."""
@@ -2499,9 +2597,14 @@ def build_presentation_context_rq(context_id, abstract_syntax_uid, transfer_synt
     )
 
 
-def build_user_information(max_pdu_length=16384, implementation_class_uid=None, implementation_version=None):
-    # type: (int, Optional[str], Optional[Union[str, bytes]]) -> Packet
-    """Build a User Information item."""
+def build_user_information(max_pdu_length=16384, implementation_class_uid=None,
+                           implementation_version=None, user_identity=None):
+    # type: (int, Optional[str], Optional[Union[str, bytes]], Optional[Any]) -> Packet
+    """Build a User Information item.
+
+    ``user_identity`` (a ``DICOMUserIdentity`` packet or a dict, see
+    :func:`build_user_identity`) adds a Type 0x58 User Identity Negotiation
+    sub-item to the A-ASSOCIATE-RQ."""
     sub_items = [
         DICOMVariableItem() / DICOMMaximumLength(max_pdu_length=max_pdu_length)
     ]
@@ -2519,6 +2622,11 @@ def build_user_information(max_pdu_length=16384, implementation_class_uid=None, 
             ver_bytes = implementation_version.encode('ascii')
         sub_items.append(
             DICOMVariableItem() / DICOMImplementationVersionName(name=ver_bytes)
+        )
+
+    if user_identity is not None:
+        sub_items.append(
+            DICOMVariableItem() / build_user_identity(user_identity)
         )
 
     return DICOMVariableItem() / DICOMUserInformation(sub_items=sub_items)
@@ -2541,6 +2649,12 @@ class DICOMSocket:
         self._proposed_max_pdu = 16384
         self.max_pdu_length = 16384
         self._proposed_context_map = {}  # type: Dict[int, str]
+        # Populated from the A-ASSOCIATE-AC so callers (fingerprinting, AE
+        # brute, credential brute) can read the *payload* of what came back,
+        # not just accept/reject.
+        self.peer_info = {}  # type: Dict[str, str]
+        self.user_identity_response = None  # type: Optional[bytes]
+        self.last_reject = None  # type: Optional[Dict[str, int]]
 
     def __enter__(self):
         # type: () -> DICOMSocket
@@ -2597,8 +2711,18 @@ class DICOMSocket:
         # type: (bytes) -> None
         self.sock.sendall(raw_bytes)
 
-    def associate(self, requested_contexts=None):
-        # type: (Optional[Dict[str, List[str]]]) -> bool
+    def associate(self, requested_contexts=None, user_identity=None):
+        # type: (Optional[Dict[str, List[str]]], Optional[Any]) -> bool
+        """Open an association.
+
+        ``user_identity`` (a ``DICOMUserIdentity`` packet or a dict, see
+        :func:`build_user_identity`) sends a Type 0x58 User Identity
+        Negotiation sub-item. On a successful AC the AC payload is parsed into
+        :attr:`peer_info` (application-context UID, implementation class UID,
+        implementation version name) and any Type 0x59 server response into
+        :attr:`user_identity_response`; on rejection the result/source/reason
+        are stored in :attr:`last_reject`.
+        """
         if not self.stream and not self.connect():
             return False
 
@@ -2608,6 +2732,9 @@ class DICOMSocket:
             }
 
         self._proposed_context_map = {}
+        self.peer_info = {}
+        self.user_identity_response = None
+        self.last_reject = None
 
         variable_items = [
             DICOMVariableItem() / DICOMApplicationContext()
@@ -2620,7 +2747,10 @@ class DICOMSocket:
             variable_items.append(pctx)
             ctx_id += 2
 
-        user_info = build_user_information(max_pdu_length=self._proposed_max_pdu)
+        user_info = build_user_information(
+            max_pdu_length=self._proposed_max_pdu,
+            user_identity=user_identity,
+        )
         variable_items.append(user_info)
 
         assoc_rq = DICOM() / A_ASSOCIATE_RQ(
@@ -2629,25 +2759,80 @@ class DICOMSocket:
             variable_items=variable_items,
         )
 
-        response = self.sr1(assoc_rq)
+        # Use send + recv rather than sr1: the association response is not a
+        # DIMSE message and scapy's sr1 answer-matching does not pair the AC/RJ
+        # PDU with the RQ, so it would drop the reply.
+        self.send(assoc_rq)
+        response = self.recv()
 
         if response:
             if response.haslayer(A_ASSOCIATE_AC):
                 self.assoc_established = True
                 self._parse_accepted_contexts(response)
                 self._parse_max_pdu_length(response)
+                self._parse_peer_info(response)
+                self._parse_user_identity_response(response)
                 return True
             elif response.haslayer(A_ASSOCIATE_RJ):
+                rj = response[A_ASSOCIATE_RJ]
+                self.last_reject = {
+                    "result": rj.result,
+                    "source": rj.source,
+                    "reason": rj.reason_diag,
+                }
                 log.error(
                     "Association rejected: result=%d, source=%d, reason=%d",
-                    response[A_ASSOCIATE_RJ].result,
-                    response[A_ASSOCIATE_RJ].source,
-                    response[A_ASSOCIATE_RJ].reason_diag,
+                    rj.result, rj.source, rj.reason_diag,
                 )
                 return False
 
         log.error("Association failed: no valid response received")
         return False
+
+    def _parse_peer_info(self, response):
+        # type: (Packet) -> None
+        """Read the AC payload — App Context UID + 0x52/0x55 sub-items — so an
+        AE/recon workflow can report *what* a peer returned, not just that it
+        accepted."""
+        def _txt(v):
+            if isinstance(v, bytes):
+                return v.rstrip(b"\x00").decode("ascii", errors="replace").strip()
+            return str(v).strip()
+        try:
+            ac = response[A_ASSOCIATE_AC]
+            for item in ac.variable_items:
+                if item.item_type == 0x10 and item.haslayer(DICOMApplicationContext):
+                    self.peer_info["application_context_uid"] = _txt(
+                        item[DICOMApplicationContext].uid)
+                elif item.item_type == 0x50 and item.haslayer(DICOMUserInformation):
+                    for sub in item[DICOMUserInformation].sub_items:
+                        if sub.item_type == 0x52 and sub.haslayer(DICOMImplementationClassUID):
+                            self.peer_info["implementation_class_uid"] = _txt(
+                                sub[DICOMImplementationClassUID].uid)
+                        elif sub.item_type == 0x55 and sub.haslayer(DICOMImplementationVersionName):
+                            # NB: the field is named "name", which collides with
+                            # scapy's Packet.name; read it via getfieldval.
+                            self.peer_info["implementation_version_name"] = _txt(
+                                sub[DICOMImplementationVersionName].getfieldval("name"))
+        except (KeyError, IndexError, AttributeError):
+            pass
+
+    def _parse_user_identity_response(self, response):
+        # type: (Packet) -> None
+        """Capture the Type 0x59 User Identity server-response payload, which is
+        only populated when identity negotiation succeeds (PS3.7 D.3.3.7)."""
+        try:
+            ac = response[A_ASSOCIATE_AC]
+            for item in ac.variable_items:
+                if item.item_type != 0x50 or not item.haslayer(DICOMUserInformation):
+                    continue
+                for sub in item[DICOMUserInformation].sub_items:
+                    if sub.item_type == 0x59 and sub.haslayer(DICOMUserIdentityResponse):
+                        self.user_identity_response = bytes(
+                            sub[DICOMUserIdentityResponse].server_response)
+                        return
+        except (KeyError, IndexError, AttributeError):
+            pass
 
     def _parse_max_pdu_length(self, response):
         # type: (Packet) -> None
@@ -2815,13 +3000,323 @@ class DICOMSocket:
                 return parse_dimse_status(pdv_rsp.data)
         return None
 
+    # ------------------------------------------------------------------
+    # Query / retrieve flows (C-FIND / C-MOVE / C-GET).
+    #
+    # These build on the same association + P-DATA plumbing as c_store; they
+    # add the request/response *stream* handling (Pending -> Success) and
+    # dataset (de)serialisation that turns the existing packet classes into
+    # usable operations.
+    # ------------------------------------------------------------------
+
+    def _ctx_is_implicit_vr(self, ctx_id):
+        # type: (int) -> bool
+        ts = self.accepted_contexts.get(ctx_id, (None, None))[1]
+        # Implicit VR LE is the default; treat an unknown/empty TS as implicit.
+        return ts in (None, "", IMPLICIT_VR_LITTLE_ENDIAN_UID)
+
+    @staticmethod
+    def _encode_query(query_ds, implicit_vr):
+        # type: (Any, bool) -> bytes
+        """Encode a query identifier dataset to bytes in the negotiated syntax.
+
+        Accepts a c_scare ``Dataset`` (preferred — supports private tags and
+        empty return keys), a pydicom ``Dataset``, or raw ``bytes``."""
+        if isinstance(query_ds, (bytes, bytearray)):
+            return bytes(query_ds)
+        # c_scare Dataset
+        if hasattr(query_ds, "encode"):
+            try:
+                return query_ds.encode(implicit_vr=implicit_vr, little_endian=True)
+            except TypeError:
+                pass
+        # pydicom Dataset fallback
+        try:
+            from io import BytesIO
+            from pydicom.filewriter import write_dataset
+            from pydicom.filebase import DicomBytesIO
+            buf = DicomBytesIO()
+            buf.is_implicit_VR = implicit_vr
+            buf.is_little_endian = True
+            write_dataset(buf, query_ds)
+            return buf.getvalue()
+        except Exception:
+            return b""
+
+    @staticmethod
+    def _decode_identifier(data_bytes, implicit_vr):
+        # type: (Optional[bytes], bool) -> Any
+        """Decode a returned identifier dataset to a pydicom Dataset (so the
+        operator can read return keys, incl. private tags). Falls back to raw
+        bytes if pydicom can't parse it."""
+        if not data_bytes:
+            return None
+        try:
+            from io import BytesIO
+            from pydicom.filereader import read_dataset
+            return read_dataset(
+                BytesIO(data_bytes),
+                is_implicit_VR=implicit_vr,
+                is_little_endian=True,
+            )
+        except Exception:
+            return data_bytes
+
+    def _send_command_and_data(self, ctx_id, command_bytes, dataset_bytes=None):
+        # type: (int, bytes, Optional[bytes]) -> None
+        """Send a DIMSE command PDV followed by its (chunked) data PDVs."""
+        cmd_pdv = PresentationDataValueItem(
+            context_id=ctx_id, data=command_bytes, is_command=1, is_last=1,
+        )
+        self.send(DICOM() / P_DATA_TF(pdv_items=[cmd_pdv]))
+
+        if not dataset_bytes:
+            return
+
+        max_pdv_data = self.max_pdu_length - 12
+        offset = 0
+        total = len(dataset_bytes)
+        while offset < total:
+            chunk = dataset_bytes[offset:offset + max_pdv_data]
+            is_last = 1 if (offset + len(chunk) >= total) else 0
+            data_pdv = PresentationDataValueItem(
+                context_id=ctx_id, data=chunk, is_command=0, is_last=is_last,
+            )
+            self.send(DICOM() / P_DATA_TF(pdv_items=[data_pdv]))
+            offset += len(chunk)
+
+    def _recv_dimse(self):
+        # type: () -> Tuple[Optional[int], Optional[bytes], Optional[bytes]]
+        """Receive and reassemble one DIMSE message.
+
+        Returns ``(context_id, command_bytes, dataset_bytes)``. ``dataset_bytes``
+        is ``None`` when the command's Data Set Type is 0x0101 (no dataset).
+        Returns ``(None, None, None)`` on timeout/abort/release."""
+        cmd = b""
+        data = b""
+        ctx_id = None
+        cmd_done = False
+        data_done = False
+        expect_data = None  # type: Optional[bool]
+
+        while True:
+            pdu = self.recv()
+            if pdu is None:
+                return (ctx_id, cmd or None, data or None)
+            if pdu.haslayer(A_ABORT) or pdu.haslayer(A_RELEASE_RQ) or pdu.haslayer(A_RELEASE_RP):
+                return (ctx_id, cmd or None, data or None)
+            if not pdu.haslayer(P_DATA_TF):
+                continue
+
+            for pdv in pdu[P_DATA_TF].pdv_items:
+                if ctx_id is None:
+                    ctx_id = pdv.context_id
+                if pdv.is_command:
+                    cmd += bytes(pdv.data)
+                    if pdv.is_last:
+                        cmd_done = True
+                else:
+                    data += bytes(pdv.data)
+                    if pdv.is_last:
+                        data_done = True
+
+            if cmd_done and expect_data is None:
+                dst = parse_dimse_command_us(cmd, 0x0000, 0x0800)
+                expect_data = dst is not None and dst != 0x0101
+
+            if cmd_done and expect_data is False:
+                return (ctx_id, cmd or None, None)
+            if cmd_done and expect_data and data_done:
+                return (ctx_id, cmd or None, data or None)
+
+    def c_find(self, query_ds, sop_class_uid=PATIENT_ROOT_QR_FIND_SOP_CLASS_UID,
+               priority=0x0002):
+        # type: (Any, str, int) -> List[Tuple[Optional[int], Any]]
+        """Issue a C-FIND and collect the Pending->Success response stream.
+
+        Returns a list of ``(status, identifier)`` pairs — one per Pending
+        C-FIND-RSP (with its decoded identifier dataset) plus a final terminal
+        status (Success/failure, identifier ``None``). The caller controls the
+        return-key set via ``query_ds``: include a key with an empty value to
+        request it back, omit it to leave it out."""
+        if not self.assoc_established:
+            log.error("Association not established")
+            return []
+        ctx_id = self._find_accepted_context_id(sop_class_uid)
+        if ctx_id is None:
+            log.error("No accepted context for SOP %s", sop_class_uid)
+            return []
+
+        implicit = self._ctx_is_implicit_vr(ctx_id)
+        q_bytes = self._encode_query(query_ds, implicit)
+        msg_id = self._get_next_message_id()
+        cmd = bytes(C_FIND_RQ(
+            affected_sop_class_uid=sop_class_uid,
+            message_id=msg_id,
+            priority=priority,
+            data_set_type=0x0001,  # != 0x0101 -> a dataset follows
+        ))
+        self._send_command_and_data(ctx_id, cmd, q_bytes)
+
+        results = []  # type: List[Tuple[Optional[int], Any]]
+        while True:
+            _cid, rcmd, rdata = self._recv_dimse()
+            if rcmd is None:
+                break
+            status = parse_dimse_status(rcmd)
+            if status in (STATUS_PENDING, STATUS_PENDING_WARNINGS):
+                results.append((status, self._decode_identifier(rdata, implicit)))
+                continue
+            results.append((status, self._decode_identifier(rdata, implicit)))
+            break
+        return results
+
+    def c_move(self, query_ds, move_destination,
+               sop_class_uid=PATIENT_ROOT_QR_MOVE_SOP_CLASS_UID, priority=0x0002):
+        # type: (Any, str, str, int) -> Dict[str, Any]
+        """Issue a C-MOVE that redirects matched objects to ``move_destination``
+        (a third AE). Returns the final status and sub-operation counts. The
+        objects are delivered to the destination AE, *not* on this channel —
+        that is the SSRF-adjacent primitive; retrieve them out-of-band."""
+        if not self.assoc_established:
+            log.error("Association not established")
+            return {"status": None, "responses": []}
+        ctx_id = self._find_accepted_context_id(sop_class_uid)
+        if ctx_id is None:
+            log.error("No accepted context for SOP %s", sop_class_uid)
+            return {"status": None, "responses": []}
+
+        implicit = self._ctx_is_implicit_vr(ctx_id)
+        q_bytes = self._encode_query(query_ds, implicit)
+        msg_id = self._get_next_message_id()
+        dest = move_destination
+        if isinstance(dest, str):
+            dest = dest.encode("ascii", errors="replace")
+        dest = dest[:16].ljust(16, b" ")
+        cmd = bytes(C_MOVE_RQ(
+            affected_sop_class_uid=sop_class_uid,
+            message_id=msg_id,
+            move_destination=dest,
+            priority=priority,
+            data_set_type=0x0001,
+        ))
+        self._send_command_and_data(ctx_id, cmd, q_bytes)
+
+        responses = []  # type: List[Dict[str, Any]]
+        final_status = None
+        while True:
+            _cid, rcmd, _rdata = self._recv_dimse()
+            if rcmd is None:
+                break
+            status = parse_dimse_status(rcmd)
+            counts = {
+                "remaining": parse_dimse_command_us(rcmd, 0x0000, 0x1020),
+                "completed": parse_dimse_command_us(rcmd, 0x0000, 0x1021),
+                "failed": parse_dimse_command_us(rcmd, 0x0000, 0x1022),
+                "warning": parse_dimse_command_us(rcmd, 0x0000, 0x1023),
+            }
+            responses.append({"status": status, **counts})
+            if status not in (STATUS_PENDING, STATUS_PENDING_WARNINGS):
+                final_status = status
+                break
+        last = responses[-1] if responses else {}
+        return {
+            "status": final_status,
+            "completed": last.get("completed"),
+            "failed": last.get("failed"),
+            "warning": last.get("warning"),
+            "responses": responses,
+        }
+
+    def c_get(self, query_ds, sop_class_uid=PATIENT_ROOT_QR_GET_SOP_CLASS_UID,
+              priority=0x0002):
+        # type: (Any, str, int) -> Dict[str, Any]
+        """Issue a C-GET and collect the objects the SCP pushes back as C-STORE
+        sub-operations on *this* association.
+
+        Experimental: the caller must have associated with both the QR-GET SOP
+        class and presentation context(s) for the storage SOP class(es) of the
+        expected objects (some SCPs also require SCP/SCU role negotiation).
+        Returns the final status, sub-op counts, and a list of decoded objects
+        (pydicom Datasets) — parse both metadata *and* pixels from these."""
+        if not self.assoc_established:
+            log.error("Association not established")
+            return {"status": None, "objects": []}
+        ctx_id = self._find_accepted_context_id(sop_class_uid)
+        if ctx_id is None:
+            log.error("No accepted context for SOP %s", sop_class_uid)
+            return {"status": None, "objects": []}
+
+        implicit = self._ctx_is_implicit_vr(ctx_id)
+        q_bytes = self._encode_query(query_ds, implicit)
+        msg_id = self._get_next_message_id()
+        cmd = bytes(C_GET_RQ(
+            affected_sop_class_uid=sop_class_uid,
+            message_id=msg_id,
+            priority=priority,
+            data_set_type=0x0001,
+        ))
+        self._send_command_and_data(ctx_id, cmd, q_bytes)
+
+        objects = []  # type: List[Any]
+        final_status = None
+        while True:
+            cid, rcmd, rdata = self._recv_dimse()
+            if rcmd is None:
+                break
+            command_field = parse_dimse_command_field(rcmd)
+            if command_field == 0x0001:
+                # Inbound C-STORE-RQ sub-operation: collect the object and ack.
+                store_implicit = self._ctx_is_implicit_vr(cid) if cid else implicit
+                objects.append(self._decode_identifier(rdata, store_implicit))
+                self._send_cstore_rsp(cid, rcmd)
+                continue
+            # C-GET-RSP
+            status = parse_dimse_status(rcmd)
+            if status not in (STATUS_PENDING, STATUS_PENDING_WARNINGS):
+                final_status = status
+                break
+        return {
+            "status": final_status,
+            "objects": objects,
+            "num_objects": len(objects),
+        }
+
+    def _send_cstore_rsp(self, ctx_id, store_rq_cmd):
+        # type: (Optional[int], bytes) -> None
+        """Acknowledge an inbound C-STORE sub-operation with a Success status."""
+        if ctx_id is None:
+            return
+        sop_class = None
+        sop_inst = None
+        try:
+            from io import BytesIO
+            from pydicom.filereader import read_dataset
+            cmd_ds = read_dataset(BytesIO(store_rq_cmd), is_implicit_VR=True,
+                                  is_little_endian=True)
+            sop_class = getattr(cmd_ds, "AffectedSOPClassUID", None)
+            sop_inst = getattr(cmd_ds, "AffectedSOPInstanceUID", None)
+            msg_id = int(getattr(cmd_ds, "MessageID", 1))
+        except Exception:
+            msg_id = 1
+        rsp = C_STORE_RSP(message_id_responded=msg_id, status=STATUS_SUCCESS)
+        if sop_class:
+            rsp.affected_sop_class_uid = str(sop_class)
+        if sop_inst:
+            rsp.affected_sop_instance_uid = str(sop_inst)
+        cmd_pdv = PresentationDataValueItem(
+            context_id=ctx_id, data=bytes(rsp), is_command=1, is_last=1,
+        )
+        self.send(DICOM() / P_DATA_TF(pdv_items=[cmd_pdv]))
+
     def release(self):
         # type: () -> bool
         if not self.assoc_established:
             return True
 
         release_rq = DICOM() / A_RELEASE_RQ()
-        response = self.sr1(release_rq)
+        self.send(release_rq)
+        response = self.recv()
         self.close()
 
         if response:
