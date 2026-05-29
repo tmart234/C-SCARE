@@ -80,6 +80,89 @@ def _get_process(args):
     return getattr(args, '_managed_process', None)
 
 
+# Categories whose payloads are DICOM datasets (not whole PDUs): to exercise
+# the target's import/parse path they must ride inside a valid C-STORE
+# association, not be dropped raw on the listening port.
+DATASET_CATEGORIES = frozenset({
+    'parser', 'memory', 'path_traversal', 'command_injection',
+})
+
+# Fallback storage SOP class for C-STORE delivery when an attack does not name
+# one. Secondary Capture accepts arbitrary datasets and is what the
+# path-traversal payloads already target. Hard-coded so this module imports
+# without scapy; delivery itself (send_cstore) requires scapy at call time.
+_DEFAULT_STORE_SOP = "1.2.840.10008.5.1.4.1.1.7"  # Secondary Capture Image Storage
+
+
+def _delivery_kind(args, result: AttackResult) -> str:
+    """Decide how to put ``result.payload`` on the wire: 'sequence' (multi-PDU
+    state-machine attack), 'cstore' (dataset wrapped in a C-STORE association),
+    or 'pdu' (single raw PDU). Honors ``--delivery``; 'auto' routes by the
+    catalog's own metadata convention (``steps`` / ``sop_class_uid``) and the
+    dataset categories."""
+    has_steps = bool(result.metadata.get('steps'))
+    has_sop = bool(result.metadata.get('sop_class_uid'))
+    mode = getattr(args, 'delivery', 'auto')
+    if mode == 'pdu':
+        return 'sequence' if has_steps else 'pdu'
+    if mode == 'cstore':
+        # Force C-STORE for anything dataset-shaped; multi-PDU sequences can't
+        # be C-STORE-wrapped, so they stay sequences.
+        if has_steps:
+            return 'sequence'
+        return 'cstore'
+    # auto
+    if has_steps:
+        return 'sequence'
+    if has_sop or result.category in DATASET_CATEGORIES:
+        return 'cstore'
+    return 'pdu'
+
+
+def _deliver(args, result: AttackResult, target, timeout: float):
+    """Deliver one (optionally mutated) payload by the chosen method. Returns
+    ``(response, error)`` where response is bytes/None and error is a short
+    ProtocolMonitor signal ('timeout'/'refused'/...) or None."""
+    payload = result.payload
+    mutate_modes = getattr(args, 'mutate', None)
+    if mutate_modes:
+        try:
+            from .hostile import mutate_payload
+            payload = mutate_payload(payload, str(mutate_modes).split(','),
+                                     seed=len(result.name))
+            result.metadata['mutation'] = mutate_modes
+        except Exception as e:  # mutation must never abort a delivery
+            result.metadata['mutation_error'] = str(e)
+
+    kind = _delivery_kind(args, result)
+    result.metadata['delivery'] = kind
+    try:
+        if kind == 'sequence':
+            steps = list(result.metadata.get('steps') or [payload])
+            responses = deliver.send_sequence(target, steps, timeout=timeout)
+            last = responses[-1] if responses else None
+            return last, ('timeout' if last is None else None)
+        if kind == 'cstore':
+            sop_class = result.metadata.get('sop_class_uid') \
+                or getattr(args, 'store_sop', None) or _DEFAULT_STORE_SOP
+            sop_inst = result.metadata.get('sop_instance_uid', '1.2.3.4.5')
+            status = deliver.send_cstore(
+                target, payload, sop_class, sop_inst,
+                transfer_syntax=result.metadata.get('transfer_syntax'),
+                timeout=timeout)
+            result.metadata['cstore_status'] = status
+            # A None status means association/C-STORE failed (no parse reached
+            # OR the server died); surface it to ProtocolMonitor as a timeout.
+            if status is None:
+                return None, 'timeout'
+            return bytes([(status >> 8) & 0xFF, status & 0xFF]), None
+        return deliver.send_pdu(target, payload, timeout=timeout), None
+    except ConnectionRefusedError:
+        return None, 'refused'
+    except ConnectionResetError:
+        return None, 'reset'
+
+
 def _run_monitored_test(args, result: AttackResult, target, timeout: float):
     """Send a payload and check all monitors for findings."""
     monitors = _get_monitors(args)
@@ -89,12 +172,8 @@ def _run_monitored_test(args, result: AttackResult, target, timeout: float):
     for i, monitor in enumerate(monitors):
         monitor.pre_test(i)
 
-    response = deliver.send_pdu(target, result.payload, timeout=timeout)
+    response, error = _deliver(args, result, target, timeout)
     result.response = response
-
-    error = None
-    if response is None:
-        error = 'timeout'
 
     for monitor in monitors:
         if isinstance(monitor, ProtocolMonitor):
@@ -150,6 +229,9 @@ def write_sarif(results: list, filepath: str):
         }
         if r.cve:
             result_obj["properties"]["cve"] = r.cve
+        for key in ("delivery", "mutation"):
+            if r.metadata.get(key) is not None:
+                result_obj["properties"][key] = r.metadata[key]
         detections = [rpt for rpt in r.monitor_reports if rpt.detected]
         if detections:
             result_obj["properties"]["monitors"] = [
@@ -818,6 +900,34 @@ def _cmd_corpus(argv: List[str]) -> int:
     return run_generate_corpus(argparse.Namespace(output=a.out))
 
 
+def _run_hostile_cget(a) -> int:
+    """Run a WorkflowResponder that accepts associations and answers a C-GET
+    with a malicious C-STORE sub-operation (hostile C-GET responder)."""
+    try:
+        from .responders import WorkflowResponder
+    except Exception as e:  # pragma: no cover - scapy is a hard dependency
+        print(f"ERROR: hostile C-GET responder requires scapy: {e}")
+        return 1
+
+    responder = WorkflowResponder(host=a.host, port=a.port, ae_title=a.ae_title,
+                                  echo_roles=True)
+
+    @responder.on_c_get
+    def _get(resp, conn, ctx_id, cmd, data):
+        print(f"[rogue] C-GET -> pushing hostile C-STORE sub-op ({a.cget})")
+        resp.serve_cget_hostile(conn, ctx_id, cmd, mode=a.cget)
+        return None
+
+    print(f"[rogue] hostile C-GET responder ({a.cget}) on {a.host}:{a.port}"
+          f"  (Ctrl-C to stop)")
+    try:
+        responder.start(blocking=True)
+    except KeyboardInterrupt:
+        print("\n[rogue] stopping")
+        responder.stop()
+    return 0
+
+
 def _cmd_rogue(argv: List[str]) -> int:
     """`rogue` subcommand: SCU/client fuzzing via a rogue DICOM SCP."""
     p = argparse.ArgumentParser(
@@ -827,10 +937,23 @@ def _cmd_rogue(argv: List[str]) -> int:
     p.add_argument('--host', default='0.0.0.0')
     p.add_argument('--port', type=int, default=11112)
     p.add_argument('--ae-title', dest='ae_title', default='C_SCARE')
-    p.add_argument('--mode', choices=['malformed-ac', 'reject', 'abort'],
+    from .hostile import ROGUE_MALFORMATION_MODES, rogue_response
+    p.add_argument('--mode',
+                   choices=['malformed-ac', 'reject', 'abort']
+                   + list(ROGUE_MALFORMATION_MODES),
                    default='malformed-ac',
-                   help='response sent on A-ASSOCIATE-RQ (default: malformed-ac)')
+                   help='response sent on A-ASSOCIATE-RQ (default: malformed-ac). '
+                        'Beyond malformed-ac/reject/abort: '
+                        + ', '.join(ROGUE_MALFORMATION_MODES))
+    p.add_argument('--cget', choices=['oversized', 'path-traversal', 'malformed'],
+                   default=None,
+                   help='accept the association and, on a C-GET, push a '
+                        'malicious C-STORE sub-operation of this kind at the '
+                        'SCU client (hostile C-GET responder).')
     a = p.parse_args(argv)
+
+    if a.cget:
+        return _run_hostile_cget(a)
 
     from .server import RawSCP
     try:
@@ -845,6 +968,8 @@ def _cmd_rogue(argv: List[str]) -> int:
             return raw(DICOM() / A_ASSOCIATE_RJ())
         if a.mode == 'abort':
             return raw(DICOM() / A_ABORT())
+        if a.mode in ROGUE_MALFORMATION_MODES:
+            return rogue_response(a.mode)
         return raw(DICOM() / A_ASSOCIATE_AC(protocol_version=0xFFFF))
 
     scp = RawSCP(host=a.host, port=a.port, ae_title=a.ae_title)
@@ -939,8 +1064,21 @@ def _cmd_workflow(argv: List[str]) -> int:
         if verb == 'move':
             q.add_argument('--dest-ae', dest='dest_ae', required=True,
                            help='C-MOVE destination AE (the pivot target)')
+        if verb == 'get':
+            q.add_argument('--strict', action='store_true',
+                           help='strict-peer mode: propose the storage SCP role '
+                                '(0x54) and abort the C-GET if the peer does not '
+                                'grant it, instead of accepting objects anyway')
+            q.add_argument('--storage-sop', dest='storage_sops', action='append',
+                           default=[], metavar='UID',
+                           help='storage SOP class UID to propose scp_role=1 for '
+                                '(repeatable; default: CT + Secondary Capture)')
+            q.add_argument('--sarif', metavar='FILE',
+                           help='write a SARIF v2.1.0 report of role-negotiation '
+                                'findings')
 
     a = p.parse_args(argv)
+    a.result_collector = []
 
     if a.wfcmd == 'respond':
         from .responders import WorkflowResponder
@@ -1043,12 +1181,51 @@ def _cmd_workflow(argv: List[str]) -> int:
                   "retrieve them out-of-band)")
             return 0
         if a.wfcmd == 'get':
-            if not sock.associate({get_uid: [DEFAULT_TRANSFER_SYNTAX_UID]}):
+            contexts = {get_uid: [DEFAULT_TRANSFER_SYNTAX_UID]}
+            roles = None
+            storage_sops = a.storage_sops or [
+                "1.2.840.10008.5.1.4.1.1.2",    # CT Image Storage
+                "1.2.840.10008.5.1.4.1.1.7",    # Secondary Capture Image Storage
+            ]
+            if a.strict:
+                # Propose a storage context AND scp_role=1 for each storage SOP
+                # class, so the SCU can receive (and the peer can grant) the
+                # Storage SCP role the C-GET sub-operations need.
+                roles = {}
+                for s in storage_sops:
+                    contexts[s] = [DEFAULT_TRANSFER_SYNTAX_UID]
+                    roles[s] = (0, 1)
+            if not sock.associate(contexts, roles=roles):
                 print("ERROR: association failed")
                 return 1
-            out = sock.c_get(query, sop_class_uid=get_uid)
-            print(f"[+] C-GET: status=0x{(out['status'] or 0):04X} "
-                  f"objects={out['num_objects']}")
+            out = sock.c_get(query, sop_class_uid=get_uid,
+                             strict_role=bool(a.strict))
+            if out.get('aborted'):
+                print(f"[!] C-GET aborted: {out.get('reason')} "
+                      f"(negotiated roles: {out.get('negotiated_roles')})")
+                for s in storage_sops:
+                    if out.get('negotiated_roles', {}).get(s, (0, 0))[1] != 1:
+                        rn = wf.RoleNegotiationResult(
+                            sop_class_uid=s, requested_scp_role=1,
+                            granted_scp_role=out.get(
+                                'negotiated_roles', {}).get(s, (0, 0))[1],
+                            aborted=True,
+                            negotiated_roles=out.get('negotiated_roles', {}))
+                        a.result_collector.append(rn.to_attack_result())
+            else:
+                print(f"[+] C-GET: status=0x{(out['status'] or 0):04X} "
+                      f"objects={out['num_objects']}")
+                if a.strict:
+                    for s in storage_sops:
+                        granted = out.get('negotiated_roles', {}).get(s, (0, 0))[1]
+                        rn = wf.RoleNegotiationResult(
+                            sop_class_uid=s, requested_scp_role=1,
+                            granted_scp_role=granted, aborted=False,
+                            negotiated_roles=out.get('negotiated_roles', {}))
+                        a.result_collector.append(rn.to_attack_result())
+            if a.sarif and a.result_collector:
+                write_sarif(a.result_collector, a.sarif)
+                print(f"[+] SARIF report written to: {a.sarif}")
             return 0
     return 0
 
@@ -1224,6 +1401,40 @@ def main(argv: Optional[List[str]] = None):
         '--sarif',
         metavar='FILE',
         help='Write SARIF v2.1.0 report to file'
+    )
+
+    parser.add_argument(
+        '--delivery',
+        choices=['auto', 'pdu', 'cstore'],
+        default='auto',
+        help='How to deliver a payload to the target (default: auto). '
+             '"pdu" sends raw bytes straight to the listening port — a '
+             'PDU-level attack that never reaches the dataset parser. '
+             '"cstore" wraps the payload in a valid C-STORE association so '
+             'dataset attacks (parser/memory/path_traversal) reach the SCP '
+             'import/parse pass. "auto" routes by attack: payloads carrying a '
+             'C-STORE SOP class (or in a dataset category) go via C-STORE, '
+             'multi-step state-machine attacks go as a PDU sequence, and the '
+             'rest go as a single raw PDU.'
+    )
+
+    parser.add_argument(
+        '--store-sop',
+        dest='store_sop',
+        metavar='UID',
+        default=None,
+        help='Storage SOP Class UID to associate with for C-STORE delivery '
+             'when an attack does not specify one (default: Secondary Capture).'
+    )
+
+    parser.add_argument(
+        '--mutate',
+        metavar='MODE[,MODE...]',
+        default=None,
+        help='Mutate each payload on the wire before delivery. Comma-separated '
+             'modes: bitflip (raw byte flip), vr (corrupt an element VR), '
+             'length (lie about an element length). Records the mutation under '
+             'the SARIF result\'s properties.mutation.'
     )
 
     parser.add_argument(
