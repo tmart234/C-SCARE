@@ -56,4 +56,4 @@ the client parses.
 
 - [Black-box DAST](dast.md) — the attack catalog these workflows set up state for.
 - [Grey-box fuzzing](fuzzing.md) — coverage-guided fuzzing of the same targets.
-- [PROTOCOL.md](../PROTOCOL.md) — byte-level DICOM structure (state machine, DIMSE).
+- [protocol.md](protocol.md) — byte-level DICOM structure (state machine, DIMSE).

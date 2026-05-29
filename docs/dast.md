@@ -128,4 +128,4 @@ scp.start()
   state (discovered AE title, valid credential) a DAST run should start from.
 - [Grey-box fuzzing](fuzzing.md) — feed the same catalog to AFL++/AFLNet as a
   seed corpus.
-- [PROTOCOL.md](../PROTOCOL.md) — byte-level DICOM structure.
+- [protocol.md](protocol.md) — byte-level DICOM structure.

@@ -6,7 +6,7 @@ C-SCARE surgically crafts malformed DICOM files, datasets, and network traffic t
 
 ## Capabilities at a glance
 
-Three pillars, each documented in its own guide. The matrix below quantifies what ships today and where each capability lives.
+C-SCARE is organised around *who* you test — a DICOM server (SCP) or a client (SCU) — and *how* you test it: three pillars, each documented in its own guide. The matrix below quantifies what ships today, which role each pillar targets (see **Targets**), and where each capability lives.
 
 |                       | **Pentest workflows** | **DAST** (black-box) | **Fuzzing** (grey-box) |
 |-----------------------|-----------------------|----------------------|------------------------|
@@ -18,15 +18,6 @@ Three pillars, each documented in its own guide. The matrix below quantifies wha
 | **CLI**               | `c-scare wf …` | `c-scare --ip … --category …` / `c-scare rogue …` | `c-scare greybox run / triage …` |
 | **Output**            | Classified findings | SARIF v2.1.0 | SARIF v2.1.0 |
 | **Guide**             | [docs/workflows.md](docs/workflows.md) | [docs/dast.md](docs/dast.md) | [docs/fuzzing.md](docs/fuzzing.md) |
-
-### Role × method matrix
-
-C-SCARE is organised around *who* you test (a DICOM server / SCP, or a client / SCU) and *how* (black-box DAST, or grey-box fuzzing):
-
-|                  | **Black-box — DAST**                                                                 | **Grey-box — fuzzing**                                                              |
-|------------------|--------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------|
-| **SCP** (server) | Deliver the attack catalog live at a server, watch for protocol/health anomalies — `c-scare --ip … --category …` | Seed AFL++/AFLNet, fuzz instrumented DCMTK binaries, triage crashes — `c-scare greybox …` |
-| **SCU** (client) | `RawSCP` rogue server feeds malformed responses to a connecting client — `c-scare rogue …` | Instrument a DICOM client (DCMTK `storescu`) and AFL-fuzz the server-response stream via a desock shim — `c-scare greybox run scu` (experimental) |
 
 ## What C-SCARE is — and is not
 
@@ -142,7 +133,7 @@ c-scare greybox run file
 | [docs/dast.md](docs/dast.md) | Black-box DAST — attack catalog (8 categories / 68 payloads / 13 CVEs), corruptor & scapy crafting, live delivery, rogue server |
 | [docs/workflows.md](docs/workflows.md) | Pentest workflows — W1–W5 issuer drivers, SCP-side responders |
 | [docs/fuzzing.md](docs/fuzzing.md) | Grey-box fuzzing — DCMTK toolchain, targets, device parity, SAND mode, coverage, campaigns |
-| [PROTOCOL.md](PROTOCOL.md) | Byte-level DICOM structure (file format, data elements, PDUs, DIMSE, state machine) |
+| [docs/protocol.md](docs/protocol.md) | Byte-level DICOM structure (file format, data elements, PDUs, DIMSE, state machine) |
 
 ## License
 
