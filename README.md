@@ -31,7 +31,7 @@ flowchart TD
         CORRUPTOR[corruptor.py]
         PIXEL[pixel.py]
         FILE[file.py]
-        SCAPY[scapy_dicom.py]
+        SCAPY[scapy_dicom.py - PDUs/DIMSE + DICOMSocket]
     end
 
     CATALOG[attacks.py - static attack catalog + seed generators]
@@ -41,24 +41,35 @@ flowchart TD
         SERVER[server.py - RawSCP]
     end
 
+    subgraph WORKFLOWS [Attack workflows - role-agnostic]
+        ISSUER[workflows.py - issuer: ae_brute / cred_brute / c_find / c_get / c_move - targets an SCP]
+        RESPONDER[responders.py - WorkflowResponder - targets an SCU]
+    end
+
     subgraph GREYBOX [Grey-box]
         AFL[AFL++ / AFLNet engines]
         GB[greybox.py - harness + crash triage]
     end
 
-    MONITOR[monitor.py + SARIF report]
+    MONITOR[monitor.py - sanitizer / process / protocol]
+    SARIF[SARIF v2.1.0 report]
 
     USER --> CATALOG
     USER --> SERVER
+    USER --> WORKFLOWS
     USER --> GB
     CATALOG --> CRAFT
     CRAFT --> CATALOG
     CATALOG -->|live delivery| DELIVER
     CATALOG -->|seed corpus| AFL
+    ISSUER -->|acts as SCU| SCAPY
+    RESPONDER -->|acts as SCP| SERVER
     DELIVER --> MONITOR
     AFL --> GB
     GB --> MONITOR
     SERVER --> MONITOR
+    MONITOR --> SARIF
+    WORKFLOWS -->|findings| SARIF
 ```
 
 ## Quick Start
