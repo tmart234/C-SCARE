@@ -16,10 +16,15 @@ side (SCP→SCU), and C-SCARE already defines both packets for every verb
 **one module exposing two drivers**, sharing the same packet builders and
 malformation hooks:
 
-| Driver | C-SCARE role | What it exercises | Built on |
-|--------|--------------|-------------------|----------|
-| **issuer** | acts as SCU | a **server** (SCP target) — black-box DAST | `DICOMSocket` |
-| **responder** | acts as SCP | a **client** (SCU target) — rogue server | `RawSCP` |
+| Driver | C-SCARE acts as | Target it attacks | Built on |
+|--------|-----------------|-------------------|----------|
+| **issuer** | SCU (client) | a **server** (SCP) — black-box DAST | `DICOMSocket` |
+| **responder** | SCP (server) | a **client** (SCU) — rogue server | `RawSCP` |
+
+The key point: you attack a **server by being a client** (issuer) and a **client
+by being a server** (responder). Neither phase is "SCP-only" or "SCU-only" — the
+*pair* lets each workflow point at either role. Phase 0 built the issuers, Phase
+1 built the responders; together they make every workflow role-agnostic.
 
 This mirrors the matrix the README already documents (SCP-DAST via
 `deliver.py`, SCU-rogue via `RawSCP`). The win is that the malformed-input
@@ -27,6 +32,17 @@ catalog (`Corruptor`, scapy `fuzz()`, `attacks.py`) plugs into **both**
 directions of every workflow — the same length-lie or out-of-spec field that
 probes a server's RQ parser probes a client's RSP parser when served the other
 way. Where a workflow only makes sense in one direction, the plan says so.
+
+### Direction coverage today
+
+| Workflow | Issuer (attack an SCP) | Responder (attack an SCU) |
+|----------|------------------------|----------------------------|
+| W1 AE brute | ✅ `ae_brute` | ⚠️ `accept_association` / `reject_association` (no AET-keyed convenience yet) |
+| W2 cred brute | ✅ `cred_brute` | ⚠️ 0x59 injection only (no require-and-validate helper yet) |
+| W3 C-FIND | ✅ `c_find` | ✅ `build_cfind_rsp_stream` |
+| W4 C-GET | ✅ `c_get` (experimental) | ❌ no inbound-sub-op sender yet |
+| W5 C-MOVE | ✅ `c_move` | ⚠️ `on_c_move` dispatch, no helper yet |
+| W6 C-STORE | ✅ `c_store` + `Corruptor` | ✅ `build_cstore_rsp` |
 
 ## The decisive capability: read the response, don't just classify
 
@@ -281,9 +297,19 @@ SCU-exercising (client-fuzzing) half usable. Note Implementation Version Name is
 SH (≤16 chars) — a strict SCU rejects longer values, so a long flag belongs in
 the Implementation Class UID arc, not 0x55.
 
-**Phase 2 — malformation wiring + reporting.** Route both directions of every
-workflow through the existing catalog (`Corruptor`, `attacks.py`, scapy `fuzz()`)
-and `monitor.py` → SARIF, so a workflow can run clean (recon) or hostile (fuzz).
+**Phase 2 — fill the missing direction + malformation + reporting.**
+- **Complete the pairs** so every workflow is genuinely role-agnostic: the
+  W4 responder (inbound C-STORE sub-op sender for C-GET), W5 `c_move` responder
+  helper, and AET-keyed / require-and-validate convenience responders for W1/W2.
+- **Hostile mode:** let each direction optionally pass its dataset/PDU through
+  the malformation catalog (`Corruptor`, `attacks.py`, scapy `fuzz()`), so a
+  workflow can run clean (recon) or hostile (malformed).
+- **Reporting:** reuse the **SARIF writer** only — `WorkflowResult.
+  to_attack_result()` already feeds `write_sarif`. *Not* `monitor.py`'s
+  `SanitizerMonitor`/`ProcessMonitor`: those parse ASan output / watch a managed
+  local process and only apply to an **instrumented fuzz target**, which a
+  live black-box workflow doesn't have. (The greybox path keeps owning the
+  monitors; they are not workflow infrastructure.)
 
 ## Open decisions
 
