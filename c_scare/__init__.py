@@ -167,7 +167,8 @@ from .deliver import send_pdu, send_sequence, send_cstore
 # sculpted query builder. Query/retrieve flows (c_find/c_get/c_move) live on
 # DICOMSocket; these compose them into operations.
 from .workflows import (
-    WorkflowResult, AETResult, CredResult, QR_MODELS,
+    WorkflowResult, RoleNegotiationResult, HostileObservation,
+    AETResult, CredResult, QR_MODELS,
     build_query, ae_brute, cred_brute,
 )
 
@@ -328,7 +329,8 @@ __all__ = [
     "RawSCP", "ConnectionState", "Connection",
     "send_pdu", "send_sequence", "send_cstore",
     # SCU-side attack workflows
-    "WorkflowResult", "AETResult", "CredResult", "QR_MODELS",
+    "WorkflowResult", "RoleNegotiationResult", "HostileObservation",
+    "AETResult", "CredResult", "QR_MODELS",
     "build_query", "ae_brute", "cred_brute",
     # SCP-side workflow responders
     "accept_association", "reject_association",

@@ -264,6 +264,124 @@ def test_w4_cget_responder_vs_cget_issuer():
         responder.stop()
 
 
+def test_strict_cget_grant_delivers_objects():
+    """Strict-peer C-GET against a responder that grants the storage SCP role
+    (echo_roles=True): the role is negotiated, objects are delivered, and the
+    C-GET is not aborted."""
+    from pydicom.dataset import Dataset
+    from c_scare import DICOMSocket, build_query
+    from c_scare.scapy_dicom import (
+        PATIENT_ROOT_QR_GET_SOP_CLASS_UID, CT_IMAGE_STORAGE_SOP_CLASS_UID,
+        DEFAULT_TRANSFER_SYNTAX_UID, STATUS_SUCCESS)
+
+    ds = Dataset()
+    ds.SOPClassUID = CT_IMAGE_STORAGE_SOP_CLASS_UID
+    ds.SOPInstanceUID = "1.2.20"
+    ds.StudyDescription = "GRANTED"
+    objects = [(CT_IMAGE_STORAGE_SOP_CLASS_UID, "1.2.20", ds)]
+
+    responder = WorkflowResponder(host=HOST, port=11638,
+                                  ae_title="C_SCARE_SCP", echo_roles=True)
+
+    @responder.on_c_get
+    def _get(resp, conn, ctx_id, cmd, data):
+        resp.serve_cget(conn, ctx_id, cmd, objects)
+        return None
+
+    _start(responder)
+    try:
+        query = build_query(level="study",
+                            match_keys={(0x0020, 0x000D, "UI"): "1.2.3"})
+        contexts = {
+            PATIENT_ROOT_QR_GET_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID],
+            CT_IMAGE_STORAGE_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID],
+        }
+        roles = {CT_IMAGE_STORAGE_SOP_CLASS_UID: (0, 1)}
+        with DICOMSocket(HOST, 11638, "C_SCARE_SCP", "C_SCARE", read_timeout=5) as sock:
+            assert sock.associate(contexts, roles=roles)
+            # The peer echoed scp_role=1 for the storage class.
+            assert sock.negotiated_roles.get(CT_IMAGE_STORAGE_SOP_CLASS_UID) == (0, 1)
+            out = sock.c_get(query, sop_class_uid=PATIENT_ROOT_QR_GET_SOP_CLASS_UID,
+                             strict_role=True)
+        assert out["aborted"] is False
+        assert out["status"] == STATUS_SUCCESS
+        assert out["num_objects"] == 1
+    finally:
+        responder.stop()
+
+
+def test_strict_cget_withhold_aborts():
+    """Strict-peer C-GET against a responder that withholds the storage SCP role
+    (role_response scp_role=0): the SCU aborts on the first sub-op rather than
+    accepting the object, and reports the reason."""
+    from pydicom.dataset import Dataset
+    from c_scare import DICOMSocket, build_query
+    from c_scare.scapy_dicom import (
+        PATIENT_ROOT_QR_GET_SOP_CLASS_UID, CT_IMAGE_STORAGE_SOP_CLASS_UID,
+        DEFAULT_TRANSFER_SYNTAX_UID)
+
+    ds = Dataset()
+    ds.SOPClassUID = CT_IMAGE_STORAGE_SOP_CLASS_UID
+    ds.SOPInstanceUID = "1.2.21"
+    objects = [(CT_IMAGE_STORAGE_SOP_CLASS_UID, "1.2.21", ds)]
+
+    responder = WorkflowResponder(
+        host=HOST, port=11639, ae_title="C_SCARE_SCP",
+        role_response={CT_IMAGE_STORAGE_SOP_CLASS_UID: (0, 0)})
+
+    @responder.on_c_get
+    def _get(resp, conn, ctx_id, cmd, data):
+        resp.serve_cget(conn, ctx_id, cmd, objects)
+        return None
+
+    _start(responder)
+    try:
+        query = build_query(level="study",
+                            match_keys={(0x0020, 0x000D, "UI"): "1.2.3"})
+        contexts = {
+            PATIENT_ROOT_QR_GET_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID],
+            CT_IMAGE_STORAGE_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID],
+        }
+        roles = {CT_IMAGE_STORAGE_SOP_CLASS_UID: (0, 1)}
+        with DICOMSocket(HOST, 11639, "C_SCARE_SCP", "C_SCARE", read_timeout=5) as sock:
+            assert sock.associate(contexts, roles=roles)
+            assert sock.negotiated_roles.get(CT_IMAGE_STORAGE_SOP_CLASS_UID) == (0, 0)
+            out = sock.c_get(query, sop_class_uid=PATIENT_ROOT_QR_GET_SOP_CLASS_UID,
+                             strict_role=True)
+        assert out["aborted"] is True
+        assert out["reason"] == "scp_role_not_granted"
+        assert out["num_objects"] == 0
+    finally:
+        responder.stop()
+
+
+def test_accept_association_echoes_proposed_roles():
+    """accept_association(echo_proposed_roles=True) echoes the RQ's 0x54 role
+    items back in the AC, and a DICOMSocket parses them into negotiated_roles."""
+    from c_scare import DICOMSocket
+    from c_scare.scapy_dicom import (
+        CT_IMAGE_STORAGE_SOP_CLASS_UID, DEFAULT_TRANSFER_SYNTAX_UID)
+    from c_scare import RawSCP
+
+    scp = RawSCP(host=HOST, port=11640)
+
+    @scp.on_associate_rq
+    def _rq(conn, pdu_bytes, pkt):
+        return accept_association(pdu_bytes, echo_proposed_roles=True)
+
+    scp.start(blocking=False)
+    time.sleep(0.4)
+    try:
+        with DICOMSocket(HOST, 11640, "C_SCARE_SCP", "C_SCARE", read_timeout=5) as sock:
+            ok = sock.associate(
+                {CT_IMAGE_STORAGE_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID]},
+                roles={CT_IMAGE_STORAGE_SOP_CLASS_UID: (0, 1)})
+            assert ok
+            assert sock.negotiated_roles.get(CT_IMAGE_STORAGE_SOP_CLASS_UID) == (0, 1)
+    finally:
+        scp.stop()
+
+
 def test_reject_association_blocks_scu():
     """A custom reject (called-AE-title-not-recognized) is delivered to the
     client — the SCP-side mirror of the AE-title axis."""

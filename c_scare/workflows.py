@@ -40,6 +40,8 @@ from .scapy_dicom import (
 
 __all__ = [
     "WorkflowResult",
+    "RoleNegotiationResult",
+    "HostileObservation",
     "AETResult",
     "CredResult",
     "QR_MODELS",
@@ -95,6 +97,80 @@ class WorkflowResult:
             expected_behavior="workflow probe",
             metadata=dict(self.detail),
             success=self.success,
+        )
+
+
+@dataclass
+class RoleNegotiationResult:
+    """Outcome of a strict-peer C-GET role negotiation, convertible to the
+    catalog AttackResult so it rides the same SARIF path.
+
+    A strict abort (the peer withheld the storage SCP role) is a reportable
+    finding: ``aborted=True`` maps to ``success=False`` (SARIF ``error``)."""
+
+    sop_class_uid: str
+    requested_scp_role: int = 1
+    granted_scp_role: int = 0
+    aborted: bool = False
+    negotiated_roles: Dict[str, Any] = field(default_factory=dict)
+
+    def to_attack_result(self):
+        """Adapt to ``attacks.AttackResult`` for SARIF output."""
+        from .attacks import AttackResult
+        if self.aborted:
+            desc = (f"Peer withheld the storage SCP role for {self.sop_class_uid} "
+                    f"(requested scp_role={self.requested_scp_role}, "
+                    f"granted={self.granted_scp_role}); C-GET aborted")
+        else:
+            desc = (f"Peer granted the storage SCP role for {self.sop_class_uid} "
+                    f"(scp_role={self.granted_scp_role})")
+        return AttackResult(
+            name=f"storage-scp-role/{self.sop_class_uid}",
+            category="role-negotiation",
+            payload=b"",
+            description=desc,
+            expected_behavior=("Peer should grant scp_role=1 for the storage SOP "
+                               "class so a C-GET SCU can receive objects"),
+            metadata={
+                "sop_class_uid": self.sop_class_uid,
+                "requested_scp_role": self.requested_scp_role,
+                "granted_scp_role": self.granted_scp_role,
+                "negotiated_roles": dict(self.negotiated_roles),
+            },
+            success=False if self.aborted else None,
+        )
+
+
+@dataclass
+class HostileObservation:
+    """An observation from hostile/rogue mode, where the system under test is a
+    CLIENT (SCU). Findings come from monitors watching the client process, so
+    the ``monitor_reports`` are passed straight through to the SARIF detection
+    block (``test_runner.write_sarif``)."""
+
+    name: str
+    description: str
+    category: str = "hostile-scu"
+    monitor_reports: List[Any] = field(default_factory=list)
+    success: Optional[bool] = None
+    detail: Dict[str, Any] = field(default_factory=dict)
+
+    def to_attack_result(self):
+        """Adapt to ``attacks.AttackResult`` for SARIF output."""
+        from .attacks import AttackResult
+        success = self.success
+        if success is None and any(getattr(r, "detected", False)
+                                   for r in self.monitor_reports):
+            success = True
+        return AttackResult(
+            name=self.name,
+            category=self.category,
+            payload=b"",
+            description=self.description,
+            expected_behavior="Client should handle hostile server input safely",
+            metadata=dict(self.detail),
+            success=success,
+            monitor_reports=list(self.monitor_reports),
         )
 
 

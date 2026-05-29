@@ -59,3 +59,59 @@ def test_rogue_abort_blocks_scu():
         assert _scu_associates(11532) is False
     finally:
         scp.stop()
+
+
+import pytest as _pytest
+
+
+@_pytest.mark.parametrize("mode", [
+    "malformed-subitems", "oversized-pdu", "truncated-pdu",
+    "illegal-role", "out-of-state",
+])
+def test_rogue_malformation_modes_block_scu(mode):
+    """Every Phase 2 rogue malformation mode must keep a real SCU from
+    establishing a clean association (it rejects, aborts, or hangs/desyncs)."""
+    from c_scare.hostile import rogue_response
+    port = 11540 + hash(mode) % 30
+    scp = _start_rogue(port, rogue_response(mode))
+    try:
+        assert _scu_associates(port) is False
+    finally:
+        scp.stop()
+
+
+def test_hostile_cget_pushes_malicious_store():
+    """The hostile C-GET responder accepts an association and, on C-GET, pushes a
+    path-traversal C-STORE sub-operation at the SCU without crashing the
+    harness. We drive it with the in-process DICOMSocket SCU so we can inspect
+    the sub-op the client received."""
+    from c_scare import WorkflowResponder, build_query, DICOMSocket
+    from c_scare.scapy_dicom import (
+        PATIENT_ROOT_QR_GET_SOP_CLASS_UID, CT_IMAGE_STORAGE_SOP_CLASS_UID,
+        DEFAULT_TRANSFER_SYNTAX_UID)
+
+    responder = WorkflowResponder(host='127.0.0.1', port=11572,
+                                  ae_title='C_SCARE_SCP', echo_roles=True)
+
+    @responder.on_c_get
+    def _get(resp, conn, ctx_id, cmd, data):
+        resp.serve_cget_hostile(conn, ctx_id, cmd, mode='path-traversal')
+        return None
+
+    responder.start(blocking=False)
+    time.sleep(0.5)
+    try:
+        query = build_query(level='study',
+                            match_keys={(0x0020, 0x000D, 'UI'): '1.2.3'})
+        contexts = {
+            PATIENT_ROOT_QR_GET_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID],
+            CT_IMAGE_STORAGE_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID],
+        }
+        with DICOMSocket('127.0.0.1', 11572, 'C_SCARE_SCP', 'C_SCARE',
+                         read_timeout=5) as sock:
+            assert sock.associate(contexts)
+            out = sock.c_get(query, sop_class_uid=PATIENT_ROOT_QR_GET_SOP_CLASS_UID)
+        # The client received exactly one (malicious) object and survived.
+        assert out['num_objects'] == 1
+    finally:
+        responder.stop()
