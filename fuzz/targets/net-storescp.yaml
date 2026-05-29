@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# SCP grey-box, network path (AFLNet) — storescp C-STORE receiver.
+schema: 1
+name: net-storescp
+engine: aflnet
+kind: net-scp
+harness: fuzz_net.sh
+
+binary: storescp
+build_subdir: build-net
+port: 11112
+
+input:
+  mode: network
+  placeholder: "@@"
+
+seeds:
+  dir: "{{REPO_ROOT}}/fuzz/seeds/net-storescp"
+  glob: "*.raw"
+  generators:
+    - "python3 {{REPO_ROOT}}/fuzz/harness/seed_serializer.py net-storescp"
+
+dictionary:
+  path: null
+
+output:
+  dir: "{{REPO_ROOT}}/fuzz/out/net-storescp"
+  storage_dir: null
+
+env:
+  ASAN_OPTIONS: "detect_leaks=0:abort_on_error=1:symbolize=0:halt_on_error=1"
+  DCMDICTPATH: "{{REPO_ROOT}}/fuzz/dcmtk/dcmdata/data/dicom.dic"
+  AFL_SKIP_CPUFREQ: "1"
+  AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES: "1"
+
+sand:
+  enabled: false
+
+association:
+  calling_ae: C-SCARE-FZ
+  called_ae: STORESCP
+  max_pdu_length: 16384
+
+# Wired into the A-ASSOCIATE-RQ presentation contexts + P-DATA-TF DIMSE bytes.
+flows:
+  - name: echo
+    dimse: C_ECHO_RQ
+    abstract_syntax: VERIFICATION_SOP_CLASS_UID
+    transfer_syntaxes: [DEFAULT_TRANSFER_SYNTAX_UID]
+  - name: store
+    dimse: C_STORE_RQ
+    abstract_syntax: CT_IMAGE_STORAGE_SOP_CLASS_UID
+    transfer_syntaxes: [DEFAULT_TRANSFER_SYNTAX_UID]
+    dimse_kwargs:
+      affected_sop_instance_uid: "1.2.3.4.5.6.7.8.9.10"
+      priority: 0x0000
+
+argv:
+  - "{{PORT}}"
+  - "--eostudy-timeout"
+  - "1"
+
+triage:
+  mode: net-replay
+  server_argv:
+    - "{{PORT}}"
+    - "--eostudy-timeout"
+    - "1"
+
+readiness:
+  port_wait_s: 5.0
+shutdown:
+  signal: SIGINT

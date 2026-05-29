@@ -1,5 +1,8 @@
 # DCMTK dcmqrscp config — fuzzing template.
-# @REPO_ROOT@ is substituted by scripts/fuzz_dcmqrscp.sh at launch time.
+# @REPO_ROOT@, @CALLING_AE@ and @CALLED_AE@ are substituted at launch time by
+# scripts/fuzz_dcmqrscp.sh (and by c_scare.greybox at triage time) from the
+# net-dcmqrscp profile (fuzz/targets/net-dcmqrscp.yaml) — the SAME AE titles
+# the seed A-ASSOCIATE-RQ carries, so the SCP recognises the peer.
 #
 # Fields:
 #   NetworkType, NetworkTCPPort, MaxPDUSize, MaxAssociations
@@ -10,12 +13,12 @@ MaxPDUSize      = 16384
 MaxAssociations = 4
 
 HostTable BEGIN
-caller    = (C-SCARE-FZ, 127.0.0.1, 11112)
+caller    = (@CALLING_AE@, 127.0.0.1, 11112)
 HostTable END
 
 VendorTable BEGIN
 VendorTable END
 
 AETable BEGIN
-DCMQRSCP    @REPO_ROOT@/fuzz/storage/dcmqrscp    RW (50, 1024mb)    caller
+@CALLED_AE@    @REPO_ROOT@/fuzz/storage/dcmqrscp    RW (50, 1024mb)    caller
 AETable END

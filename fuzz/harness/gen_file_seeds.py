@@ -36,7 +36,6 @@ from pydicom.dataset import Dataset, FileDataset
 from pydicom.uid import (
     ExplicitVRLittleEndian,
     ImplicitVRLittleEndian,
-    SecondaryCaptureImageStorage,
     generate_uid,
 )
 
@@ -44,6 +43,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
 from c_scare.corruptor import Corruptor  # noqa: E402
+from c_scare.profiles import load_profile, resolve_pydicom_uid  # noqa: E402
 
 OUT_DIR = REPO_ROOT / "fuzz" / "seeds" / "file"
 
@@ -51,18 +51,22 @@ PREAMBLE_LEN = 128
 PRIVATE_GROUP = 0x0009  # odd group -> private data element block
 PRIVATE_CREATOR = "C-SCARE POLYGLOT"
 
+# The baseline SOP class is profile-driven (file.yaml: file_seeds.baseline_sop_class).
+# Default matches the historical literal so the corpus is byte-identical.
+BASELINE_SOP_CLASS = resolve_pydicom_uid("SecondaryCaptureImageStorage")
+
 
 def _build_baseline(transfer_syntax) -> Dataset:
     """Minimal valid Secondary Capture image — enough to exercise dcm2pnm."""
     file_meta = Dataset()
-    file_meta.MediaStorageSOPClassUID = SecondaryCaptureImageStorage
+    file_meta.MediaStorageSOPClassUID = BASELINE_SOP_CLASS
     file_meta.MediaStorageSOPInstanceUID = generate_uid()
     file_meta.TransferSyntaxUID = transfer_syntax
 
     ds = FileDataset("seed.dcm", {}, file_meta=file_meta, preamble=b"\0" * 128)
     ds.PatientName = "Phase1^Seed"
     ds.PatientID = "0001"
-    ds.SOPClassUID = SecondaryCaptureImageStorage
+    ds.SOPClassUID = BASELINE_SOP_CLASS
     ds.SOPInstanceUID = file_meta.MediaStorageSOPInstanceUID
     ds.Modality = "OT"
     ds.SamplesPerPixel = 1
@@ -213,13 +217,28 @@ def _polyglot_seeds(out_dir: Path) -> int:
     return len(seeds)
 
 
-def main() -> int:
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+def main(argv=None) -> int:
+    global BASELINE_SOP_CLASS
+    argv = sys.argv[1:] if argv is None else argv
+    target = argv[0] if argv else "file"
+    profile = load_profile(target)
 
-    for ts, label in (
+    # Profile drives the baseline SOP class and the transfer syntaxes each
+    # baseline + corruption family is encoded in. Defaults reproduce the
+    # historical literals so the corpus stays byte-identical.
+    if profile.file_baseline_sop_class:
+        BASELINE_SOP_CLASS = resolve_pydicom_uid(profile.file_baseline_sop_class)
+    transfer_syntaxes = [
+        (resolve_pydicom_uid(entry["uid"]), entry["label"])
+        for entry in profile.file_transfer_syntaxes
+    ] or [
         (ExplicitVRLittleEndian, "explicit_le"),
         (ImplicitVRLittleEndian, "implicit_le"),
-    ):
+    ]
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    for ts, label in transfer_syntaxes:
         ds = _build_baseline(ts)
         baseline_path = OUT_DIR / f"baseline_{label}.dcm"
         ds.save_as(str(baseline_path), write_like_original=False)

@@ -1,0 +1,76 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# SCP grey-box, network path (AFLNet) — dcmrecv C-STORE storage SCP.
+schema: 1
+name: net-dcmrecv
+engine: aflnet
+kind: net-scp
+harness: fuzz_dcmrecv.sh
+
+binary: dcmrecv
+build_subdir: build-net
+port: 11113
+
+input:
+  mode: network
+  placeholder: "@@"
+
+seeds:
+  dir: "{{REPO_ROOT}}/fuzz/seeds/net-dcmrecv"
+  glob: "*.raw"
+  generators:
+    - "python3 {{REPO_ROOT}}/fuzz/harness/seed_serializer.py net-dcmrecv"
+
+dictionary:
+  path: null
+
+output:
+  dir: "{{REPO_ROOT}}/fuzz/out/net-dcmrecv"
+  storage_dir: "{{REPO_ROOT}}/fuzz/storage/dcmrecv"
+
+env:
+  ASAN_OPTIONS: "detect_leaks=0:abort_on_error=1:symbolize=0:halt_on_error=1"
+  DCMDICTPATH: "{{REPO_ROOT}}/fuzz/dcmtk/dcmdata/data/dicom.dic"
+  AFL_SKIP_CPUFREQ: "1"
+  AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES: "1"
+
+sand:
+  enabled: false
+
+association:
+  calling_ae: C-SCARE-FZ
+  called_ae: DCMRECV
+  max_pdu_length: 16384
+
+flows:
+  - name: echo
+    dimse: C_ECHO_RQ
+    abstract_syntax: VERIFICATION_SOP_CLASS_UID
+    transfer_syntaxes: [DEFAULT_TRANSFER_SYNTAX_UID]
+  - name: store
+    dimse: C_STORE_RQ
+    abstract_syntax: CT_IMAGE_STORAGE_SOP_CLASS_UID
+    transfer_syntaxes: [DEFAULT_TRANSFER_SYNTAX_UID]
+    dimse_kwargs:
+      affected_sop_instance_uid: "1.2.3.4.5.6.7.8.9.11"
+      priority: 0x0000
+
+argv:
+  - "{{PORT}}"
+  - "--output-directory"
+  - "{{STORAGE}}"
+  - "--eostudy-timeout"
+  - "1"
+
+triage:
+  mode: net-replay
+  server_argv:
+    - "{{PORT}}"
+    - "--output-directory"
+    - "{{WORKDIR}}"
+    - "--eostudy-timeout"
+    - "1"
+
+readiness:
+  port_wait_s: 5.0
+shutdown:
+  signal: SIGINT

@@ -5,35 +5,30 @@
 # fully parses a DICOM file with no pixel-rendering pipeline, so it is a
 # tighter target for the dataset/element parser than dcm2pnm.
 # Re-run safely: if fuzz/out/parse exists, AFL resumes via -i-.
+#
+# Per-target values come from the profile fuzz/targets/parse.yaml.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_DIR="${REPO_ROOT}/fuzz/build-llvm"
-SEEDS_DIR="${REPO_ROOT}/fuzz/seeds/file"
-DICT_PATH="${REPO_ROOT}/fuzz/dict/dicom.dict"
-OUT_DIR="${REPO_ROOT}/fuzz/out/parse"
 
-# shellcheck disable=SC1091
-source "${REPO_ROOT}/scripts/install_afl.sh"
+# shellcheck source=scripts/profile_lib.sh
+source "${REPO_ROOT}/scripts/profile_lib.sh"
+load_profile parse
+source_afl
 
-DCMDUMP="$(find "${BUILD_DIR}" -type f -name dcmdump -executable | head -1)"
-[[ -n "${DCMDUMP}" ]] || { echo "[fuzz_parse] dcmdump not built — run scripts/build_dcmtk.sh"; exit 1; }
+find_binary fuzz_parse
 
-if [[ ! -d "${SEEDS_DIR}" || -z "$(ls -A "${SEEDS_DIR}" 2>/dev/null)" ]]; then
+if [[ -z "${CSCARE_PRINT_ARGV:-}" && ( ! -d "${SEEDS_DIR}" || -z "$(ls -A "${SEEDS_DIR}" 2>/dev/null)" ) ]]; then
     echo "[fuzz_parse] generating seed corpus"
-    python3 "${REPO_ROOT}/fuzz/harness/gen_file_seeds.py"
-    python3 "${REPO_ROOT}/fuzz/harness/gen_pixel_seeds.py"
+    run_seed_generators
 fi
-if [[ ! -f "${DICT_PATH}" ]]; then
+if [[ -z "${CSCARE_PRINT_ARGV:-}" && -n "${DICT_PATH}" && ! -f "${DICT_PATH}" && -n "${DICT_GENERATOR}" ]]; then
     echo "[fuzz_parse] building dictionary"
-    python3 "${REPO_ROOT}/fuzz/harness/build_dict.py"
+    bash -c "${DICT_GENERATOR}"
 fi
 
 mkdir -p "${OUT_DIR}"
-export ASAN_OPTIONS="abort_on_error=1:symbolize=0:detect_leaks=0:halt_on_error=1"
-export DCMDICTPATH="${REPO_ROOT}/fuzz/dcmtk/dcmdata/data/dicom.dic"
-export AFL_SKIP_CPUFREQ=1
-export AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1
+# load_profile exported ASAN_OPTIONS/DCMDICTPATH/AFL_* from the profile.
 
 if [[ -f "${OUT_DIR}/fuzzer_stats" || -f "${OUT_DIR}/default/fuzzer_stats" ]]; then
     INPUT_ARG="-"
@@ -43,24 +38,25 @@ else
     echo "[fuzz_parse] starting fresh campaign in ${OUT_DIR}"
 fi
 
-# SAND mode (scripts/build_dcmtk.sh SAND=1): when sanitizer-worker trees
-# exist under fuzz/build-san-*/, route suspicious inputs to them via -w —
-# DCMDUMP is then the fast native loop binary. No workers → the plain
-# single-binary loop, unchanged. See https://aflplus.plus/docs/sand/.
+# SAND mode (scripts/build_dcmtk.sh SAND=1): route suspicious inputs to the
+# sanitizer-worker trees under fuzz/build-san-*/ via -w. See
+# https://aflplus.plus/docs/sand/.
 SAND_ARGS=()
-for wdir in "${REPO_ROOT}"/fuzz/build-san-*/; do
-    [[ -d "${wdir}" ]] || continue
-    worker="$(find "${wdir}" -type f -name dcmdump -executable | head -1)"
-    if [[ -n "${worker}" ]]; then
-        SAND_ARGS+=(-w "${worker}")
-        echo "[fuzz_parse] SAND worker: ${worker}"
-    fi
-done
+if [[ "${SAND_ENABLED}" == "true" ]]; then
+    for wdir in "${REPO_ROOT}"/fuzz/build-san-*/; do
+        [[ -d "${wdir}" ]] || continue
+        worker="$(find "${wdir}" -type f -name "${BIN_NAME}" -executable | head -1)"
+        if [[ -n "${worker}" ]]; then
+            SAND_ARGS+=(-w "${worker}")
+            echo "[fuzz_parse] SAND worker: ${worker}"
+        fi
+    done
+fi
 
-exec "${AFLPP_PATH}/afl-fuzz" \
+afl_exec "${AFLPP_PATH}/afl-fuzz" \
     -i "${INPUT_ARG}" \
     -o "${OUT_DIR}" \
     -x "${DICT_PATH}" \
     -m none \
     "${SAND_ARGS[@]}" \
-    -- "${DCMDUMP}" @@
+    -- "${BIN_PATH}" "${ARGV[@]}"

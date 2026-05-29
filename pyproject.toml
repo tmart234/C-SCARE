@@ -15,6 +15,7 @@ keywords = ["dicom", "security", "fuzzing", "dast", "medical-devices"]
 dependencies = [
     "pydicom>=2.4",
     "scapy>=2.5",
+    "pyyaml>=5.1",
 ]
 
 [project.optional-dependencies]

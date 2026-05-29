@@ -43,6 +43,24 @@ campaign reports (`scripts/campaign.sh`) embed the relevant manifest in
 | `net-dcmqrscp` | `dcmqrscp` | AFLNet | SCP grey-box — network |
 | `scu` | `storescu` | AFL++ + desock | SCU grey-box — client response parser (experimental) |
 
+### Target profiles
+
+Each target is declared by one YAML profile under `fuzz/targets/<target>.yaml`
+(loaded by `c_scare/profiles.py` for Python and `scripts/profile_lib.sh` for
+the harnesses). A profile is the single source of truth for the target's
+binary, build dir, port, seed/output/dictionary dirs, environment, the
+`afl-fuzz` argv, the crash-triage server argv, and — for the network targets —
+the DICOM identity (AE titles, and the per-DIMSE-flow SOP-class abstract
+syntaxes and transfer syntaxes) that the seed serializer encodes into the
+A-ASSOCIATE-RQ / P-DATA-TF bytes and that `dcmqrscp.cfg` is rendered from.
+
+**Adding a target** is therefore just dropping in a new
+`fuzz/targets/<name>.yaml` (and a harness if no existing engine flow fits) — no
+edits to `greybox.py`, `scripts/campaign.sh`, or the seed generators.
+`scripts/check_profiles.sh` (run by `scripts/smoke.sh` and CI) asserts the
+profiles resolve to the expected values and that each harness's `afl-fuzz`
+command line is unchanged.
+
 ## Running a campaign and triaging crashes
 
 ```bash

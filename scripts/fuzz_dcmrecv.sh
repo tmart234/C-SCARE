@@ -4,37 +4,31 @@
 # Phase 4 (variant): launch AFLNet against the ASAN-instrumented dcmrecv.
 #
 # dcmrecv is a C-STORE SCP (storage receiver). Same AFLNet flag set as
-# fuzz_net.sh — only the binary, port, and seed dir differ.
+# fuzz_net.sh — only the binary, port, and seed dir differ, all of which come
+# from the declarative profile fuzz/targets/net-dcmrecv.yaml.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_DIR="${REPO_ROOT}/fuzz/build-net"
-SEEDS_DIR="${REPO_ROOT}/fuzz/seeds/net-dcmrecv"
-OUT_DIR="${REPO_ROOT}/fuzz/out/net-dcmrecv"
-STORAGE_DIR="${REPO_ROOT}/fuzz/storage/dcmrecv"
-PORT="${DICOM_PORT:-11113}"
 
-# shellcheck disable=SC1091
-source "${REPO_ROOT}/scripts/install_afl.sh"
+# shellcheck source=scripts/profile_lib.sh
+source "${REPO_ROOT}/scripts/profile_lib.sh"
+load_profile net-dcmrecv
+source_afl
 # shellcheck source=scripts/aflnet_common.sh
 source "${REPO_ROOT}/scripts/aflnet_common.sh"
 
-DCMRECV="$(find "${BUILD_DIR}" -type f -name dcmrecv -executable | head -1)"
-[[ -n "${DCMRECV}" ]] || { echo "[fuzz_dcmrecv] dcmrecv not built"; exit 1; }
+find_binary fuzz_dcmrecv
 
-if [[ ! -d "${SEEDS_DIR}" || -z "$(find "${SEEDS_DIR}" -maxdepth 1 -name '*.raw' -print -quit 2>/dev/null)" ]]; then
+if [[ -z "${CSCARE_PRINT_ARGV:-}" && ( ! -d "${SEEDS_DIR}" || -z "$(find "${SEEDS_DIR}" -maxdepth 1 -name "${SEEDS_GLOB}" -print -quit 2>/dev/null)" ) ]]; then
     echo "[fuzz_dcmrecv] generating network seeds"
-    python3 "${REPO_ROOT}/fuzz/harness/seed_serializer.py"
+    run_seed_generators
 fi
 
 mkdir -p "${OUT_DIR}" "${STORAGE_DIR}"
+# load_profile exported ASAN_OPTIONS/DCMDICTPATH/AFL_* from the profile.
 # symbolize=0 is mandatory: AFLNet's afl-fuzz check_asan_opts() FATALs on a
 # custom ASAN_OPTIONS that omits it. Crash traces are symbolized at triage
 # time instead (see c_scare/greybox.py).
-export ASAN_OPTIONS="detect_leaks=0:abort_on_error=1:symbolize=0:halt_on_error=1"
-export DCMDICTPATH="${REPO_ROOT}/fuzz/dcmtk/dcmdata/data/dicom.dic"
-export AFL_SKIP_CPUFREQ=1
-export AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1
 
 if [[ -f "${OUT_DIR}/fuzzer_stats" ]]; then
     INPUT_ARG="-"
@@ -44,12 +38,11 @@ else
     echo "[fuzz_dcmrecv] starting fresh campaign in ${OUT_DIR}"
 fi
 
-# dcmrecv writes received instances under --output-directory. Point it at a
-# scratch dir so AFLNet's per-execution storms don't fill the repo tree.
-# AFLNet options come from scripts/aflnet_common.sh (shared, includes -E).
-exec "${AFL_PATH}/afl-fuzz" \
+# dcmrecv writes received instances under --output-directory (profile argv
+# {{STORAGE}}). AFLNet options come from scripts/aflnet_common.sh (includes -E).
+afl_exec "${AFL_PATH}/afl-fuzz" \
     -i "${INPUT_ARG}" \
     -o "${OUT_DIR}" \
     -N "tcp://127.0.0.1/${PORT}" \
     "${AFLNET_FUZZ_OPTS[@]}" \
-    -- "${DCMRECV}" "${PORT}" --output-directory "${STORAGE_DIR}" --eostudy-timeout 1
+    -- "${BIN_PATH}" "${ARGV[@]}"

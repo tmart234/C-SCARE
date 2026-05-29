@@ -13,6 +13,12 @@ SEEDS_DIR="${REPO_ROOT}/fuzz/seeds/file"
 TMP_DIR="$(mktemp -d -t cscare-smoke.XXXXXX)"
 trap 'rm -rf "${TMP_DIR}"' EXIT
 
+# (0) Declarative target profiles resolve to the expected values and each
+# harness's afl-fuzz argv is byte-identical to the pre-refactor command line.
+# Needs no DCMTK build, so it runs before the build-dependent checks below.
+echo "[smoke] (0) target profile consistency"
+bash "${REPO_ROOT}/scripts/check_profiles.sh"
+
 # shellcheck disable=SC1091
 source "${REPO_ROOT}/scripts/install_afl.sh"
 

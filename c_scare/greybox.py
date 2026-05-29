@@ -66,11 +66,15 @@ __all__ = [
     'list_queue', 'find_san_workers', 'triage', 'triage_to_sarif',
 ]
 
-# target -> fuzz harness script (mirrors scripts/campaign.sh).
-# file/parse  = SCP grey-box, file path (AFL++)
-# net-*       = SCP grey-box, network path (AFLNet)
-# scu         = SCU grey-box, client path (AFL++ + desock)
-TARGETS = {
+# Targets are declared by per-target YAML profiles under fuzz/targets/ (see
+# c_scare.profiles). TARGETS maps target name -> fuzz harness script and
+# NET_TARGETS lists the AFLNet network targets (triaged by replaying the input
+# at a launched instrumented server, see triage(net_target=...), not as a file
+# argument). Both are derived from the profiles so adding a target is a matter
+# of dropping in one YAML — no edit here, in scripts/campaign.sh, or in the
+# seed generators. The literal fallback keeps `import c_scare` working if the
+# profiles directory is ever absent.
+_LITERAL_TARGETS = {
     'file': 'fuzz_file.sh',
     'parse': 'fuzz_parse.sh',
     'net-storescp': 'fuzz_net.sh',
@@ -78,10 +82,22 @@ TARGETS = {
     'net-dcmqrscp': 'fuzz_dcmqrscp.sh',
     'scu': 'fuzz_scu.sh',
 }
+_LITERAL_NET_TARGETS = ('net-storescp', 'net-dcmrecv', 'net-dcmqrscp')
 
-# AFLNet network targets — triaged by replaying the input at a launched
-# instrumented server (see triage(net_target=...)), not as a file argument.
-NET_TARGETS = ('net-storescp', 'net-dcmrecv', 'net-dcmqrscp')
+try:
+    from . import profiles as _profiles
+    _PROFILES = _profiles.load_profiles()
+    if _PROFILES:
+        TARGETS = {name: p.harness for name, p in _PROFILES.items()}
+        NET_TARGETS = tuple(sorted(
+            name for name, p in _PROFILES.items() if p.kind == 'net-scp'))
+    else:
+        TARGETS = dict(_LITERAL_TARGETS)
+        NET_TARGETS = _LITERAL_NET_TARGETS
+except Exception:
+    # A missing/broken profile must never break importing the package.
+    TARGETS = dict(_LITERAL_TARGETS)
+    NET_TARGETS = _LITERAL_NET_TARGETS
 
 
 def repo_root() -> str:
@@ -245,23 +261,46 @@ def _wait_port(host: str, port: int, deadline: float) -> bool:
     return False
 
 
-def _dcmqrscp_config(repo: str):
-    """Render the dcmqrscp config from its template into a throwaway tree.
+def _render_config(repo: str, profile):
+    """Render a target's config from its template into a throwaway tree.
 
     Returns ``(config_path, base_dir)``; remove ``base_dir`` to clean up.
-    Mirrors the ``@REPO_ROOT@`` substitution scripts/fuzz_dcmqrscp.sh does,
-    but points storage at a temp tree so triage never writes into the repo.
+    Mirrors the ``@REPO_ROOT@`` substitution scripts/fuzz_dcmqrscp.sh does, but
+    points storage at a temp tree so triage never writes into the repo. The AE
+    titles come from the same profile fields the seed A-ASSOCIATE-RQ uses
+    (``@CALLING_AE@`` / ``@CALLED_AE@``), so the rendered config and the seeds
+    agree on who may associate.
     """
-    template = os.path.join(repo, 'fuzz', 'configs', 'dcmqrscp.cfg.template')
+    template = profile.config_template or os.path.join(
+        repo, 'fuzz', 'configs', 'dcmqrscp.cfg.template')
     with open(template, 'r') as fh:
         body = fh.read()
     base = tempfile.mkdtemp(prefix='cscare-triage-qr-')
     os.makedirs(os.path.join(base, 'fuzz', 'storage', 'dcmqrscp'),
                 exist_ok=True)
     cfg = os.path.join(base, 'dcmqrscp.cfg')
+    body = body.replace('@REPO_ROOT@', base)
+    if profile.calling_ae is not None:
+        body = body.replace('@CALLING_AE@', profile.calling_ae)
+    if profile.called_ae is not None:
+        body = body.replace('@CALLED_AE@', profile.called_ae)
     with open(cfg, 'w') as fh:
-        fh.write(body.replace('@REPO_ROOT@', base))
+        fh.write(body)
     return cfg, base
+
+
+def _net_server_argv(profile, server_binary: str, port: int,
+                     workdir: str, config: Optional[str]) -> List[str]:
+    """Build the instrumented-server argv for a network triage replay.
+
+    Driven by the profile's ``triage.server_argv`` (placeholder tokens
+    substituted), so adding a network target needs no code change here.
+    """
+    from .profiles import subst
+    return [server_binary] + [
+        subst(tok, repo=None, port=port, workdir=workdir, config=config)
+        for tok in profile.triage_server_argv
+    ]
 
 
 def _replay_net(server_binary: str, net_target: str, crash_path: str,
@@ -272,14 +311,24 @@ def _replay_net(server_binary: str, net_target: str, crash_path: str,
     transport that delivers the recorded DICOM message stream; the verdict
     is the *server's* own stderr, where the sanitizer report is written.
     A fresh server per input means a crash is attributable to exactly that
-    input and cannot mask the inputs that follow.
+    input and cannot mask the inputs that follow. The server argv, readiness
+    wait, and shutdown signal all come from the target profile.
     """
+    from .profiles import load_profile
     replay_bin = os.path.join(repo, 'fuzz', 'aflnet', 'aflnet-replay')
     if not os.access(replay_bin, os.X_OK):
         return None, (f'aflnet-replay not found at {replay_bin} — '
                       f'run scripts/install_afl.sh')
     if not (os.path.isfile(server_binary) and os.access(server_binary, os.X_OK)):
         return None, f'instrumented server not executable: {server_binary}'
+
+    # The profile is intrinsic to C-SCARE (it defines the target), so it is
+    # loaded from the C-SCARE repo root, not the caller's ``repo`` (which only
+    # locates aflnet-replay / the data dictionary, e.g. a test fixture tree).
+    try:
+        profile = load_profile(net_target)
+    except (FileNotFoundError, ValueError) as e:
+        return None, f'profile load failed for {net_target!r}: {e}'
 
     port = _free_port()
     workdir = tempfile.mkdtemp(prefix='cscare-triage-net-')
@@ -289,22 +338,16 @@ def _replay_net(server_binary: str, net_target: str, crash_path: str,
     if os.path.isfile(dict_path):
         env['DCMDICTPATH'] = dict_path
 
+    # Render the config only when the server argv asks for one ({{CONFIG}}).
     qr_base = None
-    if net_target == 'net-storescp':
-        argv = [server_binary, str(port), '--eostudy-timeout', '1']
-    elif net_target == 'net-dcmrecv':
-        argv = [server_binary, str(port), '--output-directory', workdir,
-                '--eostudy-timeout', '1']
-    elif net_target == 'net-dcmqrscp':
+    config_path = None
+    if any('{{CONFIG}}' in tok for tok in profile.triage_server_argv):
         try:
-            cfg, qr_base = _dcmqrscp_config(repo)
+            config_path, qr_base = _render_config(repo, profile)
         except OSError as e:
             shutil.rmtree(workdir, ignore_errors=True)
-            return None, f'dcmqrscp config setup failed: {e}'
-        argv = [server_binary, '-c', cfg, str(port)]
-    else:
-        shutil.rmtree(workdir, ignore_errors=True)
-        raise ValueError(f'unknown network target {net_target!r}')
+            return None, f'config setup failed: {e}'
+    argv = _net_server_argv(profile, server_binary, port, workdir, config_path)
 
     proc = None
     try:
@@ -313,7 +356,7 @@ def _replay_net(server_binary: str, net_target: str, crash_path: str,
                                 stderr=subprocess.STDOUT)
         # Wait for the listener; if it never comes up the server likely
         # exited early — its captured output below explains why.
-        _wait_port('127.0.0.1', port, time.time() + 5.0)
+        _wait_port('127.0.0.1', port, time.time() + profile.port_wait_s)
         try:
             subprocess.run(
                 [replay_bin, crash_path, 'DICOM', str(port), '127.0.0.1'],
@@ -324,9 +367,10 @@ def _replay_net(server_binary: str, net_target: str, crash_path: str,
         time.sleep(0.3)
         crashed = proc.poll() is not None
         if not crashed:
-            # Survived the replay. SIGINT gives the cleanest shot at an
-            # atexit LeakSanitizer scan; escalate below if it is ignored.
-            proc.send_signal(signal.SIGINT)
+            # Survived the replay. The profile's shutdown signal (SIGINT by
+            # default) gives the cleanest shot at an atexit LeakSanitizer
+            # scan; escalate below if it is ignored.
+            proc.send_signal(getattr(signal, profile.shutdown_signal))
         try:
             output, _ = proc.communicate(timeout=3.0)
         except subprocess.TimeoutExpired:

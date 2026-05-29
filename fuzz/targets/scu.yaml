@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# SCU grey-box, client path (AFL++ + desock) — storescu response parser.
+# *** EXPERIMENTAL *** (see scripts/fuzz_scu.sh).
+schema: 1
+name: scu
+engine: aflpp
+kind: scu
+harness: fuzz_scu.sh
+
+binary: storescu
+build_subdir: build-llvm
+port: null
+
+input:
+  mode: stdin-desock
+  placeholder: "@@"
+
+seeds:
+  dir: "{{REPO_ROOT}}/fuzz/seeds/scu"
+  glob: "*.raw"
+  # Seeds are server-response streams crafted inline by the harness
+  # (assoc_ac.raw / abort.raw) — no standalone generator script.
+  generators: []
+
+dictionary:
+  path: null
+
+output:
+  dir: "{{REPO_ROOT}}/fuzz/out/scu"
+  storage_dir: null
+
+env:
+  ASAN_OPTIONS: "abort_on_error=1:symbolize=0:detect_leaks=0:halt_on_error=1"
+  DCMDICTPATH: "{{REPO_ROOT}}/fuzz/dcmtk/dcmdata/data/dicom.dic"
+  AFL_SKIP_CPUFREQ: "1"
+  AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES: "1"
+
+sand:
+  enabled: false
+
+# storescu initiates to this peer (faked by the desocket shim); the bytes it
+# reads back are what AFL mutates. called_ae is the -aec argument.
+association:
+  called_ae: ANY-SCP
+  peer_host: 127.0.0.1
+  peer_port: 11112
+
+# Resolved by fuzz_scu.sh: where to find/build the LD_PRELOAD desocket shim.
+desock:
+  env_var: AFL_PRELOAD
+  candidates:
+    - "{{AFLPP_PATH}}/utils/libdesock/libdesock.so"
+    - "{{AFLPP_PATH}}/utils/libdesock/build/libdesock.so"
+  builder: "{{AFLPP_PATH}}/utils/libdesock/build.sh"
+  send_file: "{{REPO_ROOT}}/fuzz/seeds/file/baseline_explicit_le.dcm"
+
+argv:
+  - "-aec"
+  - "ANY-SCP"
+  - "127.0.0.1"
+  - "11112"
+  - "{{SENDFILE}}"
+
+triage:
+  mode: file-arg
+  server_argv: null
