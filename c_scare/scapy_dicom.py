@@ -1167,6 +1167,55 @@ bind_layers(DICOMVariableItem, DICOMGenericItem)
 
 
 
+# -------------------------------------------------------------------------
+# Variable-item traversal helpers
+#
+# A-ASSOCIATE-RQ/AC PDUs carry their negotiated parameters as nested
+# ``variable_items`` -> (User Information) ``sub_items``. Reading them is the
+# same walk every time: filter by item_type, guard the bound layer, decode the
+# null-padded UID. These helpers centralise that idiom so the many
+# ``_parse_*`` (DICOMSocket) and ``parse_*`` (c_scare.responders) readers stay
+# thin instead of re-implementing the loop.
+# -------------------------------------------------------------------------
+
+def decode_uid(value):
+    # type: (Any) -> str
+    """Decode a DICOM UID/text field to ``str``, stripping the trailing null
+    DICOM uses to pad odd-length values even. Bytes decode as ASCII with
+    replacement so malformed peer data never raises."""
+    if isinstance(value, bytes):
+        return value.rstrip(b"\x00").decode("ascii", "replace")
+    return str(value)
+
+
+def iter_variable_items(container, item_type):
+    # type: (Packet, int) -> Generator[Packet, None, None]
+    """Yield the ``variable_items`` of ``container`` (an A-ASSOCIATE-RQ/AC
+    layer) whose ``item_type`` matches."""
+    try:
+        items = container.variable_items
+    except AttributeError:
+        return
+    for item in items:
+        if item.item_type == item_type:
+            yield item
+
+
+def iter_user_info_subitems(container, sub_type, layer=None):
+    # type: (Packet, int, Any) -> Generator[Packet, None, None]
+    """Yield the User Information (item_type 0x50) sub-items of ``container``
+    whose ``item_type`` matches ``sub_type`` and which carry ``layer`` (when
+    given). Encapsulates the two-level variable_items -> sub_items walk shared
+    by every User-Information reader."""
+    for item in iter_variable_items(container, 0x50):
+        if not item.haslayer(DICOMUserInformation):
+            continue
+        for sub in item[DICOMUserInformation].sub_items:
+            if sub.item_type == sub_type and (layer is None or sub.haslayer(layer)):
+                yield sub
+
+
+
 # DICOM Upper Layer PDU Header (PS3.8 Section 9.3.1)
 
 
@@ -2823,26 +2872,20 @@ class DICOMSocket:
         """Read the AC payload — App Context UID + 0x52/0x55 sub-items — so an
         AE/recon workflow can report *what* a peer returned, not just that it
         accepted."""
-        def _txt(v):
-            if isinstance(v, bytes):
-                return v.rstrip(b"\x00").decode("ascii", errors="replace").strip()
-            return str(v).strip()
         try:
             ac = response[A_ASSOCIATE_AC]
-            for item in ac.variable_items:
-                if item.item_type == 0x10 and item.haslayer(DICOMApplicationContext):
-                    self.peer_info["application_context_uid"] = _txt(
-                        item[DICOMApplicationContext].uid)
-                elif item.item_type == 0x50 and item.haslayer(DICOMUserInformation):
-                    for sub in item[DICOMUserInformation].sub_items:
-                        if sub.item_type == 0x52 and sub.haslayer(DICOMImplementationClassUID):
-                            self.peer_info["implementation_class_uid"] = _txt(
-                                sub[DICOMImplementationClassUID].uid)
-                        elif sub.item_type == 0x55 and sub.haslayer(DICOMImplementationVersionName):
-                            # NB: the field is named "name", which collides with
-                            # scapy's Packet.name; read it via getfieldval.
-                            self.peer_info["implementation_version_name"] = _txt(
-                                sub[DICOMImplementationVersionName].getfieldval("name"))
+            for item in iter_variable_items(ac, 0x10):
+                if item.haslayer(DICOMApplicationContext):
+                    self.peer_info["application_context_uid"] = decode_uid(
+                        item[DICOMApplicationContext].uid).strip()
+            for sub in iter_user_info_subitems(ac, 0x52, DICOMImplementationClassUID):
+                self.peer_info["implementation_class_uid"] = decode_uid(
+                    sub[DICOMImplementationClassUID].uid).strip()
+            for sub in iter_user_info_subitems(ac, 0x55, DICOMImplementationVersionName):
+                # NB: the field is named "name", which collides with scapy's
+                # Packet.name; read it via getfieldval.
+                self.peer_info["implementation_version_name"] = decode_uid(
+                    sub[DICOMImplementationVersionName].getfieldval("name")).strip()
         except (KeyError, IndexError, AttributeError):
             pass
 
@@ -2852,14 +2895,10 @@ class DICOMSocket:
         only populated when identity negotiation succeeds (PS3.7 D.3.3.7)."""
         try:
             ac = response[A_ASSOCIATE_AC]
-            for item in ac.variable_items:
-                if item.item_type != 0x50 or not item.haslayer(DICOMUserInformation):
-                    continue
-                for sub in item[DICOMUserInformation].sub_items:
-                    if sub.item_type == 0x59 and sub.haslayer(DICOMUserIdentityResponse):
-                        self.user_identity_response = bytes(
-                            sub[DICOMUserIdentityResponse].server_response)
-                        return
+            for sub in iter_user_info_subitems(ac, 0x59, DICOMUserIdentityResponse):
+                self.user_identity_response = bytes(
+                    sub[DICOMUserIdentityResponse].server_response)
+                return
         except (KeyError, IndexError, AttributeError):
             pass
 
@@ -2870,56 +2909,35 @@ class DICOMSocket:
         acceptor that declines a role may return ``scp_role=0`` *or* omit the
         item entirely; a SOP class absent from this map was not granted."""
         try:
-            for item in response[A_ASSOCIATE_AC].variable_items:
-                if item.item_type != 0x50 or not item.haslayer(DICOMUserInformation):
-                    continue
-                for sub in item[DICOMUserInformation].sub_items:
-                    if sub.item_type == 0x54 and sub.haslayer(DICOMSCPSCURoleSelection):
-                        role = sub[DICOMSCPSCURoleSelection]
-                        uid = role.sop_class_uid
-                        if isinstance(uid, bytes):
-                            uid = uid.rstrip(b"\x00").decode("ascii", errors="replace")
-                        self.negotiated_roles[uid] = (
-                            int(role.scu_role), int(role.scp_role))
+            ac = response[A_ASSOCIATE_AC]
+            for sub in iter_user_info_subitems(ac, 0x54, DICOMSCPSCURoleSelection):
+                role = sub[DICOMSCPSCURoleSelection]
+                self.negotiated_roles[decode_uid(role.sop_class_uid)] = (
+                    int(role.scu_role), int(role.scp_role))
         except (KeyError, IndexError, AttributeError):
             pass
 
     def _parse_max_pdu_length(self, response):
         # type: (Packet) -> None
         try:
-            for item in response[A_ASSOCIATE_AC].variable_items:
-                if item.item_type != 0x50:
-                    continue
-                if not item.haslayer(DICOMUserInformation):
-                    continue
-                user_info = item[DICOMUserInformation]
-                for sub_item in user_info.sub_items:
-                    if sub_item.item_type != 0x51:
-                        continue
-                    if not sub_item.haslayer(DICOMMaximumLength):
-                        continue
-                    max_len = sub_item[DICOMMaximumLength]
-                    server_max = max_len.max_pdu_length
-                    self.max_pdu_length = min(
-                        self._proposed_max_pdu, server_max
-                    )
-                    return
+            ac = response[A_ASSOCIATE_AC]
+            for sub in iter_user_info_subitems(ac, 0x51, DICOMMaximumLength):
+                server_max = sub[DICOMMaximumLength].max_pdu_length
+                self.max_pdu_length = min(self._proposed_max_pdu, server_max)
+                return
         except (KeyError, IndexError, AttributeError):
             pass
         self.max_pdu_length = self._proposed_max_pdu
 
     def _parse_accepted_contexts(self, response):
         # type: (Packet) -> None
-        for item in response[A_ASSOCIATE_AC].variable_items:
-            if item.item_type != 0x21:
-                continue
+        for item in iter_variable_items(response[A_ASSOCIATE_AC], 0x21):
             if not item.haslayer(DICOMPresentationContextAC):
                 continue
             pctx = item[DICOMPresentationContextAC]
             ctx_id = pctx.context_id
-            result = pctx.result
 
-            if result != 0:
+            if pctx.result != 0:
                 continue
 
             abs_syntax = self._proposed_context_map.get(ctx_id)
@@ -2931,8 +2949,7 @@ class DICOMSocket:
                     continue
                 if not sub_item.haslayer(DICOMTransferSyntax):
                     continue
-                ts_uid = sub_item[DICOMTransferSyntax].uid
-                ts_uid = ts_uid.rstrip(b"\x00").decode("ascii")
+                ts_uid = decode_uid(sub_item[DICOMTransferSyntax].uid)
                 self.accepted_contexts[ctx_id] = (abs_syntax, ts_uid)
                 break
 
