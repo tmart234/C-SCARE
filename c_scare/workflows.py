@@ -25,10 +25,12 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .element import Dataset, Element
-from .scapy_dicom import (
+from .client import (
     DICOMSocket,
     classify_reject,
     reject_is_called_aet_unrecognized,
+)
+from .scapy_dicom import (
     PATIENT_ROOT_QR_FIND_SOP_CLASS_UID,
     STUDY_ROOT_QR_FIND_SOP_CLASS_UID,
     PATIENT_ROOT_QR_GET_SOP_CLASS_UID,

@@ -916,7 +916,8 @@ def _cmd_workflow(argv: List[str]) -> int:
     """
     try:
         from . import workflows as wf
-        from .scapy_dicom import DICOMSocket, DEFAULT_TRANSFER_SYNTAX_UID
+        from .client import DICOMSocket
+        from .scapy_dicom import DEFAULT_TRANSFER_SYNTAX_UID
     except Exception as e:  # pragma: no cover - scapy is a hard dependency
         print(f"ERROR: workflows require scapy: {e}")
         return 1
