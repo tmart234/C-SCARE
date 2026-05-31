@@ -64,15 +64,25 @@ def test_rogue_abort_blocks_scu():
 import pytest as _pytest
 
 
-@_pytest.mark.parametrize("mode", [
-    "malformed-subitems", "oversized-pdu", "truncated-pdu",
-    "illegal-role", "out-of-state",
-])
+# Each mode gets its own fixed, unique port. A previous version derived the
+# port from ``hash(mode) % 30``, but Python randomizes string hashing per
+# process (PYTHONHASHSEED), so two modes could collide on the same port and the
+# second bind() would fail with EADDRINUSE -- flaky run to run.
+_ROGUE_MODE_PORTS = {
+    mode: 11540 + i
+    for i, mode in enumerate([
+        "malformed-subitems", "oversized-pdu", "truncated-pdu",
+        "illegal-role", "out-of-state",
+    ])
+}
+
+
+@_pytest.mark.parametrize("mode", list(_ROGUE_MODE_PORTS))
 def test_rogue_malformation_modes_block_scu(mode):
     """Every Phase 2 rogue malformation mode must keep a real SCU from
     establishing a clean association (it rejects, aborts, or hangs/desyncs)."""
     from c_scare.hostile import rogue_response
-    port = 11540 + hash(mode) % 30
+    port = _ROGUE_MODE_PORTS[mode]
     scp = _start_rogue(port, rogue_response(mode))
     try:
         assert _scu_associates(port) is False
