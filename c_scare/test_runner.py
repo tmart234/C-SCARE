@@ -591,12 +591,19 @@ def _maybe_deliver(args, result: AttackResult, index: int):
     _run_monitored_test(args, result, target, args.timeout)
 
 
-def run_parser_attacks(args) -> int:
-    """Run parser attack tests."""
-    print("\n=== Parser Attacks ===\n")
+def _run_catalog(args, catalog, label: str, note: Optional[str] = None) -> int:
+    """Run one static attack catalog: deliver each payload (when monitors are
+    active), print results, collect findings, and optionally write the payloads
+    to ``args.output`` as corpus files.
+
+    The 8 catalog categories differ only in *which* catalog and *which* label —
+    file extension and Part-10 wrapping are decided per payload by
+    :func:`_save_corpus_file` (keyed off ``result.category``), so this one helper
+    serves them all. ``note`` prints an optional caveat after the totals."""
+    print(f"\n=== {label} ===\n")
 
     results = []
-    for i, result in enumerate(ParserAttacks.all()):
+    for i, result in enumerate(catalog.all()):
         try:
             _maybe_deliver(args, result, i)
             print_result(result, args.verbose)
@@ -604,122 +611,9 @@ def run_parser_attacks(args) -> int:
         except Exception as e:
             print(f"✗ {result.name}: {e}")
 
-    print(f"\nTotal parser attack tests: {len(results)}")
-    _collect_results(args, results)
-
-    if args.output:
-        os.makedirs(args.output, exist_ok=True)
-        for result in results:
-            filepath = os.path.join(args.output, f"{result.name}.dcm")
-            file_data = b'\x00' * 128 + b'DICM' + result.payload
-            with open(filepath, 'wb') as f:
-                f.write(file_data)
-
-    return 0
-
-
-def run_protocol_attacks(args) -> int:
-    """Run protocol-level attack tests."""
-    print("\n=== Protocol Attacks ===\n")
-
-    results = []
-    for i, result in enumerate(ProtocolAttacks.all()):
-        try:
-            _maybe_deliver(args, result, i)
-            print_result(result, args.verbose)
-            results.append(result)
-        except Exception as e:
-            print(f"✗ {result.name}: {e}")
-
-    print(f"\nTotal protocol attack tests: {len(results)}")
-    _collect_results(args, results)
-
-    if args.output:
-        os.makedirs(args.output, exist_ok=True)
-        for result in results:
-            filepath = os.path.join(args.output, f"{result.name}.bin")
-            with open(filepath, 'wb') as f:
-                f.write(result.payload)
-
-    return 0
-
-
-def run_logic_attacks(args) -> int:
-    """Run logic attack tests."""
-    print("\n=== Logic Attacks ===\n")
-
-    results = []
-    for i, result in enumerate(LogicAttacks.all()):
-        try:
-            _maybe_deliver(args, result, i)
-            print_result(result, args.verbose)
-            results.append(result)
-        except Exception as e:
-            print(f"✗ {result.name}: {e}")
-
-    print(f"\nTotal logic attack tests: {len(results)}")
-    _collect_results(args, results)
-
-    if args.output:
-        os.makedirs(args.output, exist_ok=True)
-        for result in results:
-            filepath = os.path.join(args.output, f"{result.name}.dcm")
-            if not result.payload.startswith(b'DICM'):
-                file_data = b'\x00' * 128 + b'DICM' + result.payload
-            else:
-                file_data = result.payload
-            with open(filepath, 'wb') as f:
-                f.write(file_data)
-    
-    return 0
-
-
-def run_command_injection_attacks(args) -> int:
-    """Run command-injection attack tests (storescp exec placeholders)."""
-    print("\n=== Command Injection Attacks ===\n")
-
-    results = []
-    for i, result in enumerate(CommandInjectionAttacks.all()):
-        try:
-            _maybe_deliver(args, result, i)
-            print_result(result, args.verbose)
-            results.append(result)
-        except Exception as e:
-            print(f"✗ {result.name}: {e}")
-
-    print(f"\nTotal command injection attack tests: {len(results)}")
-    print("Note: confirming RCE needs a live storescp started with "
-          "--exec-on-reception and a C-STORE (see deliver.send_cstore).")
-    _collect_results(args, results)
-
-    if args.output:
-        os.makedirs(args.output, exist_ok=True)
-        for result in results:
-            filepath = os.path.join(args.output, f"{result.name}.dcm")
-            file_data = b'\x00' * 128 + b'DICM' + result.payload
-            with open(filepath, 'wb') as f:
-                f.write(file_data)
-
-    return 0
-
-
-def run_path_traversal_attacks(args) -> int:
-    """Run path-traversal attack tests (storescp/SCU stored filenames)."""
-    print("\n=== Path Traversal Attacks ===\n")
-
-    results = []
-    for i, result in enumerate(PathTraversalAttacks.all()):
-        try:
-            _maybe_deliver(args, result, i)
-            print_result(result, args.verbose)
-            results.append(result)
-        except Exception as e:
-            print(f"✗ {result.name}: {e}")
-
-    print(f"\nTotal path traversal attack tests: {len(results)}")
-    print("Note: confirming the write primitive needs a live storescp (SCP, "
-          "CVE-2022-2119) or a RawSCP rogue server feeding a client (SCU, "
-          "CVE-2022-2120); inspect where the received file lands.")
+    print(f"\nTotal {label.lower()} tests: {len(results)}")
+    if note:
+        print(note)
     _collect_results(args, results)
 
     if args.output:
@@ -728,6 +622,38 @@ def run_path_traversal_attacks(args) -> int:
             _save_corpus_file(result, args.output)
 
     return 0
+
+
+def run_parser_attacks(args) -> int:
+    """Run parser attack tests."""
+    return _run_catalog(args, ParserAttacks, "Parser Attacks")
+
+
+def run_protocol_attacks(args) -> int:
+    """Run protocol-level attack tests."""
+    return _run_catalog(args, ProtocolAttacks, "Protocol Attacks")
+
+
+def run_logic_attacks(args) -> int:
+    """Run logic attack tests."""
+    return _run_catalog(args, LogicAttacks, "Logic Attacks")
+
+
+def run_command_injection_attacks(args) -> int:
+    """Run command-injection attack tests (storescp exec placeholders)."""
+    return _run_catalog(
+        args, CommandInjectionAttacks, "Command Injection Attacks",
+        note="Note: confirming RCE needs a live storescp started with "
+             "--exec-on-reception and a C-STORE (see deliver.send_cstore).")
+
+
+def run_path_traversal_attacks(args) -> int:
+    """Run path-traversal attack tests (storescp/SCU stored filenames)."""
+    return _run_catalog(
+        args, PathTraversalAttacks, "Path Traversal Attacks",
+        note="Note: confirming the write primitive needs a live storescp (SCP, "
+             "CVE-2022-2119) or a RawSCP rogue server feeding a client (SCU, "
+             "CVE-2022-2120); inspect where the received file lands.")
 
 
 def run_state_machine_attacks(args) -> int:
@@ -798,32 +724,7 @@ def run_state_machine_attacks(args) -> int:
 
 def run_memory_attacks(args) -> int:
     """Run memory corruption attack tests."""
-    print("\n=== Memory Attacks ===\n")
-
-    results = []
-    for i, result in enumerate(MemoryAttacks.all()):
-        try:
-            _maybe_deliver(args, result, i)
-            print_result(result, args.verbose)
-            results.append(result)
-        except Exception as e:
-            print(f"✗ {result.name}: {e}")
-
-    print(f"\nTotal memory attack tests: {len(results)}")
-    _collect_results(args, results)
-
-    if args.output:
-        os.makedirs(args.output, exist_ok=True)
-        for result in results:
-            filepath = os.path.join(args.output, f"{result.name}.dcm")
-            if not result.payload.startswith(b'DICM'):
-                file_data = b'\x00' * 128 + b'DICM' + result.payload
-            else:
-                file_data = result.payload
-            with open(filepath, 'wb') as f:
-                f.write(file_data)
-
-    return 0
+    return _run_catalog(args, MemoryAttacks, "Memory Attacks")
 
 
 def run_all_tests(args) -> int:
@@ -1015,7 +916,8 @@ def _cmd_workflow(argv: List[str]) -> int:
     """
     try:
         from . import workflows as wf
-        from .scapy_dicom import DICOMSocket, DEFAULT_TRANSFER_SYNTAX_UID
+        from .client import DICOMSocket
+        from .scapy_dicom import DEFAULT_TRANSFER_SYNTAX_UID
     except Exception as e:  # pragma: no cover - scapy is a hard dependency
         print(f"ERROR: workflows require scapy: {e}")
         return 1

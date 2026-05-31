@@ -32,7 +32,8 @@ flowchart TD
         CORRUPTOR[corruptor.py]
         PIXEL[pixel.py]
         FILE[file.py]
-        SCAPY[scapy_dicom.py - PDUs/DIMSE + DICOMSocket]
+        SCAPY[scapy_dicom.py - PDUs/DIMSE wire-format layer]
+        CLIENT[client.py - DICOMSocket SCU client]
     end
 
     CATALOG[attacks.py - static attack catalog + seed generators]
@@ -63,7 +64,8 @@ flowchart TD
     CRAFT --> CATALOG
     CATALOG -->|live delivery| DELIVER
     CATALOG -->|seed corpus| AFL
-    ISSUER -->|acts as SCU| SCAPY
+    ISSUER -->|acts as SCU| CLIENT
+    CLIENT --> SCAPY
     RESPONDER -->|acts as SCP| SERVER
     DELIVER --> MONITOR
     AFL --> GB

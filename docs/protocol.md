@@ -56,8 +56,8 @@ Each layer of the DICOM stack has corresponding C-SCARE modules for testing:
 │                                  │                                                  │
 ├──────────────────────────────────┼──────────────────────────────────────────────────┤
 │                                  │                                                  │
-│  Transport Layer                 │  scapy_dicom.py (DICOMSocket)                    │
-│    TCP segments                  │    Client with full Scapy integration            │
+│  Transport Layer                 │  client.py (DICOMSocket)                         │
+│    TCP segments                  │    SCU client built on the scapy_dicom layer     │
 │                                  │  server.py (RawSCP)                              │
 │                                  │    Rogue server for fuzzing DICOM clients        │
 │                                  │    State machine hooks, response injection       │
@@ -73,8 +73,9 @@ Quick reference for which tool to use:
 | Data element VR / length / value| `element.py`        | `Element.raw()`, `Dataset`              |
 | Existing DICOM file corruption  | `corruptor.py`      | `Corruptor`                             |
 | Encapsulated pixel data         | `pixel.py`          | `EncapsulatedPixelData`, `PixelFuzzer`  |
-| Association negotiation         | `scapy_dicom.py`    | `A_ASSOCIATE_RQ`, `DICOMSocket`         |
+| Association negotiation (PDU)   | `scapy_dicom.py`    | `A_ASSOCIATE_RQ`                        |
 | DIMSE commands                  | `scapy_dicom.py`    | `C_ECHO_RQ`, `C_STORE_RQ`, `N_GET_RQ`  |
+| SCU client / session            | `client.py`         | `DICOMSocket`                           |
 | State machine violations        | `attacks.py`        | `StateMachineAttacks`                   |
 | Client-side fuzzing             | `server.py`         | `RawSCP`                                |
 | CVE reproductions               | `attacks.py`        | `CVEAttacks`                            |

@@ -34,6 +34,7 @@ from .scapy_dicom import (
     DICOMSCPSCURoleSelection,
     C_ECHO_RSP, C_STORE_RQ, C_STORE_RSP, C_FIND_RSP, C_MOVE_RSP, C_GET_RSP,
     parse_dimse_command_us, parse_dimse_status,
+    decode_uid, iter_variable_items, iter_user_info_subitems,
     _uid_to_bytes,
     IMPLEMENTATION_CLASS_UID, DEFAULT_TRANSFER_SYNTAX_UID,
     IMPLICIT_VR_LITTLE_ENDIAN_UID, CT_IMAGE_STORAGE_SOP_CLASS_UID,
@@ -77,17 +78,15 @@ def _parse_rq(rq_bytes):
 
 def _proposed_contexts(rq):
     """Yield ``(context_id, [transfer_syntax_uid, ...])`` from an RQ."""
-    for item in rq.variable_items:
-        if item.item_type != 0x20:
-            continue
+    for item in iter_variable_items(rq, 0x20):
         try:
             pctx = item.payload
             cid = pctx.context_id
-            ts_uids = []
-            for sub in pctx.sub_items:
-                if sub.item_type == 0x40 and sub.haslayer(DICOMTransferSyntax):
-                    ts = sub[DICOMTransferSyntax].uid
-                    ts_uids.append(ts.rstrip(b"\x00").decode("ascii", "replace"))
+            ts_uids = [
+                decode_uid(sub[DICOMTransferSyntax].uid)
+                for sub in pctx.sub_items
+                if sub.item_type == 0x40 and sub.haslayer(DICOMTransferSyntax)
+            ]
             yield cid, ts_uids
         except Exception:
             continue
@@ -102,9 +101,7 @@ def parse_proposed_contexts(rq_bytes):
     rq = _parse_rq(rq_bytes)
     if rq is None:
         return out
-    for item in rq.variable_items:
-        if item.item_type != 0x20:
-            continue
+    for item in iter_variable_items(rq, 0x20):
         try:
             pctx = item.payload
             cid = pctx.context_id
@@ -112,11 +109,9 @@ def parse_proposed_contexts(rq_bytes):
             ts_uids = []
             for sub in pctx.sub_items:
                 if sub.item_type == 0x30 and sub.haslayer(DICOMAbstractSyntax):
-                    abs_uid = sub[DICOMAbstractSyntax].uid.rstrip(b"\x00").decode(
-                        "ascii", "replace")
+                    abs_uid = decode_uid(sub[DICOMAbstractSyntax].uid)
                 elif sub.item_type == 0x40 and sub.haslayer(DICOMTransferSyntax):
-                    ts_uids.append(sub[DICOMTransferSyntax].uid.rstrip(
-                        b"\x00").decode("ascii", "replace"))
+                    ts_uids.append(decode_uid(sub[DICOMTransferSyntax].uid))
             if abs_uid:
                 out[abs_uid] = (cid, ts_uids)
         except Exception:
@@ -134,16 +129,10 @@ def parse_proposed_roles(rq_bytes):
     rq = _parse_rq(rq_bytes)
     if rq is None:
         return out
-    for item in rq.variable_items:
-        if item.item_type != 0x50 or not item.haslayer(DICOMUserInformation):
-            continue
-        for sub in item[DICOMUserInformation].sub_items:
-            if sub.item_type == 0x54 and sub.haslayer(DICOMSCPSCURoleSelection):
-                role = sub[DICOMSCPSCURoleSelection]
-                uid = role.sop_class_uid
-                if isinstance(uid, bytes):
-                    uid = uid.rstrip(b"\x00").decode("ascii", "replace")
-                out[uid] = (int(role.scu_role), int(role.scp_role))
+    for sub in iter_user_info_subitems(rq, 0x54, DICOMSCPSCURoleSelection):
+        role = sub[DICOMSCPSCURoleSelection]
+        out[decode_uid(role.sop_class_uid)] = (
+            int(role.scu_role), int(role.scp_role))
     return out
 
 
@@ -157,18 +146,14 @@ def parse_user_identity(rq_bytes):
     rq = _parse_rq(rq_bytes)
     if rq is None:
         return None
-    for item in rq.variable_items:
-        if item.item_type != 0x50 or not item.haslayer(DICOMUserInformation):
-            continue
-        for sub in item[DICOMUserInformation].sub_items:
-            if sub.item_type == 0x58 and sub.haslayer(DICOMUserIdentity):
-                ui = sub[DICOMUserIdentity]
-                return {
-                    "type": ui.user_identity_type,
-                    "primary": bytes(ui.getfieldval("primary_field")),
-                    "secondary": bytes(ui.getfieldval("secondary_field") or b""),
-                    "positive_response_requested": ui.positive_response_requested,
-                }
+    for sub in iter_user_info_subitems(rq, 0x58, DICOMUserIdentity):
+        ui = sub[DICOMUserIdentity]
+        return {
+            "type": ui.user_identity_type,
+            "primary": bytes(ui.getfieldval("primary_field")),
+            "secondary": bytes(ui.getfieldval("secondary_field") or b""),
+            "positive_response_requested": ui.positive_response_requested,
+        }
     return None
 
 

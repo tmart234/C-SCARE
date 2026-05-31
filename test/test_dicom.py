@@ -86,8 +86,6 @@ from c_scare.scapy_dicom import (
     N_CREATE_RSP,
     N_DELETE_RQ,
     N_DELETE_RSP,
-    # Session management
-    DICOMSocket,
     # Helpers
     build_presentation_context_rq,
     build_user_information,
@@ -119,6 +117,7 @@ from c_scare.scapy_dicom import (
     _uid_to_bytes,
     _uid_to_bytes_raw,
 )
+from c_scare.client import DICOMSocket
 
 
 # =============================================================================
@@ -1641,7 +1640,7 @@ class TestRoleNegotiation:
         assert 0x54 not in sub_types
 
     def test_parse_negotiated_roles_reads_ac_echo(self):
-        from c_scare.scapy_dicom import DICOMSocket
+        from c_scare.client import DICOMSocket
         # Build an AC carrying an echoed 0x54 role item inside User Information.
         ui = build_user_information(roles={"1.2.840.10008.5.1.4.1.1.7": (0, 1)})
         ac = DICOM() / A_ASSOCIATE_AC(

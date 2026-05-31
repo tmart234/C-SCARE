@@ -58,9 +58,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 import random
 import struct
-import socket
 import os
-import time
 
 from .element import Element, Dataset, Tag, VR
 from .corruptor import Corruptor, Override, Injection, InjectionPoint
@@ -1056,6 +1054,34 @@ class LogicAttacks:
 
 
 # =============================================================================
+# Shared helpers for the storescp-filename injection catalogs
+# (CommandInjectionAttacks / PathTraversalAttacks operate on the same small,
+#  storable image object and the same ``(id, value, note)`` payload tables.)
+# =============================================================================
+
+def _injection_base_dataset() -> Dataset:
+    """A small, storable image object carrying placeholder identifiers."""
+    ds = Dataset()
+    ds = ds / Element(0x0008, 0x0016, 'UI', SECONDARY_CAPTURE_SOP_CLASS_UID)
+    ds = ds / Element(0x0008, 0x0018, 'UI', '1.2.3.4.5')      # SOP Instance UID
+    ds = ds / Element(0x0008, 0x0060, 'CS', 'OT')             # Modality
+    ds = ds / Element(0x0010, 0x0010, 'PN', 'Doe^John')       # Patient Name
+    ds = ds / Element(0x0010, 0x0020, 'LO', '12345')          # Patient ID
+    ds = ds / Element(0x0020, 0x000D, 'UI', '1.2.3.4.5.1')    # Study Instance UID
+    ds = ds / Element(0x0020, 0x000E, 'UI', '1.2.3.4.5.2')    # Series Instance UID
+    return ds
+
+
+def _payload_lookup(payloads, payload_id: str, kind: str) -> Tuple[str, str]:
+    """Return ``(value, description)`` for ``payload_id`` from an ``(id, value,
+    note)`` table, raising a ``kind``-labelled error when it is unknown."""
+    for pid, value, note in payloads:
+        if pid == payload_id:
+            return value, note
+    raise ValueError(f'unknown {kind} id: {payload_id!r}')
+
+
+# =============================================================================
 # Command Injection Attacks - shell metacharacters in storescp exec placeholders
 # =============================================================================
 
@@ -1107,30 +1133,14 @@ class CommandInjectionAttacks:
     @classmethod
     def _lookup(cls, payload_id: str) -> Tuple[str, str]:
         """Return (suffix, description) for a shell payload id."""
-        for pid, suffix, note in cls._SHELL_PAYLOADS:
-            if pid == payload_id:
-                return suffix, note
-        raise ValueError(f'unknown shell payload id: {payload_id!r}')
-
-    @staticmethod
-    def _base_dataset() -> Dataset:
-        """A small, storable image object carrying placeholder identifiers."""
-        ds = Dataset()
-        ds = ds / Element(0x0008, 0x0016, 'UI', SECONDARY_CAPTURE_SOP_CLASS_UID)
-        ds = ds / Element(0x0008, 0x0018, 'UI', '1.2.3.4.5')      # SOP Instance UID
-        ds = ds / Element(0x0008, 0x0060, 'CS', 'OT')             # Modality
-        ds = ds / Element(0x0010, 0x0010, 'PN', 'Doe^John')       # Patient Name
-        ds = ds / Element(0x0010, 0x0020, 'LO', '12345')          # Patient ID
-        ds = ds / Element(0x0020, 0x000D, 'UI', '1.2.3.4.5.1')    # Study Instance UID
-        ds = ds / Element(0x0020, 0x000E, 'UI', '1.2.3.4.5.2')    # Series Instance UID
-        return ds
+        return _payload_lookup(cls._SHELL_PAYLOADS, payload_id, 'shell payload')
 
     @classmethod
     def sop_instance_uid_injection(cls, payload_id: str = 'semicolon') -> AttackResult:
         """Shell metacharacters in SOP Instance UID - storescp #f placeholder."""
         suffix, note = cls._lookup(payload_id)
         malicious = '1.2.3.4.5' + suffix
-        ds = cls._base_dataset()
+        ds = _injection_base_dataset()
         ds[0x00080018] = Element(0x0008, 0x0018, 'UI', malicious)
         return AttackResult(
             name=f'cmd_injection_sop_uid_{payload_id}',
@@ -1160,7 +1170,7 @@ class CommandInjectionAttacks:
         """
         suffix, note = cls._lookup(payload_id)
         malicious = '1.2.3.4.5.1' + suffix
-        ds = cls._base_dataset()
+        ds = _injection_base_dataset()
         ds[0x0020000D] = Element(0x0020, 0x000D, 'UI', malicious)
         return AttackResult(
             name=f'cmd_injection_study_uid_{payload_id}',
@@ -1190,7 +1200,7 @@ class CommandInjectionAttacks:
         """
         suffix, note = cls._lookup(payload_id)
         malicious = 'Doe^John' + suffix
-        ds = cls._base_dataset()
+        ds = _injection_base_dataset()
         ds[0x00100010] = Element(0x0010, 0x0010, 'PN', malicious)
         return AttackResult(
             name=f'cmd_injection_patient_name_{payload_id}',
@@ -1275,29 +1285,13 @@ class PathTraversalAttacks:
     @classmethod
     def _lookup(cls, payload_id: str) -> Tuple[str, str]:
         """Return (traversal value, description) for a payload id."""
-        for pid, value, note in cls._TRAVERSAL_PAYLOADS:
-            if pid == payload_id:
-                return value, note
-        raise ValueError(f'unknown traversal payload id: {payload_id!r}')
-
-    @staticmethod
-    def _base_dataset() -> Dataset:
-        """A small, storable image object carrying placeholder identifiers."""
-        ds = Dataset()
-        ds = ds / Element(0x0008, 0x0016, 'UI', SECONDARY_CAPTURE_SOP_CLASS_UID)
-        ds = ds / Element(0x0008, 0x0018, 'UI', '1.2.3.4.5')      # SOP Instance UID
-        ds = ds / Element(0x0008, 0x0060, 'CS', 'OT')             # Modality
-        ds = ds / Element(0x0010, 0x0010, 'PN', 'Doe^John')       # Patient Name
-        ds = ds / Element(0x0010, 0x0020, 'LO', '12345')          # Patient ID
-        ds = ds / Element(0x0020, 0x000D, 'UI', '1.2.3.4.5.1')    # Study Instance UID
-        ds = ds / Element(0x0020, 0x000E, 'UI', '1.2.3.4.5.2')    # Series Instance UID
-        return ds
+        return _payload_lookup(cls._TRAVERSAL_PAYLOADS, payload_id, 'traversal payload')
 
     @classmethod
     def sop_instance_uid_traversal(cls, payload_id: str = 'posix') -> AttackResult:
         """Path traversal in SOP Instance UID - drives the received file name."""
         value, note = cls._lookup(payload_id)
-        ds = cls._base_dataset()
+        ds = _injection_base_dataset()
         ds[0x00080018] = Element(0x0008, 0x0018, 'UI', value)
         return AttackResult(
             name=f'path_traversal_sop_uid_{payload_id}',
@@ -1322,7 +1316,7 @@ class PathTraversalAttacks:
         Reached when storescp runs with --sort-on-study-uid (-su).
         """
         value, note = cls._lookup(payload_id)
-        ds = cls._base_dataset()
+        ds = _injection_base_dataset()
         ds[0x0020000D] = Element(0x0020, 0x000D, 'UI', value)
         return AttackResult(
             name=f'path_traversal_study_uid_{payload_id}',
@@ -1348,7 +1342,7 @@ class PathTraversalAttacks:
         Reached when storescp runs with --sort-on-patientname (-sp).
         """
         value, note = cls._lookup(payload_id)
-        ds = cls._base_dataset()
+        ds = _injection_base_dataset()
         ds[0x00100010] = Element(0x0010, 0x0010, 'PN', value)
         return AttackResult(
             name=f'path_traversal_patient_name_{payload_id}',
@@ -2069,7 +2063,7 @@ class TargetedSeedGenerator:
                     yield AttackResult(
                         name=f'vr_fuzz_{tag}_{invalid_vr}',
                         category='targeted',
-                        payload=c.to_bytes(),
+                        payload=c.encode(),
                         description=f'Tag {tag} VR changed from {vr} to {invalid_vr}',
                         expected_behavior='Parser should handle gracefully',
                         metadata={'tag': tag, 'original_vr': vr, 'fuzzed_vr': invalid_vr}
@@ -2087,7 +2081,7 @@ class TargetedSeedGenerator:
                 yield AttackResult(
                     name=f'length_fuzz_{tag}_{length:#x}',
                     category='targeted',
-                    payload=c.to_bytes(),
+                    payload=c.encode(),
                     description=f'Tag {tag} length set to {length:#x}',
                     expected_behavior='Parser should detect length issues',
                     metadata={'tag': tag, 'fuzzed_length': length}
@@ -2102,12 +2096,12 @@ class TargetedSeedGenerator:
         for val in [0, 1, 0xFFFF]:
             c = Corruptor(self.source)
             if (0x0028, 0x0010) in self.source:
-                c.override((0x0028, 0x0010), struct.pack('<H', val))
-            
+                c.set_raw_value((0x0028, 0x0010), struct.pack('<H', val))
+
             yield AttackResult(
                 name=f'pixel_rows_{val}',
                 category='targeted',
-                payload=c.to_bytes(),
+                payload=c.encode(),
                 description=f'Rows set to {val}',
                 expected_behavior='Parser should validate dimensions',
                 metadata={'rows': val}

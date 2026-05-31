@@ -105,7 +105,6 @@ from .scapy_dicom import (
     N_DELETE_RQ,
     N_DELETE_RSP,
     # Utilities
-    DICOMSocket,
     parse_dimse_status,
     parse_dimse_command_us,
     parse_dimse_command_field,
@@ -158,6 +157,9 @@ from .pixel import (
     Fragment, EncapsulatedPixelData, PixelData, PixelFuzzer,
     extract_frames, extract_frames_from_file,
 )
+
+# DICOM SCU client/session (stateful association + DIMSE over scapy_dicom)
+from .client import DICOMSocket
 
 # Rogue SCP (SCU / client fuzzing) and raw network delivery
 from .server import RawSCP, ConnectionState, Connection

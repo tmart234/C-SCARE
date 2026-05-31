@@ -157,8 +157,7 @@ class Corruptor:
         self._sequence_overrides: Dict[str, Override] = {}  # path_string -> Override
         self._injections: List[Injection] = []
         self._deletions: Set[int] = set()
-        self._duplicates: List[int] = []
-        self._duplicate_positions: Dict[int, str] = {}  # tag -> 'before'|'after'|'end'
+        self._duplicates: Dict[int, str] = {}  # tag_int -> 'before'|'after'|'end'
         self._reorder: Optional[List[int]] = None
         self._append_raw: bytes = b''  # Raw bytes to append at end
         
@@ -232,6 +231,19 @@ class Corruptor:
         if tag not in self._overrides:
             self._overrides[tag] = Override()
         return self._overrides[tag]
+
+    def _get_sequence_override(self, path: str) -> Override:
+        """Get or create override for a sequence-element path string."""
+        if path not in self._sequence_overrides:
+            self._sequence_overrides[path] = Override()
+        return self._sequence_overrides[path]
+
+    @staticmethod
+    def _seq_path(seq_tag, item_index: int, elem_tag) -> str:
+        """Build the path string keying a nested sequence element's override."""
+        return SequencePath(
+            Tag(seq_tag).tuple, item_index, Tag(elem_tag).tuple
+        ).to_path_string()
     
     # =========================================================================
     # Top-level Modification API
@@ -335,37 +347,22 @@ class Corruptor:
             elem_tag: Element tag within the item
             vr: New VR
         """
-        path = SequencePath(
-            Tag(seq_tag).tuple, item_index, Tag(elem_tag).tuple
-        ).to_path_string()
-        
-        if path not in self._sequence_overrides:
-            self._sequence_overrides[path] = Override()
-        self._sequence_overrides[path].vr = vr
+        self._get_sequence_override(
+            self._seq_path(seq_tag, item_index, elem_tag)).vr = vr
         return self
     
     def set_length_in_sequence(self, seq_tag, item_index: int, elem_tag, 
                                length: int) -> 'Corruptor':
         """Override length for element inside a sequence."""
-        path = SequencePath(
-            Tag(seq_tag).tuple, item_index, Tag(elem_tag).tuple
-        ).to_path_string()
-        
-        if path not in self._sequence_overrides:
-            self._sequence_overrides[path] = Override()
-        self._sequence_overrides[path].length = length
+        self._get_sequence_override(
+            self._seq_path(seq_tag, item_index, elem_tag)).length = length
         return self
     
     def set_value_in_sequence(self, seq_tag, item_index: int, elem_tag,
                               value: Any) -> 'Corruptor':
         """Override value for element inside a sequence."""
-        path = SequencePath(
-            Tag(seq_tag).tuple, item_index, Tag(elem_tag).tuple
-        ).to_path_string()
-        
-        if path not in self._sequence_overrides:
-            self._sequence_overrides[path] = Override()
-        self._sequence_overrides[path].value = value
+        self._get_sequence_override(
+            self._seq_path(seq_tag, item_index, elem_tag)).value = value
         return self
     
     # =========================================================================
@@ -424,9 +421,7 @@ class Corruptor:
             tag: Tag to duplicate
             position: 'end' (default), 'before', or 'after' the original
         """
-        tag_int = Tag(tag).as_int
-        self._duplicates.append(tag_int)
-        self._duplicate_positions[tag_int] = position
+        self._duplicates[Tag(tag).as_int] = position
         return self
     
     def reorder(self, tags: List) -> 'Corruptor':
@@ -453,7 +448,6 @@ class Corruptor:
         self._injections.clear()
         self._deletions.clear()
         self._duplicates.clear()
-        self._duplicate_positions.clear()
         self._reorder = None
         self._append_raw = b''
         return self
@@ -785,7 +779,7 @@ class Corruptor:
             element_cache[tag_int] = (elem, is_pydicom)
             
             # Duplicate before (if requested)
-            if tag_int in self._duplicates and self._duplicate_positions.get(tag_int) == 'before':
+            if self._duplicates.get(tag_int) == 'before':
                 if is_pydicom:
                     bio.write(self._encode_element_from_pydicom(tag_int, elem, implicit_vr, little_endian))
                 else:
@@ -805,7 +799,7 @@ class Corruptor:
                     bio.write(self._encode_element_from_ours(elem, implicit_vr, little_endian))
             
             # Duplicate after (if requested)
-            if tag_int in self._duplicates and self._duplicate_positions.get(tag_int) == 'after':
+            if self._duplicates.get(tag_int) == 'after':
                 if is_pydicom:
                     bio.write(self._encode_element_from_pydicom(tag_int, elem, implicit_vr, little_endian))
                 else:
@@ -816,8 +810,8 @@ class Corruptor:
                 bio.write(data)
         
         # Duplicates at end (default)
-        for tag_int in self._duplicates:
-            if self._duplicate_positions.get(tag_int, 'end') == 'end':
+        for tag_int, pos in self._duplicates.items():
+            if pos == 'end':
                 if tag_int in element_cache:
                     elem, is_pydicom = element_cache[tag_int]
                     if is_pydicom:
@@ -923,8 +917,7 @@ class Corruptor:
         
         if self._duplicates:
             print("\nDuplicates:")
-            for tag_int in self._duplicates:
-                pos = self._duplicate_positions.get(tag_int, 'end')
+            for tag_int, pos in self._duplicates.items():
                 print(f"  {Tag(tag_int)} ({pos})")
         
         if self._reorder:
