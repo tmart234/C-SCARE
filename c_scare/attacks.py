@@ -71,7 +71,7 @@ try:
         DICOM, A_ASSOCIATE_RQ, A_ASSOCIATE_AC, A_ASSOCIATE_RJ,
         P_DATA_TF, A_RELEASE_RQ, A_RELEASE_RP, A_ABORT,
         C_ECHO_RQ, C_ECHO_RSP, C_STORE_RQ, C_FIND_RQ, C_MOVE_RQ,
-        PresentationDataValueItem, DICOMSocket,
+        PresentationDataValueItem, DICOMSession,
         DICOMVariableItem, DICOMApplicationContext, DICOMUserInformation,
         DICOMPresentationContextRQ, DICOMAbstractSyntax, DICOMTransferSyntax,
         DICOMMaximumLength, DICOMImplementationClassUID,

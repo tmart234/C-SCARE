@@ -159,7 +159,7 @@ from .pixel import (
 )
 
 # DICOM SCU client/session (stateful association + DIMSE over scapy_dicom)
-from .client import DICOMSocket
+from .client import DICOMSession
 
 # Rogue SCP (SCU / client fuzzing) and raw network delivery
 from .server import RawSCP, ConnectionState, Connection
@@ -283,6 +283,7 @@ __all__ = [
     "N_DELETE_RSP",
     # Utilities
     "DICOMSocket",
+    "DICOMSession",
     "parse_dimse_status",
     "parse_dimse_command_us",
     "parse_dimse_command_field",

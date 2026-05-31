@@ -1,13 +1,15 @@
 """
 DICOM client / association session.
 
-``DICOMSocket`` is C-SCARE's stateful SCU client: it opens the TCP connection,
-drives A-ASSOCIATE negotiation, issues DIMSE-C/N operations (C-ECHO/STORE/
-FIND/GET/MOVE), and parses the peer's responses. It builds on the pure
-wire-format layer in :mod:`c_scare.scapy_dicom` (the declarative Scapy
-``Packet`` definitions, which are upstreamable as a Scapy contrib module) and is
-the part that *cannot* live in Scapy: it holds connection state and does socket
-I/O.
+``DICOMSession`` is C-SCARE's stateful SCU client: it drives A-ASSOCIATE
+negotiation, issues DIMSE-C/N operations (C-ECHO/STORE/FIND/GET/MOVE), and
+parses the peer's responses. It is the part that holds *association* state.
+
+Transport (the TCP connection + DICOM PDU framing) is delegated to
+:class:`c_scare.scapy_dicom.DICOMSocket` - the reusable Scapy ``StreamSocket``
+subclass that lives in the wire-format layer so fuzzers, scanners and the rogue
+SCP can share it. ``DICOMSession`` builds the association/DIMSE state machine on
+top of that socket rather than re-implementing PDU I/O.
 
 ``classify_reject`` / ``reject_is_called_aet_unrecognized`` interpret an
 A-ASSOCIATE-RJ into pentest-recon semantics (distinguishing a wrong Called AE
@@ -22,10 +24,10 @@ import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from scapy.packet import Packet
-from scapy.supersocket import StreamSocket
 
-# The DICOM wire-format layer. DICOMSocket consumes a broad slice of it (PDUs,
-# DIMSE classes, UID/status constants, builders), so import it wholesale.
+# The DICOM wire-format layer. DICOMSession consumes a broad slice of it (PDUs,
+# DIMSE classes, UID/status constants, builders, and the DICOMSocket transport),
+# so import it wholesale.
 from .scapy_dicom import *  # noqa: F401,F403
 # Internal dissection helpers that are intentionally not part of
 # scapy_dicom.__all__ but are used by the response parsers below.
@@ -68,8 +70,12 @@ def reject_is_called_aet_unrecognized(reject):
     return bool(reject) and reject.get("source") == 1 and reject.get("reason") == 7
 
 
-class DICOMSocket:
-    """DICOM application-layer socket for associations and DIMSE operations."""
+class DICOMSession:
+    """Stateful DICOM SCU: association negotiation + DIMSE operations.
+
+    Transport is delegated to :class:`~c_scare.scapy_dicom.DICOMSocket`; this
+    class only adds the association / DIMSE state machine on top.
+    """
 
     def __init__(self, dst_ip, dst_port, dst_ae, src_ae="SCAPY_SCU", read_timeout=10):
         # type: (str, int, str, str, int) -> None
@@ -78,7 +84,7 @@ class DICOMSocket:
         self.dst_ae = dst_ae
         self.src_ae = src_ae
         self.sock = None  # type: Optional[socket.socket]
-        self.stream = None  # type: Optional[StreamSocket]
+        self.stream = None  # type: Optional[DICOMSocket]
         self.assoc_established = False
         self.accepted_contexts = {}  # type: Dict[int, Tuple[str, str]]
         self.read_timeout = read_timeout
@@ -97,7 +103,7 @@ class DICOMSocket:
         self.negotiated_roles = {}  # type: Dict[str, Tuple[int, int]]
 
     def __enter__(self):
-        # type: () -> DICOMSocket
+        # type: () -> DICOMSession
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -113,11 +119,11 @@ class DICOMSocket:
     def connect(self):
         # type: () -> bool
         try:
-            self.sock = socket.create_connection(
-                (self.dst_ip, self.dst_port),
-                timeout=self.read_timeout,
+            # Delegate the TCP connection + PDU framing to the shared transport.
+            self.stream = DICOMSocket.connect(
+                self.dst_ip, self.dst_port, timeout=self.read_timeout,
             )
-            self.stream = StreamSocket(self.sock, basecls=DICOM)
+            self.sock = self.stream.ins
             return True
         except (socket.error, socket.timeout, OSError) as e:
             log.error("Connection failed: %s", e)

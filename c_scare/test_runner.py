@@ -911,12 +911,12 @@ def _parse_tag(text: str):
 def _cmd_workflow(argv: List[str]) -> int:
     """`wf` subcommand: SCU-side attack workflows (issuer drivers).
 
-    Shares DICOMSocket with the black-box DAST path; use these to recon / brute
+    Shares DICOMSession with the black-box DAST path; use these to recon / brute
     a target and to feed discovered AE titles or credentials into a DAST run.
     """
     try:
         from . import workflows as wf
-        from .client import DICOMSocket
+        from .client import DICOMSession
         from .scapy_dicom import DEFAULT_TRANSFER_SYNTAX_UID
     except Exception as e:  # pragma: no cover - scapy is a hard dependency
         print(f"ERROR: workflows require scapy: {e}")
@@ -1059,7 +1059,7 @@ def _cmd_workflow(argv: List[str]) -> int:
                            match_keys=match_keys)
     find_uid, get_uid, move_uid = wf.QR_MODELS[a.model]
 
-    with DICOMSocket(a.ip, a.port, a.ae_title, a.calling_ae,
+    with DICOMSession(a.ip, a.port, a.ae_title, a.calling_ae,
                      read_timeout=a.timeout) as sock:
         if a.wfcmd == 'find':
             if not sock.associate({find_uid: [DEFAULT_TRANSFER_SYNTAX_UID]}):

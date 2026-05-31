@@ -68,14 +68,14 @@ def send_cstore(target: Tuple[str, int],
     """
     try:
         from .scapy_dicom import (
-            DICOMSocket, DEFAULT_TRANSFER_SYNTAX_UID,
+            DICOMSession, DEFAULT_TRANSFER_SYNTAX_UID,
         )
     except ImportError:
         return None
 
     ts = transfer_syntax or DEFAULT_TRANSFER_SYNTAX_UID
     try:
-        with DICOMSocket(target[0], target[1], 'TARGET', 'ATTACKER') as sock:
+        with DICOMSession(target[0], target[1], 'TARGET', 'ATTACKER') as sock:
             if not sock.associate({sop_class_uid: [ts]}, user_identity=user_identity):
                 return None
             return sock.c_store(payload, sop_class_uid, sop_instance_uid, ts)

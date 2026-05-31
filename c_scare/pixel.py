@@ -703,7 +703,7 @@ class PixelFuzzer:
         2. Frame: Wrap frames in Scapy DICOMFragment / BasicOffsetTable layers
         3. Fuzz:  Let Scapy's fuzz() mutate BOT pointers, fragment lengths,
                   or drop the Sequence Delimiter entirely
-        4. Yield: Return raw bytes ready to send via DICOMSocket
+        4. Yield: Return raw bytes ready to send via DICOMSession
 
     This keeps the architecture lean: pydicom harvests valid payload seeds,
     Scapy dynamically generates the vulnerable offset framing around them.

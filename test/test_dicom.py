@@ -5,7 +5,7 @@ Tests the current architecture:
 - DICOMElementField-based DIMSE fields with TLV encoding
 - DICOMAETitleField with automatic space-padding
 - DIMSEPacket base class with post_build group length calculation
-- DICOMSocket for session management
+- DICOMSession for session management
 - Native Scapy field patterns (StrLenField, PacketListField, etc.)
 - DIMSE-N commands (PS3.7 Section 10.3)
 - Transfer Syntax UIDs (PS3.5 Annex A)
@@ -117,7 +117,7 @@ from c_scare.scapy_dicom import (
     _uid_to_bytes,
     _uid_to_bytes_raw,
 )
-from c_scare.client import DICOMSocket
+from c_scare.client import DICOMSession
 
 
 # =============================================================================
@@ -1431,15 +1431,15 @@ class TestEdgeCases:
 
 
 # =============================================================================
-# Test DICOMSocket
+# Test DICOMSession
 # =============================================================================
 
 class TestDICOMSocket:
-    """Test DICOMSocket class structure (no network required)."""
+    """Test DICOMSession class structure (no network required)."""
 
     def test_dicom_socket_init(self):
-        """DICOMSocket should initialize with required parameters."""
-        sock = DICOMSocket(
+        """DICOMSession should initialize with required parameters."""
+        sock = DICOMSession(
             dst_ip="127.0.0.1",
             dst_port=104,
             dst_ae="TEST_SCP",
@@ -1453,8 +1453,8 @@ class TestDICOMSocket:
         assert sock.assoc_established is False
 
     def test_dicom_socket_has_required_methods(self):
-        """DICOMSocket should have standard API methods."""
-        sock = DICOMSocket("127.0.0.1", 104, "TEST")
+        """DICOMSession should have standard API methods."""
+        sock = DICOMSession("127.0.0.1", 104, "TEST")
 
         assert hasattr(sock, 'connect')
         assert hasattr(sock, 'associate')
@@ -1468,8 +1468,8 @@ class TestDICOMSocket:
         assert hasattr(sock, 'send_raw_bytes')
 
     def test_dicom_socket_context_manager(self):
-        """DICOMSocket should support context manager protocol."""
-        sock = DICOMSocket("127.0.0.1", 104, "TEST")
+        """DICOMSession should support context manager protocol."""
+        sock = DICOMSession("127.0.0.1", 104, "TEST")
 
         assert hasattr(sock, '__enter__')
         assert hasattr(sock, '__exit__')
@@ -1616,7 +1616,7 @@ def test_c_echo_integration(scp_ip, scp_port, scp_ae, my_ae, timeout):
 
 class TestRoleNegotiation:
     """build_user_information emits 0x54 role items inside the 0x50 User
-    Information item, and DICOMSocket._parse_negotiated_roles reads them back
+    Information item, and DICOMSession._parse_negotiated_roles reads them back
     out of an AC."""
 
     def test_build_user_information_includes_roles(self):
@@ -1640,11 +1640,11 @@ class TestRoleNegotiation:
         assert 0x54 not in sub_types
 
     def test_parse_negotiated_roles_reads_ac_echo(self):
-        from c_scare.client import DICOMSocket
+        from c_scare.client import DICOMSession
         # Build an AC carrying an echoed 0x54 role item inside User Information.
         ui = build_user_information(roles={"1.2.840.10008.5.1.4.1.1.7": (0, 1)})
         ac = DICOM() / A_ASSOCIATE_AC(
             variable_items=[DICOMVariableItem() / DICOMApplicationContext(), ui])
-        sock = DICOMSocket("127.0.0.1", 11112, "X", "Y")
+        sock = DICOMSession("127.0.0.1", 11112, "X", "Y")
         sock._parse_negotiated_roles(ac)
         assert sock.negotiated_roles.get("1.2.840.10008.5.1.4.1.1.7") == (0, 1)

@@ -3,8 +3,8 @@
 DICOM attack workflows — SCU-side (issuer) drivers.
 
 These are the operational *flows* that turn the DIMSE packet classes and
-``DICOMSocket`` into a usable recon -> brute -> query -> retrieve -> pivot
-walkthrough. They are deliberately built on top of ``DICOMSocket`` (the same
+``DICOMSession`` into a usable recon -> brute -> query -> retrieve -> pivot
+walkthrough. They are deliberately built on top of ``DICOMSession`` (the same
 socket the black-box DAST path uses via ``deliver.send_cstore``) rather than a
 parallel transport, so there is one association/DIMSE implementation.
 
@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .element import Dataset, Element
 from .client import (
-    DICOMSocket,
+    DICOMSession,
     classify_reject,
     reject_is_called_aet_unrecognized,
 )
@@ -270,7 +270,7 @@ def ae_brute(ip: str, port: int, aets: Sequence[str],
 
     results: List[AETResult] = []
     for aet in aets:
-        sock = DICOMSocket(ip, port, aet, calling_ae, read_timeout=timeout)
+        sock = DICOMSession(ip, port, aet, calling_ae, read_timeout=timeout)
         try:
             ok = sock.associate(requested_contexts, user_identity=user_identity)
             if ok:
@@ -327,7 +327,7 @@ def cred_brute(ip: str, port: int, called_ae: str,
             "secondary": passcode,
             "positive_response_requested": 1,
         }
-        sock = DICOMSocket(ip, port, called_ae, calling_ae, read_timeout=timeout)
+        sock = DICOMSession(ip, port, called_ae, calling_ae, read_timeout=timeout)
         try:
             ok = sock.associate(requested_contexts, user_identity=identity)
             if ok:
