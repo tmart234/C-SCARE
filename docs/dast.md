@@ -71,7 +71,8 @@ with open("corrupted.dcm", "wb") as f:
 ### Fuzz the network protocol
 
 ```python
-from c_scare.scapy_dicom import *
+from c_scare import DICOMSocket            # SCU client (c_scare.client)
+from c_scare.scapy_dicom import *          # wire-format layer: PDUs, DIMSE, UIDs
 from scapy.packet import raw, fuzz
 
 # Fuzzed association request
