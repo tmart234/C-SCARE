@@ -16,7 +16,7 @@ C-SCARE is organised around *who* you test — a DICOM server (SCP) or a client 
 | **Instrumentation**   | None | None — works on real devices / prebuilt binaries | Required (recompiled, QEMU, or SAND) |
 | **Engine**            | C-SCARE (scapy-based) | C-SCARE (scapy-based via catalog + monitors) | AFL++ / AFLNet (C-SCARE bridges + triages) |
 | **CLI**               | `c-scare wf …` | `c-scare --ip … --category …` / `c-scare rogue …` | `c-scare greybox run / triage …` |
-| **Output**            | Classified findings → SARIF v2.1.0 | SARIF v2.1.0 | SARIF v2.1.0 |
+| **Output**            | SARIF v2.1.0 | SARIF v2.1.0 | SARIF v2.1.0 |
 | **Guide**             | [docs/workflows.md](docs/workflows.md) | [docs/dast.md](docs/dast.md) | [docs/fuzzing.md](docs/fuzzing.md) |
 
 > **Note:** C-SCARE is not a fuzzing engine — AFL++ and AFLNet own the mutation loop; C-SCARE supplies the crafting, attack catalog, rogue server, grey-box bridge, and monitors around them.
