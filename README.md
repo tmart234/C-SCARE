@@ -16,7 +16,7 @@ C-SCARE is organised around *who* you test — a DICOM server (SCP) or a client 
 | **Instrumentation**   | None | None — works on real devices / prebuilt binaries | Required (recompiled, QEMU, or SAND) |
 | **Engine**            | C-SCARE (scapy-based) | C-SCARE (scapy-based via catalog + monitors) | AFL++ / AFLNet (C-SCARE bridges + triages) |
 | **CLI**               | `c-scare wf …` | `c-scare --ip … --category …` / `c-scare rogue …` | `c-scare greybox run / triage …` |
-| **Output**            | Classified findings | SARIF v2.1.0 | SARIF v2.1.0 |
+| **Output**            | Classified findings → SARIF v2.1.0 | SARIF v2.1.0 | SARIF v2.1.0 |
 | **Guide**             | [docs/workflows.md](docs/workflows.md) | [docs/dast.md](docs/dast.md) | [docs/fuzzing.md](docs/fuzzing.md) |
 
 > **Note:** C-SCARE is not a fuzzing engine — AFL++ and AFLNet own the mutation loop; C-SCARE supplies the crafting, attack catalog, rogue server, grey-box bridge, and monitors around them.
@@ -27,28 +27,28 @@ C-SCARE is organised around *who* you test — a DICOM server (SCP) or a client 
 flowchart TD
     USER[Operator / Researcher]
 
-    subgraph CRAFT [Crafting and corruption]
-        ELEMENT[element.py]
-        CORRUPTOR[corruptor.py]
-        PIXEL[pixel.py]
-        FILE[file.py]
-        SCAPY[scapy_dicom.py - PDUs/DIMSE wire-format layer]
-        CLIENT[client.py - DICOMSession SCU client]
+    subgraph CRAFT [Crafting and corruption - malformed DICOM primitives]
+        ELEMENT[element.py - dataset/element building]
+        CORRUPTOR[corruptor.py - re-emit a real .dcm as invalid]
+        PIXEL[pixel.py - encapsulated pixel data]
+        FILE[file.py - Part 10 file handling]
+        SCAPY[scapy_dicom.py - malformed PDUs/DIMSE wire-format + DICOMSocket]
     end
 
     CATALOG[attacks.py - static attack catalog + seed generators]
+    CLIENT[client.py - DICOMSession SCU transport - shared]
 
-    subgraph BLACKBOX [Black-box / DAST]
-        DELIVER[deliver.py]
-        SERVER[server.py - RawSCP]
+    subgraph BLACKBOX [Black-box / DAST - tests both roles]
+        DELIVER[deliver.py - send the catalog at a live target]
+        SERVER[server.py - RawSCP rogue server]
     end
 
-    subgraph WORKFLOWS [Attack workflows - role-agnostic]
-        ISSUER[workflows.py - issuer: ae_brute / cred_brute / c_find / c_get / c_move - targets an SCP]
-        RESPONDER[responders.py - WorkflowResponder - targets an SCU]
+    subgraph WORKFLOWS [Pentest workflows - role-agnostic]
+        ISSUER[workflows.py - issuer: ae_brute / cred_brute / c_find / c_get / c_move]
+        RESPONDER[responders.py - WorkflowResponder]
     end
 
-    subgraph GREYBOX [Grey-box]
+    subgraph GREYBOX [Grey-box fuzzing]
         AFL[AFL++ / AFLNet engines]
         GB[greybox.py - harness + crash triage]
     end
@@ -60,17 +60,29 @@ flowchart TD
     USER --> SERVER
     USER --> WORKFLOWS
     USER --> GB
-    CATALOG --> CRAFT
+
+    %% Crafting/corruption underpins the catalog AND both wire endpoints
+    %% (the SCU transport and the rogue server) - not just one side.
     CRAFT --> CATALOG
+    CRAFT --> CLIENT
+    CRAFT --> SERVER
+
     CATALOG -->|live delivery| DELIVER
     CATALOG -->|seed corpus| AFL
-    ISSUER -->|acts as SCU| CLIENT
-    CLIENT --> SCAPY
-    RESPONDER -->|acts as SCP| SERVER
-    DELIVER --> MONITOR
+
+    %% Targeting a server (SCP): DAST delivery and issuer workflows both
+    %% drive the shared SCU transport against an SCP.
+    DELIVER -->|targets an SCP| CLIENT
+    ISSUER -->|targets an SCP| CLIENT
+
+    %% Targeting a client (SCU): the RawSCP rogue server, driven by DAST
+    %% delivery and by responder workflows.
+    RESPONDER -->|targets an SCU| SERVER
+
+    CLIENT -->|observe SCP responses| MONITOR
+    SERVER -->|observe SCU behavior| MONITOR
     AFL --> GB
     GB --> MONITOR
-    SERVER --> MONITOR
     MONITOR --> SARIF
     WORKFLOWS -->|findings| SARIF
 ```
