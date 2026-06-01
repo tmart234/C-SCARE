@@ -1175,7 +1175,7 @@ bind_layers(DICOMVariableItem, DICOMGenericItem)
 # ``variable_items`` -> (User Information) ``sub_items``. Reading them is the
 # same walk every time: filter by item_type, guard the bound layer, decode the
 # null-padded UID. These helpers centralise that idiom so the many
-# ``_parse_*`` (DICOMSocket) and ``parse_*`` (c_scare.responders) readers stay
+# ``_parse_*`` (DICOMSession) and ``parse_*`` (c_scare.responders) readers stay
 # thin instead of re-implementing the loop.
 # -------------------------------------------------------------------------
 

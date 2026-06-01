@@ -56,7 +56,7 @@ Each layer of the DICOM stack has corresponding C-SCARE modules for testing:
 │                                  │                                                  │
 ├──────────────────────────────────┼──────────────────────────────────────────────────┤
 │                                  │                                                  │
-│  Transport Layer                 │  client.py (DICOMSocket)                         │
+│  Transport Layer                 │  scapy_dicom.py (DICOMSocket transport)          │
 │    TCP segments                  │    SCU client built on the scapy_dicom layer     │
 │                                  │  server.py (RawSCP)                              │
 │                                  │    Rogue server for fuzzing DICOM clients        │
@@ -75,7 +75,8 @@ Quick reference for which tool to use:
 | Encapsulated pixel data         | `pixel.py`          | `EncapsulatedPixelData`, `PixelFuzzer`  |
 | Association negotiation (PDU)   | `scapy_dicom.py`    | `A_ASSOCIATE_RQ`                        |
 | DIMSE commands                  | `scapy_dicom.py`    | `C_ECHO_RQ`, `C_STORE_RQ`, `N_GET_RQ`  |
-| SCU client / session            | `client.py`         | `DICOMSocket`                           |
+| SCU client / session            | `client.py`         | `DICOMSession`                          |
+| Transport (TCP + PDU framing)   | `scapy_dicom.py`    | `DICOMSocket`, `read_dul_pdu`           |
 | State machine violations        | `attacks.py`        | `StateMachineAttacks`                   |
 | Client-side fuzzing             | `server.py`         | `RawSCP`                                |
 | CVE reproductions               | `attacks.py`        | `CVEAttacks`                            |

@@ -2,7 +2,7 @@
 
 The workflow drivers are scripted, multi-step DICOM exchanges — recon and
 query/retrieve flows that reach the state (a discovered AE title, a valid
-credential) a DAST run should start from. They share `DICOMSocket` with the
+credential) a DAST run should start from. They share `DICOMSession` (and its `DICOMSocket` transport) with the
 [DAST](dast.md) path and are **role-agnostic**: issuer drivers act as an SCU
 against a server, responders act as an SCP against a client.
 
@@ -14,9 +14,9 @@ C-SCARE ships **5 scripted workflows**, driven via `c-scare wf …`:
 |----|------------|----------|--------------|----------|
 | **W1** | `ae-brute` | AE-title brute force | Attempt association per Called AE Title and read each accepted AET's Application Context payload (AC UID, Implementation Class UID, Version Name) | `ae_brute()` |
 | **W2** | `cred-brute` | Credential brute force | Brute-force User Identity credentials, surfacing the `0x59` server response | `cred_brute()` |
-| **W3** | `find` | Sculpted C-FIND | Query with an exact return-key set — a key is returned only if you asked for it | `build_query()` + `DICOMSocket.c_find` |
-| **W4** | `get` | C-GET retrieval | Retrieve matched objects over the same association | `DICOMSocket.c_get` |
-| **W5** | `move` | C-MOVE pivot | Redirect matched objects to a third AE | `DICOMSocket.c_move` |
+| **W3** | `find` | Sculpted C-FIND | Query with an exact return-key set — a key is returned only if you asked for it | `build_query()` + `DICOMSession.c_find` |
+| **W4** | `get` | C-GET retrieval | Retrieve matched objects over the same association | `DICOMSession.c_get` |
+| **W5** | `move` | C-MOVE pivot | Redirect matched objects to a third AE | `DICOMSession.c_move` |
 
 `ae_brute()` and `cred_brute()` treat the AE-title and credential axes as
 **independent**: an accepted-or-rejected-for-any-other-reason association means

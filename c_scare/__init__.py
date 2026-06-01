@@ -50,6 +50,10 @@ from .scapy_dicom import (
     A_RELEASE_RP,
     A_ABORT,
     PresentationDataValueItem,
+    # Transport (reusable DICOM UL socket + framing)
+    DICOMSocket,
+    read_dul_pdu,
+    PDU_HEADER_LEN,
     # Variable Items (PS3.8 Section 9.3.2)
     DICOMVariableItem,
     DICOMApplicationContext,
@@ -158,7 +162,8 @@ from .pixel import (
     extract_frames, extract_frames_from_file,
 )
 
-# DICOM SCU client/session (stateful association + DIMSE over scapy_dicom)
+# DICOM SCU client/session: DICOMSession holds association + DIMSE state and
+# delegates transport to scapy_dicom.DICOMSocket.
 from .client import DICOMSession
 
 # Rogue SCP (SCU / client fuzzing) and raw network delivery
@@ -167,7 +172,7 @@ from .deliver import send_pdu, send_sequence, send_cstore
 
 # SCU-side attack workflows (issuer drivers): AE brute, credential brute,
 # sculpted query builder. Query/retrieve flows (c_find/c_get/c_move) live on
-# DICOMSocket; these compose them into operations.
+# DICOMSession; these compose them into operations.
 from .workflows import (
     WorkflowResult, RoleNegotiationResult, HostileObservation,
     AETResult, CredResult, QR_MODELS,
@@ -283,6 +288,8 @@ __all__ = [
     "N_DELETE_RSP",
     # Utilities
     "DICOMSocket",
+    "read_dul_pdu",
+    "PDU_HEADER_LEN",
     "DICOMSession",
     "parse_dimse_status",
     "parse_dimse_command_us",
