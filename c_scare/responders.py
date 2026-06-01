@@ -3,7 +3,7 @@
 DICOM attack workflows — SCP-side (responder) drivers.
 
 The responder half of each workflow: act as an SCP to exercise a *client*
-(SCU). Where the issuer drivers (workflows.py) drive ``DICOMSocket`` to test a
+(SCU). Where the issuer drivers (workflows.py) drive ``DICOMSession`` to test a
 server, these build the server-side responses on top of ``RawSCP`` so the same
 workflow can probe a connecting client.
 

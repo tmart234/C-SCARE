@@ -142,6 +142,10 @@ __all__ = [
     "A_RELEASE_RP",
     "A_ABORT",
     "PresentationDataValueItem",
+    # Transport (PS3.8 Section 9.1) - reusable DICOM UL socket + framing
+    "DICOMSocket",
+    "read_dul_pdu",
+    "PDU_HEADER_LEN",
  
     # Variable Items (PS3.8 Section 9.3.2)
  
@@ -1171,7 +1175,7 @@ bind_layers(DICOMVariableItem, DICOMGenericItem)
 # ``variable_items`` -> (User Information) ``sub_items``. Reading them is the
 # same walk every time: filter by item_type, guard the bound layer, decode the
 # null-padded UID. These helpers centralise that idiom so the many
-# ``_parse_*`` (DICOMSocket) and ``parse_*`` (c_scare.responders) readers stay
+# ``_parse_*`` (DICOMSession) and ``parse_*`` (c_scare.responders) readers stay
 # thin instead of re-implementing the loop.
 # -------------------------------------------------------------------------
 
@@ -1587,6 +1591,109 @@ bind_layers(DICOM, P_DATA_TF, pdu_type=0x04)
 bind_layers(DICOM, A_RELEASE_RQ, pdu_type=0x05)
 bind_layers(DICOM, A_RELEASE_RP, pdu_type=0x06)
 bind_layers(DICOM, A_ABORT, pdu_type=0x07)
+
+
+# -------------------------------------------------------------------------
+# DICOM Upper Layer transport socket (PS3.8 Section 9.1)
+#
+# The reusable transport primitive of this layer. Everything above is pure
+# wire format (declarative Packet classes); this is the one place that frames
+# a TCP stream into DICOM PDUs. Higher-level consumers - the SCU client
+# (c_scare.client.DICOMSession), the rogue SCP (c_scare.server.RawSCP),
+# fuzzers and scanners - all share this instead of re-rolling PDU I/O.
+# -------------------------------------------------------------------------
+
+#: Fixed size of the DICOM UL PDU header: PDU-type(1) + reserved(1) + length(4).
+PDU_HEADER_LEN = 6
+
+
+def read_dul_pdu(sock, timeout=None):
+    # type: (socket.socket, Optional[float]) -> bytes
+    """Read exactly one DICOM Upper Layer PDU from a connected stream socket.
+
+    Frames the stream per PS3.8 Section 9.3.1: read the fixed 6-byte header,
+    take the big-endian PDU-length, then read exactly that many body bytes.
+    Returns the complete PDU (header + body), or ``b""`` on a clean EOF before
+    the header or on timeout. A peer that truncates mid-body yields the partial
+    PDU read so far, so callers can still inspect a malformed/short PDU.
+
+    This is the single PDU-boundary primitive shared by :class:`DICOMSocket`
+    and ``server.RawSCP`` so neither re-implements framing.
+    """
+    try:
+        if timeout is not None:
+            sock.settimeout(timeout)
+        header = b""
+        while len(header) < PDU_HEADER_LEN:
+            chunk = sock.recv(PDU_HEADER_LEN - len(header))
+            if not chunk:
+                return b""
+            header += chunk
+        length = struct.unpack("!I", header[2:6])[0]
+        body = b""
+        while len(body) < length:
+            chunk = sock.recv(min(65536, length - len(body)))
+            if not chunk:
+                break  # peer truncated the PDU; hand back what we have
+            body += chunk
+        return header + body
+    except socket.timeout:
+        return b""
+    except OSError:
+        return b""
+
+
+class DICOMSocket(StreamSocket):
+    """Reusable DICOM Upper Layer transport (PS3.8).
+
+    A thin :class:`~scapy.supersocket.StreamSocket` subclass that frames a
+    connected TCP stream into DICOM PDUs. It is the transport *primitive* of
+    the layer: it knows about PDU boundaries and the :class:`DICOM` dissector,
+    and nothing about association negotiation, presentation contexts, or DIMSE.
+    Those concerns live in higher-level consumers (e.g.
+    ``c_scare.client.DICOMSession``, fuzzers, scanners), which share this one
+    socket rather than re-rolling PDU I/O::
+
+        sock = DICOMSocket.connect("127.0.0.1", 11112)
+        sock.send(DICOM() / A_ASSOCIATE_RQ(...))   # send a parsed PDU
+        ac = sock.recv()                            # receive a parsed DICOM PDU
+        raw = sock.recv_pdu()                       # ... or the raw PDU bytes
+        sock.close()
+
+    :meth:`recv` (inherited) returns a parsed ``DICOM`` packet, choosing the
+    concrete PDU via the layer bindings above. :meth:`recv_pdu` returns the raw
+    PDU bytes (for fuzzing / byte-level inspection). :meth:`send` (inherited)
+    accepts a Scapy ``Packet``; :meth:`send_raw` accepts raw ``bytes`` for
+    deliberately malformed PDUs.
+    """
+
+    desc = "DICOM Upper Layer stream socket"
+
+    def __init__(self, sock, basecls=DICOM):
+        # type: (socket.socket, type) -> None
+        super(DICOMSocket, self).__init__(sock, basecls=basecls)
+
+    @classmethod
+    def connect(cls, host, port=DICOM_PORT, timeout=None, basecls=DICOM):
+        # type: (str, int, Optional[float], type) -> DICOMSocket
+        """Open a TCP connection to ``host:port`` and wrap it as a DICOMSocket."""
+        sock = socket.create_connection((host, port), timeout=timeout)
+        return cls(sock, basecls=basecls)
+
+    def recv_pdu(self, timeout=None):
+        # type: (Optional[float]) -> bytes
+        """Read one whole PDU as raw bytes (header + body), honouring framing.
+
+        Use this for byte-level work (fuzzing, inspection); use :meth:`recv` for
+        a parsed packet. Don't mix the two on one socket - :meth:`recv` keeps
+        its own peek buffer.
+        """
+        return read_dul_pdu(self.ins, timeout=timeout)
+
+    def send_raw(self, data):
+        # type: (bytes) -> None
+        """Send raw bytes verbatim (e.g. a hand-crafted / malformed PDU)."""
+        self.outs.sendall(data)
 
 
 

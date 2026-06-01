@@ -15,7 +15,7 @@ pytest.importorskip("pynetdicom")
 
 from pydicom.dataset import Dataset as PydicomDataset  # noqa: E402
 
-from c_scare import ae_brute, cred_brute, build_query, DICOMSocket  # noqa: E402
+from c_scare import ae_brute, cred_brute, build_query, DICOMSession  # noqa: E402
 from c_scare.scapy_dicom import (  # noqa: E402
     VERIFICATION_SOP_CLASS_UID,
     PATIENT_ROOT_QR_FIND_SOP_CLASS_UID,
@@ -215,7 +215,7 @@ def test_c_find_enumerates_stream_and_parses_identifiers():
     try:
         query = build_query(level="study",
                             return_keys=[(0x0008, 0x1030), (0x0020, 0x000D)])
-        with DICOMSocket(HOST, 11622, "ANY-SCP", "C_SCARE", read_timeout=5) as sock:
+        with DICOMSession(HOST, 11622, "ANY-SCP", "C_SCARE", read_timeout=5) as sock:
             assert sock.associate(
                 {PATIENT_ROOT_QR_FIND_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID]})
             responses = sock.c_find(
@@ -253,7 +253,7 @@ def test_c_move_parses_status_and_counts():
     time.sleep(0.4)
     try:
         query = build_query(level="study", match_keys={(0x0020, 0x000D, "UI"): "1.2.3.1"})
-        with DICOMSocket(HOST, 11623, "ANY-SCP", "C_SCARE", read_timeout=5) as sock:
+        with DICOMSession(HOST, 11623, "ANY-SCP", "C_SCARE", read_timeout=5) as sock:
             assert sock.associate(
                 {PATIENT_ROOT_QR_MOVE_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID]})
             out = sock.c_move(query, "RESEARCH_VIEWER",

@@ -71,7 +71,7 @@ with open("corrupted.dcm", "wb") as f:
 ### Fuzz the network protocol
 
 ```python
-from c_scare import DICOMSocket            # SCU client (c_scare.client)
+from c_scare import DICOMSession          # SCU client (c_scare.client)
 from c_scare.scapy_dicom import *          # wire-format layer: PDUs, DIMSE, UIDs
 from scapy.packet import raw, fuzz
 
@@ -79,7 +79,7 @@ from scapy.packet import raw, fuzz
 pdu = raw(fuzz(DICOM() / A_ASSOCIATE_RQ()))
 
 # Full session
-with DICOMSocket('192.168.1.100', 11112, 'PACS', 'ATTACKER') as sock:
+with DICOMSession('192.168.1.100', 11112, 'PACS', 'ATTACKER') as sock:
     if sock.associate({CT_IMAGE_STORAGE_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID]}):
         sock.c_store(dataset_bytes, sop_class_uid, sop_instance_uid, transfer_syntax)
         sock.release()

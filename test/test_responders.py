@@ -190,7 +190,7 @@ def test_w2_require_identity_responder_vs_cred_brute():
 def test_w5_cmove_responder_vs_cmove_issuer():
     """W5 both directions: the responder reports sub-op counts in C-MOVE-RSP;
     the issuer parses them."""
-    from c_scare import DICOMSocket, build_query, build_cmove_rsp
+    from c_scare import DICOMSession, build_query, build_cmove_rsp
     from c_scare.scapy_dicom import (
         PATIENT_ROOT_QR_MOVE_SOP_CLASS_UID, DEFAULT_TRANSFER_SYNTAX_UID,
         parse_dimse_command_us, STATUS_SUCCESS)
@@ -207,7 +207,7 @@ def test_w5_cmove_responder_vs_cmove_issuer():
     try:
         query = build_query(level="study",
                             match_keys={(0x0020, 0x000D, "UI"): "1.2.3"})
-        with DICOMSocket(HOST, 11636, "C_SCARE_SCP", "C_SCARE", read_timeout=5) as sock:
+        with DICOMSession(HOST, 11636, "C_SCARE_SCP", "C_SCARE", read_timeout=5) as sock:
             assert sock.associate(
                 {PATIENT_ROOT_QR_MOVE_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID]})
             out = sock.c_move(query, "RESEARCH_VIEWER",
@@ -224,7 +224,7 @@ def test_w4_cget_responder_vs_cget_issuer():
     them and parses their metadata. Validates the experimental c_get issuer and
     the C-GET responder against each other."""
     from pydicom.dataset import Dataset
-    from c_scare import DICOMSocket, build_query
+    from c_scare import DICOMSession, build_query
     from c_scare.scapy_dicom import (
         PATIENT_ROOT_QR_GET_SOP_CLASS_UID, CT_IMAGE_STORAGE_SOP_CLASS_UID,
         DEFAULT_TRANSFER_SYNTAX_UID, STATUS_SUCCESS)
@@ -253,7 +253,7 @@ def test_w4_cget_responder_vs_cget_issuer():
             PATIENT_ROOT_QR_GET_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID],
             CT_IMAGE_STORAGE_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID],
         }
-        with DICOMSocket(HOST, 11637, "C_SCARE_SCP", "C_SCARE", read_timeout=5) as sock:
+        with DICOMSession(HOST, 11637, "C_SCARE_SCP", "C_SCARE", read_timeout=5) as sock:
             assert sock.associate(contexts)
             out = sock.c_get(query, sop_class_uid=PATIENT_ROOT_QR_GET_SOP_CLASS_UID)
         assert out["status"] == STATUS_SUCCESS
@@ -269,7 +269,7 @@ def test_strict_cget_grant_delivers_objects():
     (echo_roles=True): the role is negotiated, objects are delivered, and the
     C-GET is not aborted."""
     from pydicom.dataset import Dataset
-    from c_scare import DICOMSocket, build_query
+    from c_scare import DICOMSession, build_query
     from c_scare.scapy_dicom import (
         PATIENT_ROOT_QR_GET_SOP_CLASS_UID, CT_IMAGE_STORAGE_SOP_CLASS_UID,
         DEFAULT_TRANSFER_SYNTAX_UID, STATUS_SUCCESS)
@@ -297,7 +297,7 @@ def test_strict_cget_grant_delivers_objects():
             CT_IMAGE_STORAGE_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID],
         }
         roles = {CT_IMAGE_STORAGE_SOP_CLASS_UID: (0, 1)}
-        with DICOMSocket(HOST, 11638, "C_SCARE_SCP", "C_SCARE", read_timeout=5) as sock:
+        with DICOMSession(HOST, 11638, "C_SCARE_SCP", "C_SCARE", read_timeout=5) as sock:
             assert sock.associate(contexts, roles=roles)
             # The peer echoed scp_role=1 for the storage class.
             assert sock.negotiated_roles.get(CT_IMAGE_STORAGE_SOP_CLASS_UID) == (0, 1)
@@ -315,7 +315,7 @@ def test_strict_cget_withhold_aborts():
     (role_response scp_role=0): the SCU aborts on the first sub-op rather than
     accepting the object, and reports the reason."""
     from pydicom.dataset import Dataset
-    from c_scare import DICOMSocket, build_query
+    from c_scare import DICOMSession, build_query
     from c_scare.scapy_dicom import (
         PATIENT_ROOT_QR_GET_SOP_CLASS_UID, CT_IMAGE_STORAGE_SOP_CLASS_UID,
         DEFAULT_TRANSFER_SYNTAX_UID)
@@ -343,7 +343,7 @@ def test_strict_cget_withhold_aborts():
             CT_IMAGE_STORAGE_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID],
         }
         roles = {CT_IMAGE_STORAGE_SOP_CLASS_UID: (0, 1)}
-        with DICOMSocket(HOST, 11639, "C_SCARE_SCP", "C_SCARE", read_timeout=5) as sock:
+        with DICOMSession(HOST, 11639, "C_SCARE_SCP", "C_SCARE", read_timeout=5) as sock:
             assert sock.associate(contexts, roles=roles)
             assert sock.negotiated_roles.get(CT_IMAGE_STORAGE_SOP_CLASS_UID) == (0, 0)
             out = sock.c_get(query, sop_class_uid=PATIENT_ROOT_QR_GET_SOP_CLASS_UID,
@@ -357,8 +357,8 @@ def test_strict_cget_withhold_aborts():
 
 def test_accept_association_echoes_proposed_roles():
     """accept_association(echo_proposed_roles=True) echoes the RQ's 0x54 role
-    items back in the AC, and a DICOMSocket parses them into negotiated_roles."""
-    from c_scare import DICOMSocket
+    items back in the AC, and a DICOMSession parses them into negotiated_roles."""
+    from c_scare import DICOMSession
     from c_scare.scapy_dicom import (
         CT_IMAGE_STORAGE_SOP_CLASS_UID, DEFAULT_TRANSFER_SYNTAX_UID)
     from c_scare import RawSCP
@@ -372,7 +372,7 @@ def test_accept_association_echoes_proposed_roles():
     scp.start(blocking=False)
     time.sleep(0.4)
     try:
-        with DICOMSocket(HOST, 11640, "C_SCARE_SCP", "C_SCARE", read_timeout=5) as sock:
+        with DICOMSession(HOST, 11640, "C_SCARE_SCP", "C_SCARE", read_timeout=5) as sock:
             ok = sock.associate(
                 {CT_IMAGE_STORAGE_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID]},
                 roles={CT_IMAGE_STORAGE_SOP_CLASS_UID: (0, 1)})

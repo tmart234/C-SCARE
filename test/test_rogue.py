@@ -93,9 +93,9 @@ def test_rogue_malformation_modes_block_scu(mode):
 def test_hostile_cget_pushes_malicious_store():
     """The hostile C-GET responder accepts an association and, on C-GET, pushes a
     path-traversal C-STORE sub-operation at the SCU without crashing the
-    harness. We drive it with the in-process DICOMSocket SCU so we can inspect
+    harness. We drive it with the in-process DICOMSession SCU so we can inspect
     the sub-op the client received."""
-    from c_scare import WorkflowResponder, build_query, DICOMSocket
+    from c_scare import WorkflowResponder, build_query, DICOMSession
     from c_scare.scapy_dicom import (
         PATIENT_ROOT_QR_GET_SOP_CLASS_UID, CT_IMAGE_STORAGE_SOP_CLASS_UID,
         DEFAULT_TRANSFER_SYNTAX_UID)
@@ -117,7 +117,7 @@ def test_hostile_cget_pushes_malicious_store():
             PATIENT_ROOT_QR_GET_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID],
             CT_IMAGE_STORAGE_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID],
         }
-        with DICOMSocket('127.0.0.1', 11572, 'C_SCARE_SCP', 'C_SCARE',
+        with DICOMSession('127.0.0.1', 11572, 'C_SCARE_SCP', 'C_SCARE',
                          read_timeout=5) as sock:
             assert sock.associate(contexts)
             out = sock.c_get(query, sop_class_uid=PATIENT_ROOT_QR_GET_SOP_CLASS_UID)

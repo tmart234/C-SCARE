@@ -14,7 +14,7 @@ C-SCARE is organised around *who* you test — a DICOM server (SCP) or a client 
 | **Quantified**        | **5** workflows (W1–W5) | **8** attack categories · **68** payloads · **13** CVEs | **6** targets · **2** engines · **3** sanitizers |
 | **Targets**           | SCP and SCU | SCP (server) and SCU (client, via rogue server) | SCP (file/parser/network) and SCU (experimental) |
 | **Instrumentation**   | None | None — works on real devices / prebuilt binaries | Required (recompiled, QEMU, or SAND) |
-| **Engine**            | C-SCARE (`DICOMSocket`) | C-SCARE (catalog + monitors) | AFL++ / AFLNet (C-SCARE bridges + triages) |
+| **Engine**            | C-SCARE (`DICOMSession`) | C-SCARE (catalog + monitors) | AFL++ / AFLNet (C-SCARE bridges + triages) |
 | **CLI**               | `c-scare wf …` | `c-scare --ip … --category …` / `c-scare rogue …` | `c-scare greybox run / triage …` |
 | **Output**            | Classified findings | SARIF v2.1.0 | SARIF v2.1.0 |
 | **Guide**             | [docs/workflows.md](docs/workflows.md) | [docs/dast.md](docs/dast.md) | [docs/fuzzing.md](docs/fuzzing.md) |
@@ -33,7 +33,7 @@ flowchart TD
         PIXEL[pixel.py]
         FILE[file.py]
         SCAPY[scapy_dicom.py - PDUs/DIMSE wire-format layer]
-        CLIENT[client.py - DICOMSocket SCU client]
+        CLIENT[client.py - DICOMSession SCU client]
     end
 
     CATALOG[attacks.py - static attack catalog + seed generators]
