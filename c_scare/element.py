@@ -5,8 +5,8 @@ DICOM Element and Dataset - Core building blocks.
 Scapy-like API for building DICOM data structures with full byte control.
 
 Example:
-    from dicom_hacker.element import Element, Dataset
-    
+    from c_scare.element import Element, Dataset
+
     ds = (Dataset()
         / Element(0x0010, 0x0010, 'PN', 'Doe^John')
         / Element.raw(tag=0x00100020, vr='XX', value=b'fuzz')
@@ -102,6 +102,48 @@ class VR:
     @classmethod
     def uses_long_length(cls, vr: str) -> bool:
         return vr.upper() in cls.LONG_LENGTH
+
+
+# VRs padded to even length with a NULL byte rather than a trailing space
+# (PS3.5 §6.2). UI is null-padded; binary/"other" VRs are byte streams.
+_NULL_PAD_VRS = frozenset({'UI', 'OB', 'OW', 'OF', 'OD', 'UN'})
+
+
+def pad_to_even(val_bytes: bytes, vr: str) -> bytes:
+    """Pad a value to an even byte length per the VR's padding rule.
+
+    Shared by the dataset encoder (:meth:`Element.encode`) and the pydicom
+    bridge (:class:`c_scare.corruptor.Corruptor`) so both agree on padding.
+    """
+    if len(val_bytes) % 2 == 0:
+        return val_bytes
+    return val_bytes + (b'\x00' if vr.upper() in _NULL_PAD_VRS else b' ')
+
+
+def encode_vr_length(vr: str, length: int, implicit_vr: bool,
+                     little_endian: bool, raw_vr: Optional[bytes] = None,
+                     long_form: Optional[bool] = None) -> bytes:
+    """Encode the VR + length header for one element (PS3.5 §7.1.2).
+
+    Implicit VR emits a bare 4-byte length; explicit VR emits the 2-byte VR
+    followed by either a 2-byte length or (long form) a 2-byte reserved field
+    plus a 4-byte length. ``long_form`` selects the explicit-VR layout; when
+    ``None`` it defaults to "long VR, or length overflows 16 bits". Callers that
+    want a length value to be *truncated* into the 2-byte field (a deliberate
+    length/value-mismatch malformation) pass ``long_form=False`` explicitly.
+    Shared by ``Element.encode`` and the Corruptor so the long-VR set and the
+    header layout live in one place.
+    """
+    endian = '<' if little_endian else '>'
+    if implicit_vr:
+        return struct.pack(endian + 'I', length)
+    out = (raw_vr[:2].ljust(2, b' ') if raw_vr
+           else vr[:2].ljust(2).encode('ascii', errors='replace'))
+    if long_form is None:
+        long_form = VR.uses_long_length(vr) or length > 0xFFFF
+    if long_form:
+        return out + b'\x00\x00' + struct.pack(endian + 'I', length)
+    return out + struct.pack(endian + 'H', length & 0xFFFF)
 
 
 # =============================================================================
@@ -270,40 +312,21 @@ class Element:
         
         # Value bytes
         val_bytes = self._encode_value(little_endian)
-        
+
         # Pad to even length (unless raw length override)
-        if self._raw_length is None and len(val_bytes) % 2:
-            if self.vr.upper() == 'UI':
-                val_bytes += b'\x00'
-            elif self.vr.upper() in ('OB', 'OW', 'OF', 'OD', 'UN'):
-                val_bytes += b'\x00'
-            else:
-                val_bytes += b' '
-        
+        if self._raw_length is None:
+            val_bytes = pad_to_even(val_bytes, self.vr)
+
         # Length
         length = self._raw_length if self._raw_length is not None else len(val_bytes)
-        
-        if implicit_vr:
-            # Implicit VR: 4-byte length only
-            fmt = '<I' if little_endian else '>I'
-            bio.write(struct.pack(fmt, length))
-        else:
-            # Explicit VR
-            if self._raw_vr:
-                bio.write(self._raw_vr[:2].ljust(2, b' '))
-            else:
-                bio.write(self.vr[:2].ljust(2).encode('ascii'))
-            
-            if VR.uses_long_length(self.vr) or (self._raw_length is not None and self._raw_length > 0xFFFF):
-                # 4-byte length with 2-byte reserved
-                bio.write(b'\x00\x00')
-                fmt = '<I' if little_endian else '>I'
-                bio.write(struct.pack(fmt, length))
-            else:
-                # 2-byte length
-                fmt = '<H' if little_endian else '>H'
-                bio.write(struct.pack(fmt, length & 0xFFFF))
-        
+
+        # Long form only for genuine long VRs or a raw-length override that
+        # overflows 16 bits; a natural value over 64 KiB keeps the short header
+        # so its 2-byte length truncates (preserving length-mismatch payloads).
+        long_form = (VR.uses_long_length(self.vr)
+                     or (self._raw_length is not None and self._raw_length > 0xFFFF))
+        bio.write(encode_vr_length(self.vr, length, implicit_vr, little_endian,
+                                   raw_vr=self._raw_vr, long_form=long_form))
         bio.write(val_bytes)
         return bio.getvalue()
     

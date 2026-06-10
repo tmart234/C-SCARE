@@ -124,6 +124,40 @@ class TestSarifAdapters:
         res = doc["runs"][0]["results"][0]
         assert res["properties"]["monitors"][0]["finding_type"] == "asan:heap-overflow"
 
+    def test_sarif_severity_and_dedup(self, tmp_path):
+        """A detection (success=True) is an 'error'; a clean result (None) is a
+        'note'. Regression: detections previously rendered as the lowest level.
+        Identical findings must also share a partialFingerprint for dedup."""
+        import json
+        from c_scare.attacks import AttackResult
+        from c_scare.monitor import MonitorReport
+        from c_scare.test_runner import write_sarif
+
+        def crash(name):
+            rpt = MonitorReport(detected=True, finding_type="asan:heap-overflow",
+                                description="oops", evidence="frame0\nframe1")
+            return AttackResult(name=name, category="greybox", payload=b"x",
+                                description="crash", expected_behavior="no crash",
+                                success=True, monitor_reports=[rpt],
+                                metadata={"crash_path": "fuzz/out/file/crashes/id:1"})
+
+        clean = AttackResult(name="ok", category="parser", payload=b"x",
+                             description="delivered", expected_behavior="ok",
+                             success=None)
+        out = tmp_path / "r.sarif"
+        write_sarif([crash("a"), crash("b"), clean], str(out))
+        results = json.loads(out.read_text())["runs"][0]["results"]
+        by_rule = {r["ruleId"]: r for r in results}
+
+        assert by_rule["greybox/a"]["level"] == "error"
+        assert by_rule["parser/ok"]["level"] == "note"
+        # same stack -> same fingerprint (consumer collapses duplicate crashes)
+        assert (by_rule["greybox/a"]["partialFingerprints"]
+                == by_rule["greybox/b"]["partialFingerprints"])
+        # grey-box crash carries its input path as a location
+        assert (by_rule["greybox/a"]["locations"][0]["physicalLocation"]
+                ["artifactLocation"]["uri"].endswith("id:1"))
+
 
 class TestDeliveryRouting:
     """_delivery_kind routes payloads by --delivery mode and catalog metadata."""
@@ -170,3 +204,50 @@ class TestDeliveryRouting:
         from c_scare.test_runner import _delivery_kind
         assert _delivery_kind(self._args("cstore"),
                               self._result("protocol")) == "cstore"
+
+
+class TestSendCStore:
+    """send_cstore must drive a real DICOMSession, not silently no-op.
+
+    Regression: send_cstore previously imported DICOMSession from the wrong
+    module (scapy_dicom instead of client), so the import raised ImportError,
+    was swallowed, and every live C-STORE delivery returned None.
+    """
+
+    def test_resolvable_import(self):
+        # The names send_cstore relies on must be importable from where it
+        # looks for them; a wrong path is exactly the swallowed-ImportError bug.
+        from c_scare.client import DICOMSession  # noqa: F401
+        from c_scare.scapy_dicom import DEFAULT_TRANSFER_SYNTAX_UID  # noqa: F401
+
+    def test_drives_session_and_returns_status(self, monkeypatch):
+        import c_scare.client as client_mod
+        from c_scare import deliver
+
+        calls = {}
+
+        class FakeSession:
+            def __init__(self, *a, **k):
+                calls["init"] = (a, k)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def associate(self, contexts, user_identity=None):
+                calls["associate"] = (contexts, user_identity)
+                return True
+
+            def c_store(self, payload, sop_class_uid, sop_instance_uid, ts):
+                calls["c_store"] = (payload, sop_class_uid, sop_instance_uid, ts)
+                return 0x0000
+
+        monkeypatch.setattr(client_mod, "DICOMSession", FakeSession)
+        status = deliver.send_cstore(
+            ("127.0.0.1", 104), b"DATASET", "1.2.840.10008.5.1.4.1.1.7",
+            sop_instance_uid="1.2.3", user_identity={"username": "u"})
+        assert status == 0x0000  # not None: the delivery path actually ran
+        assert calls["c_store"][0] == b"DATASET"
+        assert calls["associate"][1] == {"username": "u"}

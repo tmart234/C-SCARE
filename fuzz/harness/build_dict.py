@@ -97,6 +97,24 @@ def main() -> int:
     # DICOM file preamble magic — Part 10 marker
     _emit(seen, lines, "magic_dicm", _esc_str("DICM"))
 
+    # Encapsulated-pixel codec markers — the file/pixel campaign mutates
+    # fragments inside JPEG / JPEG-LS / JPEG2000 / RLE wrappers, so the codec
+    # framing bytes are high-value tokens for reaching decoder internals.
+    codec_markers = [
+        ("jpeg_soi", b"\xff\xd8"),          # JPEG start of image
+        ("jpeg_eoi", b"\xff\xd9"),          # JPEG end of image
+        ("jpeg_app0", b"\xff\xe0"),         # JFIF APP0
+        ("jpeg_sof0", b"\xff\xc0"),         # baseline start of frame
+        ("jpeg_sos", b"\xff\xda"),          # start of scan
+        ("jpegls_sof55", b"\xff\xf7"),      # JPEG-LS start of frame
+        ("j2k_soc", b"\xff\x4f"),           # JPEG2000 codestream start
+        ("j2k_eoc", b"\xff\xd9"),           # JPEG2000 codestream end
+        ("j2k_siz", b"\xff\x51"),           # JPEG2000 image/tile size
+        ("jp2_signature", b"\x00\x00\x00\x0cjP  \r\n\x87\n"),  # JP2 box signature
+    ]
+    for label, marker in codec_markers:
+        _emit(seen, lines, f"codec_{label}", _esc_bytes(marker))
+
     OUT_PATH.write_text("\n".join(lines) + "\n")
     print(f"wrote {OUT_PATH.relative_to(REPO_ROOT)} ({len(lines)} entries)")
     return 0

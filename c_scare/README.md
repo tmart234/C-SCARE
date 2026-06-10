@@ -8,7 +8,7 @@ The `c_scare` package. See the [project README](../README.md) for an overview an
 | `corruptor.py` | pydicom bridge — read with pydicom, re-emit *invalid* with our encoder |
 | `pixel.py` | Encapsulated pixel data with fragment-level control + Scapy layers |
 | `file.py` | Part 10 file handling (preamble, meta header, transfer syntax via `pydicom.uid.UID`) |
-| `scapy_dicom.py` | DICOM wire-format layer — declarative Scapy `Packet` definitions for PDUs/DIMSE-C/N plus builders and dissection helpers; the pure, upstreamable protocol module (no I/O) |
+| `scapy_dicom.py` | DICOM wire-format layer — declarative Scapy `Packet` definitions for PDUs/DIMSE-C/N plus builders and dissection helpers. The `Packet`/`Field` definitions are pure and upstreamable; the module also bundles the thin TCP transport primitives (`DICOMSocket`, `read_dul_pdu`) that frame a byte stream into PDUs |
 | `client.py` | `DICOMSession` — stateful SCU client (association + DIMSE), delegating transport to `scapy_dicom`'s `DICOMSocket`; plus the A-ASSOCIATE-RJ recon helpers `classify_reject` / `reject_is_called_aet_unrecognized` |
 | `server.py` | `RawSCP` rogue server for fuzzing clients (SCU) |
 | `attacks.py` | Static attack catalog + seed generators — classes expose `all()` iterators of `AttackResult` |

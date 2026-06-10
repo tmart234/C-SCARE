@@ -30,7 +30,7 @@ import yaml
 
 __all__ = [
     'PROFILES_DIR', 'Flow', 'Profile',
-    'load_profile', 'load_profiles', 'iter_profiles',
+    'load_profile', 'load_profiles',
     'resolve_cscare_uid', 'resolve_pydicom_uid', 'subst',
 ]
 
@@ -157,10 +157,6 @@ class Profile:
     # SCU-only desocket shim hints (consumed by fuzz_scu.sh).
     desock: Optional[dict] = None
 
-    @property
-    def is_network(self) -> bool:
-        return self.kind == 'net-scp' or self.engine == 'aflnet'
-
 
 def _flows_from_raw(raw_flows, calling_ae) -> List[Flow]:
     flows: List[Flow] = []
@@ -267,8 +263,3 @@ def load_profiles(repo: Optional[str] = None) -> Dict[str, Profile]:
         stem = os.path.splitext(os.path.basename(p))[0]
         out[stem] = load_profile(stem, repo)
     return out
-
-
-def iter_profiles(repo: Optional[str] = None):
-    """Yield profiles sorted by target name."""
-    return iter(load_profiles(repo).values())

@@ -176,7 +176,7 @@ jobs:
         id: test_fuzz_packets
         run: |
           echo "=== Fuzz Packet Tests ==="
-          echo "Testing: C_ECHO_RQ_Fuzz, C_STORE_RQ_Fuzz with explicit group_length, odd-length UIDs, Scapy fuzz()"
+          echo "Testing: C_ECHO_RQ / C_STORE_RQ with explicit group_length, odd-length UIDs, Scapy fuzz()"
           python -m c_scare.test_runner \
             --ip 127.0.0.1 \
             --port ${{ matrix.dicom_server.port }} \

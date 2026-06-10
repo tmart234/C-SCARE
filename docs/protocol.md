@@ -42,8 +42,8 @@ Each layer of the DICOM stack has corresponding C-SCARE modules for testing:
 │                                  │                                                  │
 │  DIMSE Layer                     │  scapy_dicom.py (DIMSE packets)                  │
 │    C-STORE, C-FIND, C-ECHO       │    C_ECHO_RQ, C_STORE_RQ, C_FIND_RQ, C_MOVE_RQ   │
-│    Command + Data                │    C_STORE_RQ_Fuzz ─ explicit group_length       │
-│                                  │    fuzz() for automatic field mutation           │
+│    Command + Data                │    C_STORE_RQ + explicit group_length;           │
+│                                  │    scapy fuzz() for automatic field mutation     │
 │                                  │                                                  │
 ├──────────────────────────────────┼──────────────────────────────────────────────────┤
 │                                  │                                                  │
@@ -245,7 +245,7 @@ Attack Surface:
   ► Max Length: 0, 0xFFFFFFFF
   ► Nested items: Missing, duplicate, wrong order
 
-Tool: pdu.py (AssociateRQ), attacks.py (ProtocolAttacks)
+Tool: scapy_dicom.py (A_ASSOCIATE_RQ), attacks.py (ProtocolAttacks)
 ```
 
 ### P-DATA-TF (Type 0x04) - Data Transfer
@@ -265,25 +265,25 @@ Tool: pdu.py (AssociateRQ), attacks.py (ProtocolAttacks)
 │          │          │   │ Item Length (4 bytes, big-endian)                │   │
 │          │          │   │ Presentation Context ID (1 byte, odd 1-255)      │   │
 │          │          │   │ Message Control Header (1 byte):                 │   │
-│          │          │   │   Bit 0: 0=Command, 1=Data                       │   │
-│          │          │   │   Bit 1: 0=More fragments, 1=Last fragment       │   │
+│          │          │   │   Bit 0: 1=Command, 0=Data                       │   │
+│          │          │   │   Bit 1: 1=Last fragment, 0=More fragments       │   │
 │          │          │   │ Presentation Data Fragment (Item Length - 2)     │   │
 │          │          │   └──────────────────────────────────────────────────┘   │
 │          │          │   (repeat for multiple PDV items)                        │
 └──────────┴──────────┴──────────────────────────────────────────────────────────┘
 
-Message Control Header values:
-  0x00 = Command, not last
-  0x01 = Data, not last
-  0x02 = Command, last fragment
-  0x03 = Data, last fragment
+Message Control Header values (bit 0 = command/data, bit 1 = last):
+  0x00 = Data, not last
+  0x01 = Command, not last
+  0x02 = Data, last fragment
+  0x03 = Command, last fragment
 
 Attack Surface:
   ► Context ID: Even numbers (invalid), 0, mismatched with association
   ► Fragmentation: Incomplete command, orphan data fragments
   ► Item Length: Mismatch, overflow
 
-Tool: pdu.py (PDataTF, PDataItem), dimse.py
+Tool: scapy_dicom.py (P_DATA_TF, PresentationDataValueItem, DIMSE packets)
 ```
 
 ### Other PDU Types
@@ -312,7 +312,7 @@ A-ABORT Structure (simplest):
 │ 9        │ 1        │ Reason/Diag (0-6 depending on source)                    │
 └──────────┴──────────┴──────────────────────────────────────────────────────────┘
 
-Tool: pdu.py (Abort, ReleaseRQ, ReleaseRP, AssociateRJ)
+Tool: scapy_dicom.py (A_ABORT, A_RELEASE_RQ, A_RELEASE_RP, A_ASSOCIATE_RJ)
 ```
 
 ---
@@ -375,7 +375,7 @@ Attack Surface:
   ► Priority: Invalid values (3+)
   ► SOP Class/Instance UID: Mismatch with association
 
-Tool: dimse.py (CEchoRQ, CStoreRQ, etc.)
+Tool: scapy_dicom.py (C_ECHO_RQ, C_STORE_RQ, etc.)
 ```
 
 ### C-STORE Message Flow
@@ -458,38 +458,35 @@ Tool: server.py (ConnectionState enum), attacks.py (StateMachineAttacks)
 The included Scapy layer (`scapy_dicom.py`) provides packet definitions for all structures above:
 
 ```python
-from scapy.all import *
-from dicom_hacker import install_scapy_layer
+from scapy.packet import raw
+from scapy.utils import rdpcap
+# Importing the package installs the layer; the wire-format symbols live in
+# c_scare.scapy_dicom (the classes are styled as scapy.contrib.dicom).
+from c_scare.scapy_dicom import *
 
-# Install layer (one-time)
-install_scapy_layer()
+# Build an A-ASSOCIATE-RQ from its variable items. AE titles are space-padded
+# to 16 bytes on the wire; the builders assemble the presentation context and
+# user-information sub-items for you.
+app_ctx = DICOMVariableItem() / DICOMApplicationContext()
+pctx = build_presentation_context_rq(
+    1, CT_IMAGE_STORAGE_SOP_CLASS_UID, [DEFAULT_TRANSFER_SYNTAX_UID])
+user_info = build_user_information(max_pdu_length=16384)
 
-# Import DICOM layer
-from scapy.contrib.dicom import *
-
-# Build packets with Scapy syntax
-pdu = A_ASSOCIATE_RQ(
-    called_ae="TARGET          ",
-    calling_ae="ATTACKER        ",
-    contexts=[
-        PresentationContext(
-            id=1,
-            abstract_syntax=CT_IMAGE_STORAGE_SOP_CLASS_UID,
-            transfer_syntaxes=[DEFAULT_TRANSFER_SYNTAX_UID],
-        )
-    ],
+pdu = DICOM() / A_ASSOCIATE_RQ(
+    called_ae_title=b"TARGET",
+    calling_ae_title=b"ATTACKER",
+    variable_items=[app_ctx, pctx, user_info],
 )
 
 # View packet structure
 pdu.show()
 
-# Get raw bytes
+# Get raw bytes (use scapy fuzz() first for automatic field mutation)
 raw(pdu)
 
 # Dissect captured traffic
-pkts = rdpcap("dicom_capture.pcap")
-for pkt in pkts:
-    if DICOM in pkt:
+for pkt in rdpcap("dicom_capture.pcap"):
+    if pkt.haslayer(DICOM):
         pkt[DICOM].show()
 ```
 

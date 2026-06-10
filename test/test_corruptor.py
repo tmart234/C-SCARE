@@ -136,17 +136,40 @@ def test_clear_resets_all_modifications():
     assert _encode(c) == base
 
 
-def test_set_value_in_sequence_roundtrips():
+def test_set_vr_in_sequence_applies_override():
     pydicom = pytest.importorskip('pydicom')
     ds = _build()
     item = pydicom.Dataset()
     item.add_new(0x00080100, 'SH', 'CODE1')      # CodeValue
-    seq_ds = pydicom.Dataset()
-    seq_ds.PatientName = 'Seq^Patient'
     ds.add_new(0x0040A730, 'SQ', [item])         # ContentSequence
     c = Corruptor(ds)
-    # Exercising the sequence override path must not raise and must still encode.
     c.set_vr_in_sequence(0x0040A730, 0, 0x00080100, 'XX')
-    out = _encode(c)
-    assert len(out) > 0
+    out = c.encode(implicit_vr=False, little_endian=True)
     assert _tag_le(0x0040, 0xA730) in out
+    # Regression: the in-sequence override used to be a silent no-op because the
+    # stored path key never matched the encoder's lookup. The nested CodeValue's
+    # VR must now be the corrupt 'XX', not the original 'SH'.
+    idx = out.find(_tag_le(0x0008, 0x0100))
+    assert idx != -1
+    assert out[idx + 4:idx + 6] == b'XX'
+
+
+def test_set_vr_in_sequence_nested_depth():
+    """The encoder threads the item path at every depth, so an override keyed by
+    the nested path form resolves into a sequence-within-a-sequence."""
+    pydicom = pytest.importorskip('pydicom')
+    from c_scare.corruptor import Override
+    ds = _build()
+    inner = pydicom.Dataset()
+    inner.add_new(0x00080102, 'SH', 'SCHEME')        # CodingSchemeDesignator
+    middle = pydicom.Dataset()
+    middle.add_new(0x00080100, 'SQ', [inner])        # nested sequence within item
+    ds.add_new(0x0040A730, 'SQ', [middle])           # ContentSequence
+    c = Corruptor(ds)
+    # Two-level threaded path: ContentSequence[0] -> (0008,0100)[0] -> (0008,0102)
+    c._sequence_overrides["(0040,A730)[0].(0008,0100)[0].(0008,0102)"] = \
+        Override(vr='YY')
+    out = c.encode(implicit_vr=False, little_endian=True)
+    idx = out.find(_tag_le(0x0008, 0x0102))
+    assert idx != -1
+    assert out[idx + 4:idx + 6] == b'YY'
