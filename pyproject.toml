@@ -13,7 +13,7 @@ license = { text = "GPL-2.0-only" }
 authors = [{ name = "Tyler M" }]
 keywords = ["dicom", "security", "fuzzing", "dast", "medical-devices"]
 dependencies = [
-    "pydicom>=2.4",
+    "pydicom>=3.0.2",  # 3.0.2 fixes CVE-2026-32711 (DICOMDIR path traversal)
     "scapy>=2.5",
     "pyyaml>=5.1",
 ]

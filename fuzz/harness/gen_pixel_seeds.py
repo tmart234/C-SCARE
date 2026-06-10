@@ -21,6 +21,7 @@ random module before invoking PixelFuzzer.
 """
 import os
 import random
+import struct
 import sys
 from pathlib import Path
 
@@ -36,6 +37,8 @@ from c_scare.pixel import PixelData, PixelFuzzer  # noqa: E402
 
 OUT_DIR = REPO_ROOT / "fuzz" / "seeds" / "file"
 JPEG_BASELINE_UID = "1.2.840.10008.1.2.4.50"
+JPEG_LS_LOSSLESS_UID = "1.2.840.10008.1.2.4.80"
+RLE_LOSSLESS_UID = "1.2.840.10008.1.2.5"
 EXPLICIT_VR_LE = "1.2.840.10008.1.2.1"
 DEFAULT_SEED = 0x9112E1
 PIXEL_TAG = 0x7FE00010
@@ -107,6 +110,61 @@ def _ybr_full_planar_undersize() -> Dataset:
     return ds
 
 
+def _encapsulated(fragments: list) -> bytes:
+    """Wrap fragments in an encapsulated Pixel Data stream (empty BOT)."""
+    out = struct.pack("<HH", 0xFFFE, 0xE000) + struct.pack("<I", 0)  # empty BOT item
+    for frag in fragments:
+        if len(frag) % 2:
+            frag += b"\x00"
+        out += struct.pack("<HH", 0xFFFE, 0xE000) + struct.pack("<I", len(frag)) + frag
+    out += struct.pack("<HH", 0xFFFE, 0xE0DD) + struct.pack("<I", 0)  # seq delim
+    return out
+
+
+def _rle_bad_header() -> bytes:
+    """RLE Lossless frame whose RLE header lies about its segment count.
+
+    Grey-box seed for CVE-2025-25475 — NULL pointer dereference in the RLE
+    decoder (dcmdata/.../dcrleccd.cc) reached when the 64-byte RLE header
+    declares more segments than the fragment actually carries.
+    """
+    ds = _baseline(RLE_LOSSLESS_UID)
+    # 64-byte RLE header: number-of-segments (UINT32 LE) + 15 segment offsets.
+    header = struct.pack("<I", 0xFFFFFFFF) + b"\x00" * 60
+    return _splice_pixel(ds, _encapsulated([header]), undefined_length=True)
+
+
+def _jpegls_truncated() -> bytes:
+    """JPEG-LS frame with a truncated/garbage codestream.
+
+    Grey-box seed for CVE-2025-2357 — memory corruption in the dcmjpls
+    JPEG-LS decoder reached through the codec dispatch on a malformed stream.
+    """
+    ds = _baseline(JPEG_LS_LOSSLESS_UID)
+    # SOI + JPEG-LS SOF (0xFFF7) then truncated parameters.
+    stream = bytes.fromhex("FFD8FFF7000B08") + b"\x00" * 6
+    return _splice_pixel(ds, _encapsulated([stream]), undefined_length=True)
+
+
+def _diinpxt_bits_mismatch() -> bytes:
+    """Native image whose bit fields exceed the allocation, undersized buffer.
+
+    Grey-box seed for CVE-2025-25474 — buffer overflow in the dcmimgle input
+    pixel template (dcmimgle/.../diinpxt.h) when Bits Stored / High Bit are
+    inconsistent with Bits Allocated and Pixel Data is too short for the
+    declared Rows*Columns.
+    """
+    ds = _baseline(EXPLICIT_VR_LE)
+    ds.Rows = 256
+    ds.Columns = 256
+    ds.BitsAllocated = 8
+    ds.BitsStored = 16   # > BitsAllocated
+    ds.HighBit = 15
+    ds.PixelRepresentation = 1
+    # 256*256 = 65536 samples expected; supply only 32 bytes.
+    return _splice_pixel(ds, b"\x80" * 32, undefined_length=False)
+
+
 def main() -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     seed = int(os.environ.get("C_SCARE_PIXEL_SEED", str(DEFAULT_SEED)), 0)
@@ -142,6 +200,20 @@ def main() -> int:
     _ybr_full_planar_undersize().save_as(str(ybr_path), write_like_original=False)
     print(f"  wrote {ybr_path.relative_to(REPO_ROOT)} "
           f"(YBR_FULL planar=1, 96B pixel data vs 12288B expected)")
+
+    # Codec-specific DCMTK CVE seeds (steer the codec dispatch; AFL mutates).
+    for fname, builder, label in (
+        ("pixel_rle_bad_header.dcm", _rle_bad_header,
+         "RLE header over-declares segments (CVE-2025-25475)"),
+        ("pixel_jpegls_truncated.dcm", _jpegls_truncated,
+         "truncated JPEG-LS codestream (CVE-2025-2357)"),
+        ("pixel_diinpxt_bits_mismatch.dcm", _diinpxt_bits_mismatch,
+         "Bits Stored>Allocated + short buffer (CVE-2025-25474)"),
+    ):
+        try:
+            _write(OUT_DIR / fname, builder(), label)
+        except Exception as exc:  # extreme encoder edge cases
+            print(f"  skip {fname}: {exc}")
 
     (OUT_DIR / "PIXEL_SEED.txt").write_text(f"{seed}\n")
     print(f"  wrote {(OUT_DIR / 'PIXEL_SEED.txt').relative_to(REPO_ROOT)} (seed={hex(seed)})")
