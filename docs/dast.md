@@ -16,7 +16,7 @@ Two delivery directions:
 
 ## Attack catalog
 
-C-SCARE ships **8 attack categories** totalling **108 hand-built payloads** (the
+C-SCARE ships **8 attack categories** totalling **124 hand-built payloads** (the
 count each category's `all()` iterator yields). The catalog is used two ways:
 delivered live for black-box DAST, or written to disk as an AFL/AFLNet seed
 corpus (`c-scare corpus -o ./corpus`) — see [Grey-box fuzzing](fuzzing.md).
@@ -30,7 +30,7 @@ corpus (`c-scare corpus -o ./corpus`) — see [Grey-box fuzzing](fuzzing.md).
 | **Command Injection** | 13 | Shell metacharacters across SOP/Study Instance UID & Patient Name that feed storescp's `--exec-on-reception` placeholders (DCMTK #1194 / CVE-2026-5663) | `CommandInjectionAttacks` |
 | **Path Traversal** | 11 | `../` sequences across SOP/Study Instance UID & Patient Name that escape the storescp/SCU storage directory (CVE-2022-2119/2120) | `PathTraversalAttacks` |
 | **State Machine** | 5 | Out-of-order PDUs (Sta1–Sta13 violations) | `StateMachineAttacks` |
-| **CVE** | 37 | CVE-2023-32135, CVE-2024-24793/94, CVE-2019-11687, CVE-2026-3650 (GDCM), CVE-2026-5437/5442 (Orthanc), CVE-2026-10528 (DCMTK), CVE-2026-32711 (pydicom DICOMDIR), plus DCMTK CVE-2022-2121 / CVE-2024-47796 / CVE-2025-14607 / CVE-2015-8979, and more | `CVEAttacks` |
+| **CVE** | 53 | DCMTK (CVE-2015-8979, CVE-2022-2121, CVE-2024-28130, CVE-2024-47796, CVE-2025-14607, CVE-2026-10528), GDCM codec/parser (CVE-2024-22373/22391/25569, CVE-2025-48429/52582/11266, CVE-2015-8396, CVE-2026-3650), Orthanc (CVE-2026-5437/5441/5442/5443/5444/5445), pydicom (CVE-2026-32711), dcm4che/standard polyglot (CVE-2019-11687), and more | `CVEAttacks` |
 
 Each `*Attacks` class exposes an `all()` iterator of `AttackResult` objects.
 
@@ -38,22 +38,17 @@ Each `*Attacks` class exposes an `all()` iterator of `AttackResult` objects.
 
 Each payload tags its CVE relationship honestly in `metadata`:
 
-- **`metadata['cve']` — directly targeted / probed.** Sixteen CVEs:
-  `CVE-2019-11687`, `CVE-2022-2119` (and `CVE-2022-2120`, the same payload
-  served via `RawSCP` at an SCU), `CVE-2022-2121`, `CVE-2023-32135`,
-  `CVE-2024-24793`, `CVE-2024-24794`, `CVE-2024-33606`, `CVE-2024-34509`,
-  `CVE-2024-47796`, `CVE-2025-14607`, `CVE-2026-5663`, `CVE-2015-8979`,
-  `CVE-2026-3650` (GDCM non-standard-VR memory-leak DoS), `CVE-2026-5437`
-  (Orthanc `DicomStreamReader` meta-header OOB read; sibling `CVE-2026-5442`),
-  `CVE-2026-10528` (Orthanc/DCMTK stack overflow via `DcmItem::read`), and
-  `CVE-2026-32711` (pydicom FileSet/DICOMDIR path traversal via Referenced
-  File ID). The use-after-free entries (32135/24793/24794) and the
-  `DcmItem::read` recursion (10528) are *structural triggers / regression
-  seeds* — a single static buffer cannot itself drive a heap use-after-free
-  or guarantee a stack smash, so they steer a parser into the vulnerable code
-  path rather than deterministically reproducing the bug. The full DCMTK CVE
-  map (covered / seed / config / out-of-scope) lives in
-  [dcmtk_cves.md](dcmtk_cves.md).
+- **`metadata['cve']` — directly targeted / probed.** Twenty-five CVEs across
+  DCMTK, GDCM, Orthanc, pydicom, and the standard-level polyglot — spanning
+  parser NULL-derefs, codec OOB read/write, integer over/underflow, type
+  confusion, path traversal, and command injection. The use-after-free entries
+  (32135/24793/24794), the `DcmItem::read` recursion (10528), and the Philips
+  PMSCT_RLE1 entry (5441) are *structural triggers / regression seeds* — a
+  single static buffer cannot itself drive a heap use-after-free or guarantee a
+  stack smash, so they steer a parser into the vulnerable code path rather than
+  deterministically reproducing the bug. The full CVE coverage map (every CVE,
+  every library, and its delivery vector) lives in
+  [cve_coverage.md](cve_coverage.md).
 - **`metadata['cve_related']` — inspired-by bug classes, not reproductions.**
   Generic length/overflow/recursion payloads modelled after `CVE-2024-22100`
   (heap overflow), `CVE-2024-25578` (out-of-bounds write) and
