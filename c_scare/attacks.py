@@ -25,19 +25,32 @@ Attack Categories:
     StateMachineAttacks - DICOM state machine (Sta1-Sta13) violations
     CVEAttacks         - CVE-specific reproductions
 
-CVE Coverage:
-    CVE-2023-32135  - Use-After-Free in DCM parsing
-    CVE-2024-24793  - Use-After-Free in File Meta Info
-    CVE-2024-24794  - Use-After-Free in Sequence parsing
-    CVE-2024-33606  - SSRF via URI Value Representation
-    CVE-2019-11687  - Executable embedding (PEDICOM/ELFDICOM/TIFF)
-    CVE-2024-22100  - Heap-based buffer overflow
-    CVE-2024-25578  - Out-of-bounds write
-    CVE-2024-28877  - Stack-based buffer overflow
-    CVE-2024-34509  - dcmdata segfault via invalid DIMSE message
-    CVE-2026-5663   - OS command injection via storescp exec placeholders
+CVE coverage is tagged at two fidelity levels in each payload's metadata:
+
+  metadata['cve']         - a targeted reproduction / probe of a specific CVE.
+  metadata['cve_related'] - a generic bug-class payload *inspired by* a CVE but
+                            not claiming to reproduce it (e.g. a static buffer
+                            cannot reproduce a heap use-after-free); these also
+                            carry metadata['bug_class'].
+
+Targeted (metadata['cve']):
+    CVE-2019-11687  - Executable embedding (PEDICOM/ELFDICOM/TIFF polyglots)
     CVE-2022-2119   - SCP path traversal in stored DICOM filenames
-    CVE-2022-2120   - SCU path traversal in stored DICOM filenames
+    CVE-2022-2120   - SCU path traversal (same payload, RawSCP delivery)
+    CVE-2023-32135  - Use-After-Free trigger in DCM parsing (structural seed)
+    CVE-2024-24793  - Use-After-Free trigger in File Meta Info (structural seed)
+    CVE-2024-24794  - Use-After-Free trigger in Sequence parsing (structural seed)
+    CVE-2024-33606  - SSRF via URI Value Representation
+    CVE-2024-34509  - dcmdata segfault via invalid DIMSE message (black-box analogue)
+    CVE-2026-5663   - OS command injection via storescp exec placeholders
+
+  Config-file CVEs exercised by the grey-box dcmqrscp track live under
+  fuzz/configs/malformed/: CVE-2020-36855, CVE-2022-4981.
+
+Inspired-by bug classes (metadata['cve_related'], not reproductions):
+    CVE-2024-22100  - heap overflow      -> integer-overflow / oversized-value
+    CVE-2024-25578  - out-of-bounds write -> length-mismatch / oob-offset / lut-bounds
+    CVE-2024-28877  - stack overflow      -> recursion-stack-exhaustion
 
 Example:
     from c_scare.attacks import ParserAttacks, CVEAttacks, ProtocolSeedGenerator
@@ -248,7 +261,8 @@ class ParserAttacks:
             payload=data,
             description=f'Sequence nested {depth} levels deep',
             expected_behavior='Parser may stack overflow or hang',
-            metadata={'depth': depth, 'cve': 'CVE-2024-28877'}
+            metadata={'depth': depth, 'bug_class': 'recursion-stack-exhaustion',
+                      'cve_related': 'CVE-2024-28877'}
         )
     
     @staticmethod
@@ -268,7 +282,8 @@ class ParserAttacks:
     
     @staticmethod
     def duplicate_tag() -> AttackResult:
-        """Same tag appears twice. CVE-2024-24793 variant."""
+        """Same tag appears twice (duplicate-tag handling; lineage:
+        CVE-2024-24793, whose targeted reproduction lives in CVEAttacks)."""
         ds = Dataset()
         ds._force_append(Element(0x0010, 0x0010, 'PN', 'Doe^John'))
         ds._force_append(Element(0x0010, 0x0010, 'PN', 'Evil^Patient'))
@@ -279,7 +294,7 @@ class ParserAttacks:
             payload=ds.encode(),
             description='PatientName appears twice',
             expected_behavior='Parser behavior undefined - may use either',
-            metadata={'cve': 'CVE-2024-24793'}
+            metadata={'bug_class': 'duplicate-tag', 'cve_related': 'CVE-2024-24793'}
         )
     
     @staticmethod
@@ -297,7 +312,7 @@ class ParserAttacks:
     
     @staticmethod
     def format_string_injection() -> AttackResult:
-        """Format string patterns in string VR. CVE-2024-28877 variant."""
+        """Format string patterns in string VR."""
         ds = Dataset()
         ds = ds / Element(0x0008, 0x1030, 'LO', '%s%s%s%s%s%s%s%s%n')  # Study Description
         ds = ds / Element(0x0010, 0x0010, 'PN', '%x%x%x%x%x%x%x%x')  # Patient Name
@@ -308,7 +323,7 @@ class ParserAttacks:
             payload=ds.encode(),
             description='Format string patterns in string tags',
             expected_behavior='Parser should not interpret as format strings',
-            metadata={'cve': 'CVE-2024-28877'}
+            metadata={'bug_class': 'format-string'}
         )
     
     @staticmethod
@@ -324,7 +339,7 @@ class ParserAttacks:
             payload=ds.encode(),
             description='Path traversal sequences in string tags',
             expected_behavior='Parser should sanitize paths',
-            metadata={'cve': 'CVE-2024-28877'}
+            metadata={'bug_class': 'path-traversal', 'cve_related': 'CVE-2022-2119'}
         )
     
     @staticmethod
@@ -340,7 +355,7 @@ class ParserAttacks:
             payload=ds.encode(),
             description='Unicode that may expand during conversion',
             expected_behavior='Parser should handle encoding safely',
-            metadata={'cve': 'CVE-2024-28877'}
+            metadata={'bug_class': 'charset-expansion'}
         )
     
     @staticmethod
@@ -728,7 +743,7 @@ class MemoryAttacks:
             payload=ds.encode(),
             description='65535x65535 pixels with 32-bit allocation',
             expected_behavior='May cause integer overflow in size calc',
-            metadata={'cve': 'CVE-2024-22100'}
+            metadata={'bug_class': 'integer-overflow', 'cve_related': 'CVE-2024-22100'}
         )
     
     @staticmethod
@@ -745,7 +760,7 @@ class MemoryAttacks:
             payload=pixel.encode(),
             description='10,000 pixel fragments',
             expected_behavior='May exhaust memory tracking fragments',
-            metadata={'cve': 'CVE-2024-22100'}
+            metadata={'bug_class': 'resource-exhaustion'}
         )
     
     @staticmethod
@@ -769,7 +784,7 @@ class MemoryAttacks:
             payload=data,
             description=f'{num_offsets} fragment offsets pointing to huge addresses',
             expected_behavior='Parser may allocate or seek to huge addresses',
-            metadata={'cve': 'CVE-2024-25578'}
+            metadata={'bug_class': 'oob-offset', 'cve_related': 'CVE-2024-25578'}
         )
     
     @staticmethod
@@ -784,12 +799,12 @@ class MemoryAttacks:
             payload=ds.encode(),
             description='SOP Instance UID with 100,000 values',
             expected_behavior='Parser may allocate huge string array',
-            metadata={'cve': 'CVE-2024-22100'}
+            metadata={'bug_class': 'resource-exhaustion'}
         )
     
     @staticmethod
     def oversized_string_vr(size: int = 0x10000) -> AttackResult:
-        """String VR exceeding normal limits. CVE-2024-22100."""
+        """String VR exceeding normal limits."""
         ds = Dataset()
         ds = ds / Element(0x0010, 0x0010, 'PN', 'A' * size)  # Patient Name
         
@@ -799,7 +814,7 @@ class MemoryAttacks:
             payload=ds.encode(),
             description=f'Patient Name with {size} bytes',
             expected_behavior='Parser should handle or reject gracefully',
-            metadata={'cve': 'CVE-2024-22100', 'size': size}
+            metadata={'bug_class': 'oversized-value', 'size': size}
         )
     
     @staticmethod
@@ -818,7 +833,7 @@ class MemoryAttacks:
             payload=ds.encode(),
             description='Element with maximum possible length declaration',
             expected_behavior='Parser should detect impossibility',
-            metadata={'cve': 'CVE-2024-22100'}
+            metadata={'bug_class': 'length-overflow'}
         )
     
     @staticmethod
@@ -836,7 +851,7 @@ class MemoryAttacks:
             payload=data,
             description='OB value exceeds declared length',
             expected_behavior='Parser should stop at declared length',
-            metadata={'cve': 'CVE-2024-25578'}
+            metadata={'bug_class': 'length-mismatch', 'cve_related': 'CVE-2024-25578'}
         )
     
     @staticmethod
@@ -854,7 +869,7 @@ class MemoryAttacks:
             payload=data,
             description='OW value exceeds declared length',
             expected_behavior='Parser should stop at declared length',
-            metadata={'cve': 'CVE-2024-25578'}
+            metadata={'bug_class': 'length-mismatch', 'cve_related': 'CVE-2024-25578'}
         )
     
     @staticmethod
@@ -872,7 +887,7 @@ class MemoryAttacks:
             payload=ds.encode(),
             description='LUT data far exceeds descriptor count',
             expected_behavior='Parser should validate LUT size',
-            metadata={'cve': 'CVE-2024-25578'}
+            metadata={'bug_class': 'lut-bounds', 'cve_related': 'CVE-2024-25578'}
         )
     
     @staticmethod
@@ -894,7 +909,7 @@ class MemoryAttacks:
             payload=pixel.encode(),
             description='JPEG with oversized segment length',
             expected_behavior='JPEG decoder should handle gracefully',
-            metadata={'cve': 'CVE-2024-25578'}
+            metadata={'bug_class': 'codec-length'}
         )
 
     @classmethod

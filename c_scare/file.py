@@ -16,8 +16,8 @@ DICOM file structure:
     └── Dataset (encoding per Transfer Syntax)
 
 Example:
-    from dicom_hacker.file import DicomFile
-    
+    from c_scare.file import DicomFile
+
     # Build file from dataset
     df = DicomFile()
     df.set_meta(

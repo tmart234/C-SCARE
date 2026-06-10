@@ -10,7 +10,7 @@ private tags, encapsulated pixels) but VALIDATES on encoding.
 We use pydicom to understand, our encoder to corrupt.
 
 Example:
-    from dicom_hacker.corruptor import Corruptor
+    from c_scare.corruptor import Corruptor
     import pydicom
     
     # Load with pydicom (it understands everything)
@@ -35,7 +35,10 @@ from enum import Enum, auto
 from io import BytesIO
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
-from .element import Element, Dataset, Tag, VR, Sequence, hexdump
+from .element import (
+    Element, Dataset, Tag, VR, Sequence, hexdump,
+    pad_to_even, encode_vr_length,
+)
 
 __all__ = [
     'Corruptor',
@@ -79,23 +82,22 @@ class Injection:
 @dataclass
 class SequencePath:
     """
-    Path into nested sequences for deep corruption.
-    
+    Path to an element inside a sequence item, for in-sequence corruption.
+
     Example:
         SequencePath((0x0040, 0xA730), 0, (0x0008, 0x0100))
         = ContentSequence, item 0, CodeValue
+
+    Deeper nesting is addressed by the path-string form the encoder threads
+    through each item: ``(0040,A730)[0].(0008,0100)[0].(0008,0102)``.
     """
     sequence_tag: Tuple[int, int]
     item_index: int
     element_tag: Tuple[int, int]
-    # For deeper nesting
-    nested: Optional['SequencePath'] = None
-    
+
     def to_path_string(self) -> str:
         s = f"({self.sequence_tag[0]:04X},{self.sequence_tag[1]:04X})[{self.item_index}]"
         s += f".({self.element_tag[0]:04X},{self.element_tag[1]:04X})"
-        if self.nested:
-            s += "." + self.nested.to_path_string()
         return s
 
 
@@ -109,7 +111,7 @@ class Corruptor:
     
     Usage:
         import pydicom
-        from dicom_hacker.corruptor import Corruptor
+        from c_scare.corruptor import Corruptor
         
         # Load with pydicom - it understands everything
         ds = pydicom.dcmread("real_scanner_output.dcm")
@@ -456,26 +458,30 @@ class Corruptor:
     # Encoding - THE KEY PART
     # =========================================================================
     
-    def _encode_pydicom_value(self, elem, little_endian: bool) -> bytes:
+    def _encode_pydicom_value(self, elem, little_endian: bool,
+                              seq_path: str = '') -> bytes:
         """
         Encode a pydicom element value to bytes.
-        
+
         Handles all the pydicom value types (PersonName, MultiValue, etc.)
+
+        ``seq_path`` is this element's override-path prefix; for a sequence it is
+        threaded down to nested items so ``set_vr_in_sequence`` overrides match.
         """
         value = elem.value
         vr = elem.VR
-        
+
         # None or empty
         if value is None:
             return b''
-        
+
         # Already bytes
         if isinstance(value, bytes):
             return value
-        
+
         # Sequence - handled separately
         if vr == 'SQ':
-            return self._encode_sequence(elem, little_endian)
+            return self._encode_sequence(elem, little_endian, seq_path)
         
         # Numeric types
         if vr in ('SS', 'US', 'SL', 'UL', 'FL', 'FD', 'SV', 'UV', 'AT'):
@@ -544,20 +550,28 @@ class Corruptor:
         
         return result.getvalue()
     
-    def _encode_sequence(self, elem, little_endian: bool) -> bytes:
-        """Encode a sequence element's value."""
+    def _encode_sequence(self, elem, little_endian: bool,
+                         seq_path: str = '') -> bytes:
+        """Encode a sequence element's value.
+
+        ``seq_path`` is the sequence element's override-path prefix (e.g.
+        ``(0040,A730)``); each item appends ``[i].`` so nested element overrides
+        keyed by :meth:`Corruptor._seq_path` resolve at any depth.
+        """
         bio = BytesIO()
-        
-        for item in elem.value:
+
+        for index, item in enumerate(elem.value):
             # Item tag
             if little_endian:
                 bio.write(b'\xFE\xFF\x00\xE0')
             else:
                 bio.write(b'\xFF\xFE\xE0\x00')
-            
-            # Encode item contents
-            item_bytes = self._encode_dataset_recursive(item, little_endian)
-            
+
+            # Encode item contents, threading the path so overrides match
+            item_prefix = f"{seq_path}[{index}]." if seq_path else ''
+            item_bytes = self._encode_dataset_recursive(
+                item, little_endian, item_prefix)
+
             # For now, use undefined length
             bio.write(b'\xFF\xFF\xFF\xFF')
             bio.write(item_bytes)
@@ -578,17 +592,18 @@ class Corruptor:
         
         return bio.getvalue()
     
-    def _encode_dataset_recursive(self, ds, little_endian: bool) -> bytes:
+    def _encode_dataset_recursive(self, ds, little_endian: bool,
+                                  path_prefix: str = '') -> bytes:
         """Encode a nested dataset (sequence item)."""
         bio = BytesIO()
         implicit_vr = self.force_implicit_vr or False
-        
+
         for elem in ds:
             tag_int = (elem.tag.group << 16) | elem.tag.element
             bio.write(self._encode_element_from_pydicom(
-                tag_int, elem, implicit_vr, little_endian
+                tag_int, elem, implicit_vr, little_endian, path_prefix
             ))
-        
+
         return bio.getvalue()
     
     def _encode_element_from_pydicom(self, tag_int: int, elem,
@@ -641,18 +656,13 @@ class Corruptor:
             else:
                 val_bytes = str(effective_override.value).encode('ascii', errors='replace')
         else:
-            # Encode the original pydicom value
-            val_bytes = self._encode_pydicom_value(elem, little_endian)
+            # Encode the original pydicom value; pass this element's path so a
+            # sequence threads it to nested items for override matching.
+            val_bytes = self._encode_pydicom_value(elem, little_endian, current_path)
         
         # Pad to even length
-        if len(val_bytes) % 2:
-            if vr == 'UI':
-                val_bytes += b'\x00'
-            elif vr in ('OB', 'OW', 'OF', 'OD', 'UN', 'SQ'):
-                val_bytes += b'\x00'
-            else:
-                val_bytes += b' '
-        
+        val_bytes = pad_to_even(val_bytes, vr)
+
         # === LENGTH ===
         if effective_override.length is not None:
             length = effective_override.length
@@ -660,32 +670,17 @@ class Corruptor:
             length = 0xFFFFFFFF
         else:
             length = len(val_bytes)
-        
+
         # === ENCODE VR AND LENGTH ===
-        if implicit_vr:
-            # Implicit VR: just 4-byte length
-            endian = '<' if little_endian else '>'
-            bio.write(struct.pack(endian + 'I', length))
-        else:
-            # Explicit VR
-            if effective_override.raw_vr:
-                bio.write(effective_override.raw_vr[:2])
-            else:
-                bio.write(vr[:2].encode('ascii', errors='replace'))
-            
-            # Length encoding depends on VR
-            long_vrs = {'OB', 'OD', 'OF', 'OL', 'OV', 'OW', 'SQ', 'UC', 'UN', 'UR', 'UT', 'SV', 'UV'}
-            endian = '<' if little_endian else '>'
-            
-            if vr.upper() in long_vrs or length > 0xFFFF:
-                bio.write(b'\x00\x00')  # Reserved
-                bio.write(struct.pack(endian + 'I', length))
-            else:
-                bio.write(struct.pack(endian + 'H', length & 0xFFFF))
-        
+        # raw_vr (when present) is emitted verbatim, even sub-2-byte, so the VR
+        # bytes can themselves be malformed; encode_vr_length left-pads to 2.
+        raw_vr = effective_override.raw_vr
+        bio.write(encode_vr_length(vr, length, implicit_vr, little_endian,
+                                   raw_vr=raw_vr))
+
         # === VALUE BYTES ===
         bio.write(val_bytes)
-        
+
         return bio.getvalue()
     
     def _encode_element_from_ours(self, elem: Element,

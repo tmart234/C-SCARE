@@ -112,8 +112,6 @@ from .scapy_dicom import (
     parse_dimse_status,
     parse_dimse_command_us,
     parse_dimse_command_field,
-    _uid_to_bytes,
-    _uid_to_bytes_raw,
     build_presentation_context_rq,
     build_user_information,
     build_user_identity,
@@ -174,7 +172,7 @@ from .deliver import send_pdu, send_sequence, send_cstore
 # sculpted query builder. Query/retrieve flows (c_find/c_get/c_move) live on
 # DICOMSession; these compose them into operations.
 from .workflows import (
-    WorkflowResult, RoleNegotiationResult, HostileObservation,
+    RoleNegotiationResult, HostileObservation,
     AETResult, CredResult, QR_MODELS,
     build_query, ae_brute, cred_brute,
 )
@@ -294,8 +292,6 @@ __all__ = [
     "parse_dimse_status",
     "parse_dimse_command_us",
     "parse_dimse_command_field",
-    "_uid_to_bytes",
-    "_uid_to_bytes_raw",
     "build_presentation_context_rq",
     "build_user_information",
     "build_user_identity",
@@ -339,7 +335,7 @@ __all__ = [
     "RawSCP", "ConnectionState", "Connection",
     "send_pdu", "send_sequence", "send_cstore",
     # SCU-side attack workflows
-    "WorkflowResult", "RoleNegotiationResult", "HostileObservation",
+    "RoleNegotiationResult", "HostileObservation",
     "AETResult", "CredResult", "QR_MODELS",
     "build_query", "ae_brute", "cred_brute",
     # SCP-side workflow responders

@@ -399,40 +399,7 @@ class DICOMSession:
             message_id=msg_id,
         ))
 
-        cmd_pdv = PresentationDataValueItem(
-            context_id=store_ctx_id,
-            data=dimse_rq,
-            is_command=1,
-            is_last=1,
-        )
-        pdata_cmd = DICOM() / P_DATA_TF(pdv_items=[cmd_pdv])
-        self.send(pdata_cmd)
-
-        max_pdv_data = self.max_pdu_length - 12
-
-        if len(dataset_bytes) <= max_pdv_data:
-            data_pdv = PresentationDataValueItem(
-                context_id=store_ctx_id,
-                data=dataset_bytes,
-                is_command=0,
-                is_last=1,
-            )
-            pdata_data = DICOM() / P_DATA_TF(pdv_items=[data_pdv])
-            self.send(pdata_data)
-        else:
-            offset = 0
-            while offset < len(dataset_bytes):
-                chunk = dataset_bytes[offset:offset + max_pdv_data]
-                is_last = 1 if (offset + len(chunk) >= len(dataset_bytes)) else 0
-                data_pdv = PresentationDataValueItem(
-                    context_id=store_ctx_id,
-                    data=chunk,
-                    is_command=0,
-                    is_last=is_last,
-                )
-                pdata_data = DICOM() / P_DATA_TF(pdv_items=[data_pdv])
-                self.send(pdata_data)
-                offset += len(chunk)
+        self._send_command_and_data(store_ctx_id, dimse_rq, dataset_bytes)
 
         response = self.recv()
 

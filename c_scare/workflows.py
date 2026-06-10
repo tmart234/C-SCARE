@@ -14,8 +14,9 @@ Synergy with black-box DAST:
     credential with :func:`cred_brute`, then feed those into the DAST
     ``--ae-title`` / ``--username`` flags so payload delivery starts from an
     associated, authenticated position.
-  * Findings convert to the catalog's ``AttackResult`` (:meth:`WorkflowResult.
-    to_attack_result`) so they flow through the existing SARIF writer.
+  * Findings convert to the catalog's ``AttackResult`` (e.g.
+    :meth:`RoleNegotiationResult.to_attack_result`) so they flow through the
+    existing SARIF writer.
 
 The decisive capability across all of these is *reading the response payload*,
 not just classifying accept/reject — see docs/dicom-attack-workflows.md.
@@ -41,7 +42,6 @@ from .scapy_dicom import (
 )
 
 __all__ = [
-    "WorkflowResult",
     "RoleNegotiationResult",
     "HostileObservation",
     "AETResult",
@@ -75,31 +75,6 @@ _QR_LEVEL = {
     "series": "SERIES",
     "image": "IMAGE",
 }
-
-
-@dataclass
-class WorkflowResult:
-    """A single workflow finding, convertible to the catalog AttackResult so it
-    rides the same SARIF reporting path as the DAST attack catalog."""
-
-    name: str
-    category: str
-    description: str
-    detail: Dict[str, Any] = field(default_factory=dict)
-    success: Optional[bool] = None
-
-    def to_attack_result(self):
-        """Adapt to ``attacks.AttackResult`` for SARIF output."""
-        from .attacks import AttackResult
-        return AttackResult(
-            name=self.name,
-            category=self.category,
-            payload=b"",
-            description=self.description,
-            expected_behavior="workflow probe",
-            metadata=dict(self.detail),
-            success=self.success,
-        )
 
 
 @dataclass

@@ -16,10 +16,10 @@ Two delivery directions:
 
 ## Attack catalog
 
-C-SCARE ships **8 attack categories** totalling **68 hand-built payloads** and
-covering **13 unique CVEs**. The catalog is used two ways: delivered live for
-black-box DAST, or written to disk as an AFL/AFLNet seed corpus
-(`c-scare corpus -o ./corpus`) — see [Grey-box fuzzing](fuzzing.md).
+C-SCARE ships **8 attack categories** totalling **86 hand-built payloads** (the
+count each category's `all()` iterator yields). The catalog is used two ways:
+delivered live for black-box DAST, or written to disk as an AFL/AFLNet seed
+corpus (`c-scare corpus -o ./corpus`) — see [Grey-box fuzzing](fuzzing.md).
 
 | Category | Payloads | What it targets | Key class |
 |----------|:--------:|----------------|-----------|
@@ -27,19 +27,31 @@ black-box DAST, or written to disk as an AFL/AFLNet seed corpus
 | **Protocol** | 14 | PDU malformation, AE title overflow, missing items | `ProtocolAttacks` |
 | **Memory** | 10 | Pixel dimension overflow, fragment bombs, LUT overflow | `MemoryAttacks` |
 | **Logic** | 7 | Transfer syntax mismatch, SSRF via URI, file:// injection | `LogicAttacks` |
-| **Command Injection** | 3 | Shell metacharacters in SOP/Study Instance UID & Patient Name that feed storescp's `--exec-on-reception` placeholders (DCMTK #1194 / CVE-2026-5663) | `CommandInjectionAttacks` |
-| **Path Traversal** | 3 | `../` sequences in SOP/Study Instance UID & Patient Name that escape the storescp/SCU storage directory (CVE-2022-2119/2120) | `PathTraversalAttacks` |
+| **Command Injection** | 13 | Shell metacharacters across SOP/Study Instance UID & Patient Name that feed storescp's `--exec-on-reception` placeholders (DCMTK #1194 / CVE-2026-5663) | `CommandInjectionAttacks` |
+| **Path Traversal** | 11 | `../` sequences across SOP/Study Instance UID & Patient Name that escape the storescp/SCU storage directory (CVE-2022-2119/2120) | `PathTraversalAttacks` |
 | **State Machine** | 5 | Out-of-order PDUs (Sta1–Sta13 violations) | `StateMachineAttacks` |
 | **CVE** | 15 | CVE-2023-32135, CVE-2024-24793/94, CVE-2024-33606, CVE-2019-11687, and more | `CVEAttacks` |
 
 Each `*Attacks` class exposes an `all()` iterator of `AttackResult` objects.
 
-### CVEs covered
+### CVE mapping (fidelity matters)
 
-`CVE-2019-11687`, `CVE-2022-2119`, `CVE-2022-2120`, `CVE-2023-32135`,
-`CVE-2024-22100`, `CVE-2024-24793`, `CVE-2024-24794`, `CVE-2024-25578`,
-`CVE-2024-28877`, `CVE-2024-33606`, `CVE-2024-34508`, `CVE-2024-34509`,
-`CVE-2026-5663`.
+Each payload tags its CVE relationship honestly in `metadata`:
+
+- **`metadata['cve']` — directly targeted / probed.** Eight CVEs:
+  `CVE-2019-11687`, `CVE-2022-2119` (and `CVE-2022-2120`, the same payload
+  served via `RawSCP` at an SCU), `CVE-2023-32135`, `CVE-2024-24793`,
+  `CVE-2024-24794`, `CVE-2024-33606`, `CVE-2024-34509`, `CVE-2026-5663`. The
+  three use-after-free entries (32135/24793/24794) are *structural triggers /
+  regression seeds* — a single static buffer cannot itself drive a heap
+  use-after-free, so they steer a parser into the vulnerable code path rather
+  than guaranteeing the freed-memory access.
+- **`metadata['cve_related']` — inspired-by bug classes, not reproductions.**
+  Generic length/overflow/recursion payloads modelled after `CVE-2024-22100`
+  (heap overflow), `CVE-2024-25578` (out-of-bounds write) and
+  `CVE-2024-28877` (stack overflow); these also carry a `bug_class` tag.
+- **Config-file CVEs** for the grey-box dcmqrscp track live under
+  `fuzz/configs/malformed/`: `CVE-2020-36855`, `CVE-2022-4981`.
 
 ## Crafting & corruption primitives
 

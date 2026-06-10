@@ -67,9 +67,8 @@ def send_cstore(target: Tuple[str, int],
     the workflow-as-precondition synergy.
     """
     try:
-        from .scapy_dicom import (
-            DICOMSession, DEFAULT_TRANSFER_SYNTAX_UID,
-        )
+        from .client import DICOMSession
+        from .scapy_dicom import DEFAULT_TRANSFER_SYNTAX_UID
     except ImportError:
         return None
 

@@ -11,7 +11,7 @@ C-SCARE is organised around *who* you test — a DICOM server (SCP) or a client 
 |                       | **Pentest workflows** | **DAST** (black-box) | **Fuzzing** (grey-box) |
 |-----------------------|-----------------------|----------------------|------------------------|
 | **What it does**      | Scripted recon → query/retrieve flows that reach a test's starting state | Deliver a static attack catalog at a live target, watch for anomalies | Coverage-guided mutation of instrumented binaries |
-| **Quantified**        | **5** workflows (W1–W5) | **8** attack categories · **68** payloads · **13** CVEs | **6** targets · **2** engines · **3** sanitizers |
+| **Quantified**        | **5** workflows (W1–W5) | **8** attack categories · **86** payloads · **8** CVEs reproduced (+ inspired-by & config-file CVEs) | **6** targets · **2** engines · **3** sanitizers |
 | **Targets**           | SCP and SCU | SCP (server) and SCU (client, via rogue server) | SCP (file/parser/network) and SCU (experimental) |
 | **Instrumentation**   | None | None — works on real devices / prebuilt binaries | Required (recompiled, QEMU, or SAND) |
 | **Engine**            | C-SCARE (scapy-based) | C-SCARE (scapy-based via catalog + monitors) | AFL++ / AFLNet (C-SCARE bridges + triages) |
@@ -23,68 +23,70 @@ C-SCARE is organised around *who* you test — a DICOM server (SCP) or a client 
 
 ## Architecture
 
+The flow is left-to-right: external **inputs** feed the **crafting** layer, which
+feeds the **attack catalog**, which fans out to the **three testing pillars**,
+which drive the **targets** and converge on a single **SARIF** report.
+
 ```mermaid
-flowchart TD
-    USER[Operator / Researcher]
+flowchart LR
+    OP([Operator / Researcher])
 
-    subgraph CRAFT [Crafting and corruption - malformed DICOM primitives]
-        ELEMENT[element.py - dataset/element building]
-        CORRUPTOR[corruptor.py - re-emit a real .dcm as invalid]
-        PIXEL[pixel.py - encapsulated pixel data]
-        FILE[file.py - Part 10 file handling]
-        SCAPY[scapy_dicom.py - malformed PDUs/DIMSE wire-format + DICOMSocket]
+    %% ---- External inputs ----
+    REALDCM[(Real .dcm file)]
+    CFG[(dcmqrscp config<br/>malformed .cfg)]
+
+    %% ---- Crafting & corruption primitives ----
+    subgraph CRAFT [Crafting and corruption]
+        PYDICOM[pydicom<br/>parse real objects]
+        CORRUPTOR[corruptor.py<br/>re-emit as invalid]
+        ELEMENT[element.py<br/>dataset + shared encoder]
+        PIXEL[pixel.py<br/>encapsulated pixel data]
+        FILE[file.py<br/>Part 10 file]
+        SCAPY[scapy_dicom.py<br/>malformed PDUs/DIMSE]
+        PYDICOM --> CORRUPTOR
+        ELEMENT --> CORRUPTOR & PIXEL & FILE
     end
 
-    CATALOG[attacks.py - static attack catalog + seed generators]
-    CLIENT[client.py - DICOMSession SCU transport - shared]
+    REALDCM -->|pydicom bridge| PYDICOM
 
-    subgraph BLACKBOX [Black-box / DAST - tests both roles]
-        DELIVER[deliver.py - send the catalog at a live target]
-        SERVER[server.py - RawSCP rogue server]
-    end
-
-    subgraph WORKFLOWS [Pentest workflows - role-agnostic]
-        ISSUER[workflows.py - issuer: ae_brute / cred_brute / c_find / c_get / c_move]
-        RESPONDER[responders.py - WorkflowResponder]
-    end
-
-    subgraph GREYBOX [Grey-box fuzzing]
-        AFL[AFL++ / AFLNet engines]
-        GB[greybox.py - harness + crash triage]
-    end
-
-    MONITOR[monitor.py - sanitizer / process / protocol]
-    SARIF[SARIF v2.1.0 report]
-
-    USER --> CATALOG
-    USER --> SERVER
-    USER --> WORKFLOWS
-    USER --> GB
-
-    %% Crafting/corruption underpins the catalog AND both wire endpoints
-    %% (the SCU transport and the rogue server) - not just one side.
+    CATALOG[attacks.py<br/>static catalog + seed generators]
     CRAFT --> CATALOG
-    CRAFT --> CLIENT
-    CRAFT --> SERVER
 
+    %% ---- Three testing pillars ----
+    subgraph WF [Pentest workflows]
+        ISSUER[workflows.py<br/>SCU issuer]
+        RESPONDER[responders.py<br/>SCP responder]
+    end
+    subgraph DAST [Black-box DAST]
+        DELIVER[deliver.py<br/>live delivery]
+        ROGUE[server.py<br/>RawSCP rogue server]
+    end
+    subgraph GB [Grey-box fuzzing]
+        AFL[AFL++ / AFLNet engines]
+        BRIDGE[greybox.py<br/>harness + crash triage]
+    end
+
+    CLIENT[client.py<br/>DICOMSession SCU transport]
+    SCAPY --> CLIENT
+
+    OP --> CATALOG & WF & ROGUE & GB
     CATALOG -->|live delivery| DELIVER
-    CATALOG -->|seed corpus| AFL
+    CATALOG -->|seed corpus + dict| AFL
+    CFG -->|config-file CVEs| AFL
 
-    %% Targeting a server (SCP): DAST delivery and issuer workflows both
-    %% drive the shared SCU transport against an SCP.
-    DELIVER -->|targets an SCP| CLIENT
-    ISSUER -->|targets an SCP| CLIENT
+    %% Targeting a server (SCP): DAST delivery and issuer workflows share the
+    %% SCU transport; targeting a client (SCU): the rogue server.
+    DELIVER & ISSUER -->|targets an SCP| CLIENT
+    RESPONDER -->|targets an SCU| ROGUE
+    AFL --> BRIDGE
 
-    %% Targeting a client (SCU): the RawSCP rogue server, driven by DAST
-    %% delivery and by responder workflows.
-    RESPONDER -->|targets an SCU| SERVER
-
-    CLIENT -->|observe SCP responses| MONITOR
-    SERVER -->|observe SCU behavior| MONITOR
-    AFL --> GB
-    GB --> MONITOR
-    MONITOR --> SARIF
-    WORKFLOWS -->|findings| SARIF
+    %% ---- Observation + reporting ----
+    MONITOR[monitor.py<br/>sanitizer / protocol / process]
+    CLIENT -->|SCP responses| MONITOR
+    ROGUE -->|SCU behavior| MONITOR
+    BRIDGE --> MONITOR
+    MONITOR --> SARIF[SARIF v2.1.0 report]
+    ISSUER -->|findings| SARIF
 ```
 
 ### Module reference

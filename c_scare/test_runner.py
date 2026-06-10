@@ -194,6 +194,27 @@ def _run_monitored_test(args, result: AttackResult, target, timeout: float):
         time.sleep(0.5)
 
 
+def _sarif_fingerprint(result, detections) -> str:
+    """Stable dedup key for a finding.
+
+    Two crashes with the same finding types and top stack frame collapse to one
+    SARIF result for the consumer (GitHub code scanning et al.), so a campaign
+    that rediscovers the same bug a thousand times reports it once. Built from
+    the finding types plus the first line of the first stack trace; falls back
+    to category/name when there is no detection (e.g. a clean catalog delivery).
+    """
+    import hashlib
+
+    parts = [f"{rpt.finding_type}" for rpt in detections]
+    for rpt in detections:
+        if rpt.evidence:
+            parts.append(rpt.evidence.strip().splitlines()[0].strip())
+            break
+    if not parts:
+        parts = [result.category, result.name]
+    return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
+
+
 def write_sarif(results: list, filepath: str):
     """Write SARIF v2.1.0 report from AttackResult objects."""
     import json
@@ -211,28 +232,43 @@ def write_sarif(results: list, filepath: str):
                 rule_def["helpUri"] = f"https://cve.mitre.org/cgi-bin/cvename.cgi?name={r.cve}"
             rules[rule_id] = rule_def
 
-        if r.success is False:
-            level = "error"
-        elif r.success is True:
-            level = "note"
-        else:
-            level = "warning"
+        # SARIF severity follows the tri-state finding flag AttackResult.success:
+        #   True  -> an anomaly was actively detected (sanitizer crash/leak,
+        #            protocol/process monitor, hostile-client misbehavior)
+        #   False -> a finding established by an expected failure: the peer
+        #            aborted us (role withheld), or a payload could not be built
+        #   None  -> delivered with no finding / not monitored / inconclusive
+        # Both True and False are reportable findings and map to "error"; only
+        # the no-finding case is informational.
+        level = "note" if r.success is None else "error"
 
+        detections = [rpt for rpt in r.monitor_reports if rpt.detected]
         result_obj = {
             "ruleId": rule_id,
             "level": level,
             "message": {"text": r.description},
+            "partialFingerprints": {
+                "cscareFinding/v1": _sarif_fingerprint(r, detections),
+            },
             "properties": {
                 "category": r.category,
                 "expected_behavior": r.expected_behavior,
             },
         }
+        # Grey-box triage results carry the crash/queue input path; surface it as
+        # the result location so consumers can locate and dedup by artifact.
+        crash_path = r.metadata.get("crash_path")
+        if crash_path:
+            result_obj["locations"] = [{
+                "physicalLocation": {
+                    "artifactLocation": {"uri": crash_path},
+                },
+            }]
         if r.cve:
             result_obj["properties"]["cve"] = r.cve
         for key in ("delivery", "mutation"):
             if r.metadata.get(key) is not None:
                 result_obj["properties"][key] = r.metadata[key]
-        detections = [rpt for rpt in r.monitor_reports if rpt.detected]
         if detections:
             result_obj["properties"]["monitors"] = [
                 {

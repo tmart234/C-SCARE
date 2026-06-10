@@ -41,7 +41,6 @@ Note on PS3.5 encoding:
 import logging
 import socket
 import struct
-import time
 from typing import Any, Dict, List, Optional, Tuple, Union, TYPE_CHECKING
 
 # =============================================================================
@@ -2608,37 +2607,8 @@ def parse_dimse_status(dimse_bytes):
     - 0x01xx: Warning
     - 0x0Axx-0x0Cxx: Failure
     """
-    try:
-        if len(dimse_bytes) < 12:
-            return None
+    return parse_dimse_command_us(dimse_bytes, 0x0000, 0x0900)
 
-        # Read Command Group Length value
-        cmd_group_len = struct.unpack("<I", dimse_bytes[8:12])[0]
-        offset = 12
-        group_end_offset = offset + cmd_group_len
-
-        # Search for Status element (0000,0900)
-        while offset < group_end_offset and offset + 8 <= len(dimse_bytes):
-            tag_group, tag_elem = struct.unpack(
-                "<HH", dimse_bytes[offset:offset + 4]
-            )
-            value_len = struct.unpack(
-                "<I", dimse_bytes[offset + 4:offset + 8]
-            )[0]
-
-            if tag_group == 0x0000 and tag_elem == 0x0900 and value_len == 2:
-                if offset + 10 > len(dimse_bytes):
-                    break
-                if offset + 10 > group_end_offset:
-                    break
-                return struct.unpack("<H", dimse_bytes[offset + 8:offset + 10])[0]
-
-            offset += 8 + value_len
-
-    except struct.error:
-        return None
-
-    return None
 
 def parse_dimse_command_us(dimse_bytes, group, element):
     # type: (bytes, int, int) -> Optional[int]
