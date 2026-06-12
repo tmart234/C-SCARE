@@ -17,6 +17,7 @@ __all__ = [
     'SanitizerMonitor',
     'ProtocolMonitor',
     'ProcessMonitor',
+    'LivenessMonitor',
     'SanitizerFinding',
     'parse_sanitizer_output',
 ]
@@ -376,3 +377,49 @@ class ProcessMonitor(BaseMonitor):
                 description=f'Process died (exit code: {self._proc.exit_code()})',
             )
         return MonitorReport(detected=False, description='Process alive')
+
+
+class LivenessMonitor(BaseMonitor):
+    """Black-box crash oracle for a *remote* target with no process handle.
+
+    The test runner re-probes the target after each payload (a fresh
+    association / C-ECHO) and reports the outcome here via
+    :meth:`set_liveness`. If the target stops answering at the DICOM layer,
+    the worker very likely crashed on the preceding payload — surfaced as a
+    finding instead of a silent inconclusive result. This catches a
+    single-process listener going down (e.g. a NULL-deref crash); a forked
+    server whose parent survives will still answer, so pair this with an
+    out-of-band core watcher on the device (scripts/dut_crash_watch.sh).
+    """
+
+    # Map a probe error to a finding type aligned with ProtocolMonitor.
+    _FINDING_TYPES = {
+        'refused': 'network:connection_refused',
+        'reset': 'network:connection_reset',
+        'timeout': 'network:timeout',
+    }
+
+    def __init__(self):
+        self._alive = True
+        self._error = None
+
+    def pre_test(self, test_number: int):
+        self._alive = True
+        self._error = None
+
+    def set_liveness(self, alive: bool, error: Optional[str] = None):
+        """Called by the test runner after the post-payload liveness probe."""
+        self._alive = alive
+        self._error = error
+
+    def post_test(self) -> MonitorReport:
+        if self._alive:
+            return MonitorReport(detected=False,
+                                 description='Target still answering after payload')
+        err = self._error or 'down'
+        return MonitorReport(
+            detected=True,
+            finding_type=self._FINDING_TYPES.get(err, f'liveness:{err}'),
+            description='Target stopped answering after this payload — likely crash',
+            evidence=f'liveness probe: {err}',
+        )

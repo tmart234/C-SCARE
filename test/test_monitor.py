@@ -21,6 +21,7 @@ MonitorReport = _mod.MonitorReport
 SanitizerMonitor = _mod.SanitizerMonitor
 ProtocolMonitor = _mod.ProtocolMonitor
 ProcessMonitor = _mod.ProcessMonitor
+LivenessMonitor = _mod.LivenessMonitor
 SanitizerFinding = _mod.SanitizerFinding
 parse_sanitizer_output = _mod.parse_sanitizer_output
 check_exit_code = _mod.check_exit_code
@@ -408,3 +409,40 @@ class TestBaseMonitor:
         m = BaseMonitor()
         report = m.post_test()
         assert report.detected is False
+
+
+class TestLivenessMonitor:
+    def setup_method(self):
+        self.monitor = LivenessMonitor()
+
+    def test_alive_is_not_a_finding(self):
+        self.monitor.pre_test(0)
+        self.monitor.set_liveness(True)
+        report = self.monitor.post_test()
+        assert report.detected is False
+
+    def test_refused_maps_to_connection_refused(self):
+        self.monitor.pre_test(0)
+        self.monitor.set_liveness(False, 'refused')
+        report = self.monitor.post_test()
+        assert report.detected is True
+        assert report.finding_type == 'network:connection_refused'
+
+    def test_reset_and_timeout_map_to_network_findings(self):
+        self.monitor.pre_test(0)
+        self.monitor.set_liveness(False, 'reset')
+        assert self.monitor.post_test().finding_type == 'network:connection_reset'
+        self.monitor.set_liveness(False, 'timeout')
+        assert self.monitor.post_test().finding_type == 'network:timeout'
+
+    def test_unknown_error_falls_back_to_liveness_namespace(self):
+        self.monitor.pre_test(0)
+        self.monitor.set_liveness(False, 'no_dicom_response')
+        report = self.monitor.post_test()
+        assert report.detected is True
+        assert report.finding_type == 'liveness:no_dicom_response'
+
+    def test_pre_test_resets_to_alive(self):
+        self.monitor.set_liveness(False, 'refused')
+        self.monitor.pre_test(1)
+        assert self.monitor.post_test().detected is False

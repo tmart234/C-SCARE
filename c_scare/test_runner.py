@@ -42,7 +42,7 @@ try:
     from . import deliver
     from .monitor import (
         BaseMonitor, MonitorReport, SanitizerMonitor,
-        ProtocolMonitor, ProcessMonitor,
+        ProtocolMonitor, ProcessMonitor, LivenessMonitor,
     )
     from .process_manager import InstrumentedProcess
 except ImportError:
@@ -54,7 +54,7 @@ except ImportError:
     import deliver
     from monitor import (
         BaseMonitor, MonitorReport, SanitizerMonitor,
-        ProtocolMonitor, ProcessMonitor,
+        ProtocolMonitor, ProcessMonitor, LivenessMonitor,
     )
     from process_manager import InstrumentedProcess
 
@@ -163,6 +163,69 @@ def _deliver(args, result: AttackResult, target, timeout: float):
         return None, 'reset'
 
 
+def _liveness_probe(args, target, timeout: float):
+    """Re-probe a remote target after a payload. Returns ``(alive, error)``.
+
+    ``alive`` is False only when the target stops answering at the network /
+    DICOM layer — the black-box signal that the worker crashed on the previous
+    payload. A plain TCP connect is the core oracle (a dead single-process
+    listener refuses the connection); when scapy is available an A-ASSOCIATE
+    round-trip confirms the DICOM listener itself still answers (a *rejected*
+    association still counts as alive — the server replied). Probe-side bugs
+    never fabricate a crash: if TCP connected, we report alive.
+    """
+    import socket as _socket
+    host, port = target[0], int(target[1])
+
+    sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect((host, port))
+    except ConnectionRefusedError:
+        return False, 'refused'
+    except ConnectionResetError:
+        return False, 'reset'
+    except (_socket.timeout, OSError):
+        return False, 'timeout'
+    finally:
+        sock.close()
+
+    if not SCAPY_AVAILABLE:
+        return True, None  # TCP accepted — listener is up
+
+    try:
+        from .client import DICOMSession
+        from .scapy_dicom import (
+            VERIFICATION_SOP_CLASS_UID, DEFAULT_TRANSFER_SYNTAX_UID,
+        )
+    except ImportError:
+        return True, None
+
+    try:
+        with DICOMSession(host, port, args.ae_title, 'C_SCARE_LIVE',
+                          read_timeout=timeout) as sess:
+            ok = sess.associate(
+                {VERIFICATION_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID]})
+            if ok:
+                try:
+                    sess.release()
+                except Exception:
+                    pass
+                return True, None
+            # A reject means the server answered — it is alive.
+            if getattr(sess, 'last_reject', None):
+                return True, None
+            return False, 'no_dicom_response'
+    except ConnectionRefusedError:
+        return False, 'refused'
+    except ConnectionResetError:
+        return False, 'reset'
+    except (OSError,):
+        return False, 'timeout'
+    except Exception:
+        return True, None  # TCP already succeeded; don't fabricate a crash
+
+
 def _run_monitored_test(args, result: AttackResult, target, timeout: float):
     """Send a payload and check all monitors for findings."""
     monitors = _get_monitors(args)
@@ -174,6 +237,13 @@ def _run_monitored_test(args, result: AttackResult, target, timeout: float):
 
     response, error = _deliver(args, result, target, timeout)
     result.response = response
+
+    live_monitors = [m for m in monitors if isinstance(m, LivenessMonitor)]
+    if live_monitors:
+        alive, live_error = _liveness_probe(args, target, timeout)
+        result.metadata['liveness'] = 'up' if alive else (live_error or 'down')
+        for monitor in live_monitors:
+            monitor.set_liveness(alive, live_error)
 
     for monitor in monitors:
         if isinstance(monitor, ProtocolMonitor):
@@ -1383,6 +1453,16 @@ def main(argv: Optional[List[str]] = None):
     )
 
     parser.add_argument(
+        '--monitor-remote',
+        action='store_true',
+        help='Black-box crash oracle for a REMOTE target (no instrumentation): '
+             'after each payload, re-probe the target with a fresh association / '
+             'C-ECHO. A worker that stops answering is reported as '
+             'network:connection_refused instead of a silent inconclusive result. '
+             'Pair with scripts/dut_crash_watch.sh on the device for forked servers.'
+    )
+
+    parser.add_argument(
         '--asan-port',
         type=int,
         default=None,
@@ -1449,6 +1529,15 @@ def main(argv: Optional[List[str]] = None):
         args.target = f"{args.ip}:{asan_port}"
         print(f"Monitors: SanitizerMonitor, ProcessMonitor, ProtocolMonitor")
         print(f"Target: {args.target} (ASan-instrumented)")
+        print()
+
+    elif getattr(args, 'monitor_remote', False):
+        args._monitors = [LivenessMonitor()]
+        args.target = f"{args.ip}:{args.port}"
+        print("Monitors: LivenessMonitor (remote C-ECHO re-probe after each payload)")
+        print(f"Target: {args.target} (black-box, remote)")
+        print("Note: detects a crashed *listener*; for forked servers also run "
+              "scripts/dut_crash_watch.sh on the device.")
         print()
 
     try:

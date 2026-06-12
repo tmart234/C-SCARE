@@ -120,6 +120,33 @@ c-scare corpus -o ./corpus
 
 (`python -m c_scare …` is equivalent to the `c-scare` console command.)
 
+### Detecting findings (the oracle)
+
+By default a remote run **delivers** payloads but attaches **no monitor**, so
+every result is scored `?` (inconclusive) — delivery happened, but nothing was
+evaluated. Attach an oracle:
+
+- **`--asan-binary PATH`** — launches a *local* ASan-instrumented target and
+  attaches `SanitizerMonitor + ProcessMonitor + ProtocolMonitor`. This is the
+  only way to catch *silent* (non-faulting) corruption — a short OOB read, a
+  heap overflow that doesn't fault — with an exact `file:line`.
+- **`--monitor-remote`** — black-box crash oracle for a target you can't
+  rebuild. After each payload C-SCARE re-probes the target with a fresh
+  association / C-ECHO; a worker that stops answering is reported as
+  `network:connection_refused` (a `LivenessMonitor` finding) instead of `?`.
+
+```bash
+# Remote black-box crash oracle (one category at a time keeps the timeline sparse)
+c-scare --ip 10.0.0.5 --port 104 --ae-title PACS --category cve --monitor-remote --sarif cve.sarif
+```
+
+`--monitor-remote` only sees a crash that takes the **listener** down (a
+single-process server). A forked server's parent survives a child crash, so the
+re-probe still succeeds — pair it with the out-of-band core watcher
+[`scripts/dut_crash_watch.sh`](../scripts/dut_crash_watch.sh) on the device, and
+remember **path-traversal / command-injection succeed with a *normal* response**
+(confirm those by their filesystem / command side effects, not the oracle).
+
 ## Fuzz clients with a rogue server (SCU)
 
 `RawSCP` fuzzes DICOM *clients* by controlling exactly what bytes the server
