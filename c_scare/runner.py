@@ -42,6 +42,7 @@ try:
         ParserAttacks, ProtocolAttacks, MemoryAttacks, LogicAttacks,
         StorageSCPAbuseAttacks, CommandInjectionAttacks,
         PathTraversalAttacks, StateMachineAttacks, CVEAttacks,
+        NegotiationAttacks, DimseNAttacks,
         ProtocolFuzzer, AttackResult, SCAPY_AVAILABLE
     )
     from . import deliver
@@ -55,6 +56,7 @@ except ImportError:
         ParserAttacks, ProtocolAttacks, MemoryAttacks, LogicAttacks,
         StorageSCPAbuseAttacks, CommandInjectionAttacks,
         PathTraversalAttacks, StateMachineAttacks, CVEAttacks,
+        NegotiationAttacks, DimseNAttacks,
         ProtocolFuzzer, AttackResult, SCAPY_AVAILABLE
     )
     import deliver
@@ -1145,6 +1147,8 @@ def run_generate_corpus(args) -> int:
         ('Path traversal attacks', PathTraversalAttacks),
         ('CVE attacks', CVEAttacks),
         ('Protocol attacks', ProtocolAttacks),
+        ('Negotiation attacks', NegotiationAttacks),
+        ('DIMSE-N attacks', DimseNAttacks),
         ('State machine attacks', StateMachineAttacks),
     ]
 
@@ -1315,6 +1319,16 @@ def run_state_machine_attacks(args) -> int:
     return 0
 
 
+def run_negotiation_attacks(args) -> int:
+    """Run A-ASSOCIATE user-information sub-item attacks."""
+    return _run_catalog(args, NegotiationAttacks, "Negotiation Attacks")
+
+
+def run_dimse_n_attacks(args) -> int:
+    """Run DIMSE-N normalized-service (MPPS / Storage Commitment) attacks."""
+    return _run_catalog(args, DimseNAttacks, "DIMSE-N Attacks")
+
+
 def run_memory_attacks(args) -> int:
     """Run memory corruption attack tests."""
     return _run_catalog(args, MemoryAttacks, "Memory Attacks")
@@ -1334,6 +1348,8 @@ def run_all_tests(args) -> int:
         ('Storage SCP Abuse Attacks', run_storage_scp_abuse_attacks),
         ('Command Injection Attacks', run_command_injection_attacks),
         ('Path Traversal Attacks', run_path_traversal_attacks),
+        ('Negotiation Attacks', run_negotiation_attacks),
+        ('DIMSE-N Attacks', run_dimse_n_attacks),
         ('Fuzz Packets', run_fuzz_packets),
     ]
     
@@ -1374,6 +1390,8 @@ def run_command(command: str, args) -> int:
         'storage_scp_abuse_attacks': run_storage_scp_abuse_attacks,
         'command_injection_attacks': run_command_injection_attacks,
         'path_traversal_attacks': run_path_traversal_attacks,
+        'negotiation_attacks': run_negotiation_attacks,
+        'dimse_n_attacks': run_dimse_n_attacks,
         'state_machine_attacks': run_state_machine_attacks,
         'all': run_all_tests,
     }
@@ -1882,7 +1900,7 @@ def main(argv: Optional[List[str]] = None):
         '--category',
         choices=['parser', 'protocol', 'memory', 'logic', 'storage_abuse',
              'command_injection', 'path_traversal', 'state_machine', 'cve',
-             'fuzz_packet', 'live_fuzz', 'all'],
+             'negotiation', 'dimse_n', 'fuzz_packet', 'live_fuzz', 'all'],
         help='Test category to run (if not specified, runs all)'
     )
     
@@ -2016,6 +2034,8 @@ def main(argv: Optional[List[str]] = None):
         'storage_abuse': 'storage_scp_abuse_attacks',
         'command_injection': 'command_injection_attacks',
         'path_traversal': 'path_traversal_attacks',
+        'negotiation': 'negotiation_attacks',
+        'dimse_n': 'dimse_n_attacks',
         'state_machine': 'state_machine_attacks',
         'cve': 'cve_attacks',
         'fuzz_packet': 'fuzz_packets',

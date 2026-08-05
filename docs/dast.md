@@ -23,23 +23,41 @@ as an AFL/AFLNet seed corpus (`c-scare corpus -o ./corpus`) — see
 
 | Category | Payloads | What it targets | Key class |
 |----------|:--------:|----------------|-----------|
-| **Parser** | 11 | VR fuzzing, length mismatches, sequence bombs, format strings | `ParserAttacks` |
+| **Parser** | 18 | VR fuzzing, length mismatches, sequence bombs, format strings, nesting-depth bomb, explicit/implicit VR and endianness confusion, group-length lies, odd-length values, private-block collision | `ParserAttacks` |
 | **Protocol** | 18 | PDU malformation, AE title overflow, missing items, duplicate/even presentation contexts, tiny Max PDU negotiation | `ProtocolAttacks` |
 | **Memory** | 10 | Pixel dimension overflow, fragment bombs, LUT overflow | `MemoryAttacks` |
 | **Logic** | 7 | Transfer syntax mismatch, SSRF via URI, file:// injection | `LogicAttacks` |
 | **Storage SCP Abuse** | 10 | Unauthenticated C-STORE import/storage abuse: empty identity, duplicate identity, command-vs-dataset mismatch, disk pressure, private-tag pressure, malformed C-STORE command/data sequences | `StorageSCPAbuseAttacks` |
 | **Command Injection** | 13 | Shell metacharacters in SOP/Study Instance UID & Patient Name that feed storescp's `--exec-on-reception` placeholders (DCMTK #1194 / CVE-2026-5663) | `CommandInjectionAttacks` |
-| **Path Traversal** | 23 | SOP/Study Instance UID, Patient Name, command-vs-dataset mismatches, file-meta confusion, Windows/POSIX absolute paths, UI padding/length/VM boundary cases, and attacker-controlled-extension plus NUL-byte suffix bypasses that escape storescp/SCU storage directories (CVE-2022-2119/2120) | `PathTraversalAttacks` |
-| **State Machine** | 5 | Out-of-order PDUs (Sta1–Sta13 violations) | `StateMachineAttacks` |
+| **Path Traversal** | 26 | SOP/Study Instance UID, Patient Name, command-vs-dataset mismatches, file-meta confusion, Windows/POSIX absolute paths, UI padding/length/VM boundary cases, and attacker-controlled-extension plus NUL-byte suffix bypasses that escape storescp/SCU storage directories (CVE-2022-2119/2120) | `PathTraversalAttacks` |
+| **State Machine** | 13 | Out-of-order PDUs (Sta1–Sta13), post-abort and post-release processing, release collision, acceptor PDUs sent by the requestor, DIMSE message-ordering and cross-context reassembly | `StateMachineAttacks` |
+| **Negotiation** | 15 | A-ASSOCIATE User Information sub-items (PS3.7 D.3.3): User Identity authentication — empty credentials, length lies, Kerberos/SAML/JWT parser reachability, duplicate identity items — plus extended negotiation, role selection, async window | `NegotiationAttacks` |
+| **DIMSE-N** | 11 | Normalized services: MPPS N-CREATE/N-SET state transitions and duplicate instances, Storage Commitment N-ACTION/N-EVENT-REPORT false and unsolicited results, N-GET attribute bombs, well-known-instance N-DELETE | `DimseNAttacks` |
 | **CVE** | 59 | DCMTK, GDCM, Orthanc, pydicom, dcm4che/standard polyglot, and ICSMA-26-181-01 DCMTK cases | `CVEAttacks` |
 
 Each `*Attacks` class exposes an `all()` iterator of `AttackResult` objects.
+
+Two of these categories exist because the *packet* layer already spoke more
+DICOM than the *catalog* did:
+
+- **Negotiation** targets what is parsed before any DIMSE service runs and
+  before most access control, so a defect there is reachable by a peer that
+  never completes an association. User Identity types 3–5 hand attacker bytes
+  straight to a Kerberos, XML, or JWT parser — and many deployments treat that
+  sub-item as the authentication boundary. Each payload keeps the mandatory
+  user-information items valid, so a rejection is attributable to the sub-item
+  under test rather than to an unusable request.
+- **DIMSE-N** targets the normalized services a PACS with worklist support
+  also speaks. Unlike C-STORE, these mutate *workflow state*, so the
+  interesting failures are logic failures: reopening a COMPLETED procedure
+  step, committing storage for objects the SCP never received, or accepting an
+  unsolicited commitment result from any peer that can reach the port.
 
 ### CVE mapping (fidelity matters)
 
 Each payload tags its CVE relationship honestly in `metadata`:
 
-- **`metadata['cve']` — directly targeted / probed.** Twenty-five CVEs across
+- **`metadata['cve']` — directly targeted / probed.** Thirty CVEs across
   DCMTK, GDCM, Orthanc, pydicom, and the standard-level polyglot — spanning
   parser NULL-derefs, codec OOB read/write, integer over/underflow, type
   confusion, path traversal, and command injection. The use-after-free entries

@@ -3,11 +3,19 @@
 
 import argparse
 
+import pytest
+
 from c_scare.attacks import (
     CVEAttacks,
+    DimseNAttacks,
+    NegotiationAttacks,
     PathTraversalAttacks,
     ProtocolAttacks,
     StorageSCPAbuseAttacks,
+)
+from c_scare.scapy_dicom import (
+    IMPLEMENTATION_CLASS_UID,
+    STORAGE_COMMITMENT_SOP_INSTANCE_UID,
 )
 from c_scare.runner import _delivery_kind
 
@@ -287,3 +295,109 @@ def test_path_traversal_multi_field_probe_marks_every_storage_field():
         result.payload
     assert b'../../../../../../tmp/c-scare-traversal-proof/patient-name' in \
         result.payload
+
+
+# ---------------------------------------------------------------------------
+# Association negotiation (PS3.7 Annex D.3.3)
+# ---------------------------------------------------------------------------
+
+class TestNegotiationAttacks:
+    """The negotiation catalog must stay a set of *valid* A-ASSOCIATE-RQ PDUs.
+
+    The point of these payloads is that the sub-item under test is the only
+    thing wrong: if the enclosing PDU is malformed, a rejection proves nothing
+    about the sub-item.
+    """
+
+    def _pdus(self):
+        return list(NegotiationAttacks.all())
+
+    def test_every_payload_is_a_wellformed_associate_rq(self):
+        pytest.importorskip("scapy")
+        from c_scare.scapy_dicom import DICOM
+
+        for result in self._pdus():
+            pkt = DICOM(result.payload)
+            assert pkt.pdu_type == 0x01, result.name
+            # The PDU length header must describe the bytes actually sent, or
+            # the target rejects on framing before reaching the sub-item.
+            assert pkt.length == len(result.payload) - 6, result.name
+
+    def test_mandatory_user_information_items_stay_valid(self):
+        """Maximum Length and Implementation Class UID must survive intact."""
+        for result in self._pdus():
+            if result.name == 'negotiation_user_information_item_length_overrun':
+                continue  # this one deliberately corrupts Maximum Length
+            body = result.payload[6:]
+            assert b'\x51\x00\x00\x04' in body, result.name
+            assert IMPLEMENTATION_CLASS_UID.encode() in body, result.name
+
+    def test_payloads_are_delivered_as_raw_pdus(self):
+        """A negotiation attack *is* the association request; wrapping it in a
+        C-STORE association would defeat it."""
+        for result in self._pdus():
+            assert _delivery_kind(_args(), result) == 'pdu', result.name
+
+    def test_user_identity_length_lies_keep_the_declared_value(self):
+        by_name = {r.name: r for r in self._pdus()}
+        lie = by_name['negotiation_user_identity_primary_length_lie']
+        assert lie.metadata['declared_length'] == 0xFFFF
+        assert lie.metadata['actual_length'] == 5
+        # The oversized length must really be on the wire, not clamped at build.
+        assert b'\xff\xff' + b'admin' in lie.payload
+
+    def test_identity_types_cover_every_parser_backed_type(self):
+        types = {r.metadata.get('identity_type') for r in self._pdus()}
+        # 3/4/5 are the Kerberos, SAML and JWT parsers - the reason this class
+        # exists. 1 and 2 cover plain and password-bearing identities.
+        assert {1, 2, 3, 4, 5} <= types
+
+
+# ---------------------------------------------------------------------------
+# DIMSE-N normalized services (MPPS / Storage Commitment)
+# ---------------------------------------------------------------------------
+
+class TestDimseNAttacks:
+
+    def _cases(self):
+        return list(DimseNAttacks.all())
+
+    def test_every_case_is_a_complete_association_sequence(self):
+        pytest.importorskip("scapy")
+        from c_scare.scapy_dicom import DICOM
+
+        for result in self._cases():
+            steps = result.metadata.get('steps')
+            assert steps, result.name
+            # A DIMSE-N command is meaningless without an association around
+            # it, so each case must open with an RQ and carry data.
+            assert DICOM(steps[0]).pdu_type == 0x01, result.name
+            assert any(DICOM(s).pdu_type == 0x04 for s in steps), result.name
+            for step in steps:
+                assert DICOM(step).length == len(step) - 6, result.name
+            assert b''.join(steps) == result.payload, result.name
+
+    def test_cases_are_delivered_as_sequences(self):
+        for result in self._cases():
+            assert _delivery_kind(_args(), result) == 'sequence', result.name
+
+    def test_both_normalized_service_classes_are_covered(self):
+        services = {r.metadata.get('service_class') for r in self._cases()}
+        assert services == {'MPPS', 'Storage Commitment'}
+
+    def test_commitment_targets_the_well_known_sop_instance(self):
+        """PS3.4 J.3.1 fixes the Storage Commitment instance UID; a payload
+        that invents one would be answered as 'no such instance' and never
+        reach the commitment logic."""
+        commitment = [r for r in self._cases()
+                      if r.metadata.get('service_class') == 'Storage Commitment']
+        assert commitment
+        for result in commitment:
+            assert STORAGE_COMMITMENT_SOP_INSTANCE_UID.encode() in result.payload, \
+                result.name
+
+    def test_mpps_state_transition_case_carries_the_illegal_status(self):
+        by_name = {r.name: r for r in self._cases()}
+        reopen = by_name['dimse_n_mpps_nset_reopen_completed_step']
+        assert reopen.metadata['bug_class'] == 'illegal-state-transition'
+        assert b'IN PROGRESS' in reopen.payload

@@ -32,7 +32,7 @@ C-SCARE is a Python DICOM security testing framework for black-box DAST, scripte
 ## Component Boundaries
 
 - `element.py`, `corruptor.py`, `pixel.py`, and `file.py` own malformed DICOM dataset/file construction.
-- `attacks.py` owns the static catalog; attack classes expose `all()` iterators of `AttackResult` objects.
+- `attacks.py` owns the static catalog; attack classes expose `all()` iterators of `AttackResult` objects. Placement of a payload on the wire is declared in `metadata`, never by attack name: `steps` means a multi-PDU sequence, `sop_class_uid`/`delivery_hint: cstore` means C-STORE delivery, and anything else is a single raw PDU. Negotiation payloads must not declare `sop_class_uid` — they *are* the association request.
 - `scapy_dicom.py` owns DICOM PDU/DIMSE packet definitions, builders, dissection helpers, and low-level transport helpers.
 - `client.py` owns stateful SCU behavior through `DICOMSession`; `server.py` and `responders.py` own rogue/responder SCP behavior for client-facing tests.
 - `deliver.py` and `runner.py` choose how payloads reach a live target; `monitor.py` owns sanitizer, protocol, and process-health detection.
