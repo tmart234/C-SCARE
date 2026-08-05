@@ -73,6 +73,9 @@ jobs:
         if: matrix.dicom_server.name == 'Orthanc'
         run: |
           echo "Starting Orthanc container..."
+          # Only ORTHANC__* env vars: the bare DICOM_AET / DICOM_PORT names were
+          # deprecated in April 2020 and the image refuses to start on them as
+          # of July 2026.
           # No --rm: a container that dies during startup must survive long
           # enough for the "Show server logs" step to explain why.
           docker run \
@@ -80,8 +83,6 @@ jobs:
             --name dicom-scp-test \
             --publish ${{ matrix.dicom_server.port }}:${{ matrix.dicom_server.port }} \
             -e VERBOSE_ENABLED=true \
-            -e DICOM_AET=${{ matrix.dicom_server.aet }} \
-            -e DICOM_PORT=${{ matrix.dicom_server.port }} \
             -e ORTHANC__DICOM_AET=${{ matrix.dicom_server.aet }} \
             -e ORTHANC__DICOM_PORT=${{ matrix.dicom_server.port }} \
             ${{ matrix.dicom_server.image }}

@@ -51,8 +51,8 @@ jobs:
             -e "ORTHANC__REGISTERED_USERS={}" \
             -e "ORTHANC__AUTHENTICATION_ENABLED=false" \
             -e "ORTHANC__REMOTE_ACCESS_ALLOWED=true" \
-            -e "DICOM_AET=${{ matrix.dicom_server.aet }}" \
-            -e "DICOM_PORT=${{ matrix.dicom_server.port }}" \
+            -e "ORTHANC__DICOM_AET=${{ matrix.dicom_server.aet }}" \
+            -e "ORTHANC__DICOM_PORT=${{ matrix.dicom_server.port }}" \
             ${{ matrix.dicom_server.image }} \
             --verbose
           
