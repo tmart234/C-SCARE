@@ -428,6 +428,11 @@ class WorkflowResponder:
         return f
 
     # -- lifecycle -----------------------------------------------------------
+    @property
+    def port(self):
+        """The bound port. Resolved after :meth:`start` when ``port=0``."""
+        return self.scp.port
+
     def start(self, blocking=False):
         return self.scp.start(blocking=blocking)
 

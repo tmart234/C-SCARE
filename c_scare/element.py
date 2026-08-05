@@ -105,8 +105,16 @@ class VR:
 
 
 # VRs padded to even length with a NULL byte rather than a trailing space
-# (PS3.5 §6.2). UI is null-padded; binary/"other" VRs are byte streams.
-_NULL_PAD_VRS = frozenset({'UI', 'OB', 'OW', 'OF', 'OD', 'UN'})
+# (PS3.5 §6.2). UI is null-padded; binary/"other" VRs are byte streams, so a
+# trailing space would be a data byte rather than filler. Verified against
+# pydicom's writer for every VR in test_pydicom_parity.
+_NULL_PAD_VRS = frozenset({
+    'UI',
+    # "Other" byte-stream VRs, all null-padded.
+    'OB', 'OW', 'OF', 'OD', 'OL', 'OV',
+    # Unknown content: the correct pad byte is unknowable, so use NULL.
+    'UN',
+})
 
 
 def pad_to_even(val_bytes: bytes, vr: str) -> bytes:
@@ -273,25 +281,58 @@ class Element:
         e._raw_length = length
         return e
     
+    # Binary VRs whose values are packed numbers rather than ASCII text
+    # (PS3.5 Table 6.2-1). AT is a pair of 16-bit halves — a tag — not a
+    # single scalar, so it is handled separately below.
+    _NUMERIC_FMT = {
+        'SS': 'h', 'US': 'H', 'SL': 'i', 'UL': 'I',
+        'SV': 'q', 'UV': 'Q', 'FL': 'f', 'FD': 'd',
+    }
+
+    def _encode_scalar(self, value, little_endian: bool) -> bytes:
+        """Encode one numeric value per the element's VR."""
+        endian = '<' if little_endian else '>'
+        vr_upper = self.vr.upper()
+        if vr_upper == 'AT':
+            # Attribute Tag: two consecutive 16-bit unsigned values, group then
+            # element (PS3.5 §6.2). Encoding it as its decimal string would
+            # produce ASCII digits and the wrong length.
+            if isinstance(value, Tag):
+                group, element = value.group, value.element
+            elif isinstance(value, tuple):
+                group, element = value
+            else:
+                group, element = (int(value) >> 16) & 0xFFFF, int(value) & 0xFFFF
+            return struct.pack(endian + 'HH', group, element)
+        if vr_upper in self._NUMERIC_FMT:
+            return struct.pack(endian + self._NUMERIC_FMT[vr_upper], value)
+        return str(value).encode('ascii', errors='replace')
+
     def _encode_value(self, little_endian: bool = True) -> bytes:
         """Encode value to bytes."""
         if self._raw_value is not None:
             return self._raw_value
-        
+
         if isinstance(self.value, bytes):
             return self.value
         elif isinstance(self.value, str):
             return self.value.encode('ascii', errors='replace')
-        elif isinstance(self.value, (int, float)):
-            vr_upper = self.vr.upper()
-            _NUMERIC_FMT = {
-                'SS': 'h', 'US': 'H', 'SL': 'i', 'UL': 'I',
-                'SV': 'q', 'UV': 'Q', 'FL': 'f', 'FD': 'd',
-            }
-            if vr_upper in _NUMERIC_FMT:
-                endian = '<' if little_endian else '>'
-                return struct.pack(endian + _NUMERIC_FMT[vr_upper], self.value)
-            return str(self.value).encode('ascii')
+        elif isinstance(self.value, (int, float, Tag)):
+            return self._encode_scalar(self.value, little_endian)
+        elif self.vr.upper() == 'AT' and isinstance(self.value, tuple):
+            # A tuple on AT is one (group, element) tag, matching both Tag()
+            # and pydicom. A *list* on AT is still several tags.
+            return self._encode_scalar(self.value, little_endian)
+        elif isinstance(self.value, (list, tuple)):
+            # Multi-valued element. Binary VRs concatenate their packed values;
+            # text VRs join with the backslash delimiter (PS3.5 §6.4). Without
+            # this a list fell through to str(), emitting a Python repr like
+            # "[16, 0, 16]" as the value.
+            if self.vr.upper() in self._NUMERIC_FMT or self.vr.upper() == 'AT':
+                return b''.join(self._encode_scalar(v, little_endian)
+                                for v in self.value)
+            return '\\'.join(str(v) for v in self.value).encode(
+                'ascii', errors='replace')
         elif self.value is None:
             return b''
         elif hasattr(self.value, 'encode'):

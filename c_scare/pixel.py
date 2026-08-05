@@ -131,24 +131,35 @@ class Fragment:
         self.length_override = length_override
     
     def encode(self, little_endian: bool = True) -> bytes:
-        """Encode as Item."""
+        """Encode as Item.
+
+        Item lengths must be even (PS3.5 §7.5), so odd-length fragment data is
+        padded with a trailing NULL and the declared length counts that pad
+        byte. Declaring the *unpadded* length while still writing the pad would
+        shift every following item by one byte, so a parser would read the pad
+        as the start of the next item tag and the whole fragment stream — plus
+        any Basic Offset Table pointing into it — would desync.
+
+        ``length_override`` is left exactly as given: a caller overriding the
+        length wants a specific lie on the wire, and correcting it would defeat
+        the malformation.
+        """
         bio = BytesIO()
-        
+
         # Item tag
         bio.write(ITEM_TAG_LE if little_endian else ITEM_TAG_BE)
-        
+
+        data = self.data
+        if len(data) % 2:
+            data += b'\x00'
+
         # Length
-        length = self.length_override if self.length_override is not None else len(self.data)
+        length = self.length_override if self.length_override is not None else len(data)
         fmt = '<I' if little_endian else '>I'
         bio.write(struct.pack(fmt, length))
-        
-        # Data
-        bio.write(self.data)
-        
-        # Pad to even if needed
-        if len(self.data) % 2:
-            bio.write(b'\x00')
-        
+
+        bio.write(data)
+
         return bio.getvalue()
 
 
@@ -288,6 +299,34 @@ class EncapsulatedPixelData:
         
         return bio.getvalue()
     
+    def encode_element(self, little_endian: bool = True,
+                       implicit_vr: bool = False) -> bytes:
+        """Encode as a complete (7FE0,0010) Pixel Data *element*.
+
+        :meth:`encode` returns only the item stream — the element's *value*.
+        On its own that is not a data set: it starts with an Item tag
+        (FFFE,E000), so a receiving SCP rejects it at the first element and
+        never reaches the codec the payload is aimed at. Encapsulated pixel
+        data must be carried by (7FE0,0010) with an undefined length
+        (0xFFFFFFFF), per PS3.5 §A.4, and the item stream's trailing Sequence
+        Delimitation Item closes it.
+
+        Use this when the payload is delivered as a data set (C-STORE or a
+        Part-10 file); use :meth:`encode` when hand-assembling an element
+        header, as the raw-bytes attacks do.
+        """
+        endian = '<' if little_endian else '>'
+        out = BytesIO()
+        out.write(struct.pack(endian + 'HH', 0x7FE0, 0x0010))
+        if implicit_vr:
+            out.write(struct.pack(endian + 'I', 0xFFFFFFFF))
+        else:
+            # OB with undefined length: VR, 2 reserved bytes, then the length.
+            out.write(b'OB' + b'\x00\x00')
+            out.write(struct.pack(endian + 'I', 0xFFFFFFFF))
+        out.write(self.encode(little_endian))
+        return out.getvalue()
+
     @classmethod
     def parse(cls, data: bytes, little_endian: bool = True) -> 'EncapsulatedPixelData':
         """Parse encapsulated pixel data."""
