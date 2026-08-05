@@ -133,6 +133,7 @@ try:
         DICOMMaximumLength, DICOMImplementationClassUID,
         build_presentation_context_rq, build_user_information,
         DEFAULT_TRANSFER_SYNTAX_UID, VERIFICATION_SOP_CLASS_UID,
+        IMPLICIT_VR_LITTLE_ENDIAN_UID, EXPLICIT_VR_LITTLE_ENDIAN_UID,
         CT_IMAGE_STORAGE_SOP_CLASS_UID, IMPLEMENTATION_CLASS_UID,
         MR_IMAGE_STORAGE_SOP_CLASS_UID, SECONDARY_CAPTURE_SOP_CLASS_UID,
         MODALITY_WORKLIST_FIND_SOP_CLASS_UID,
@@ -147,6 +148,8 @@ try:
 except Exception:
     SCAPY_DICOM_AVAILABLE = False
     DEFAULT_TRANSFER_SYNTAX_UID = '1.2.840.10008.1.2'
+    IMPLICIT_VR_LITTLE_ENDIAN_UID = '1.2.840.10008.1.2'
+    EXPLICIT_VR_LITTLE_ENDIAN_UID = '1.2.840.10008.1.2.1'
     VERIFICATION_SOP_CLASS_UID = '1.2.840.10008.1.1'
     CT_IMAGE_STORAGE_SOP_CLASS_UID = '1.2.840.10008.5.1.4.1.1.2'
     MR_IMAGE_STORAGE_SOP_CLASS_UID = '1.2.840.10008.5.1.4.1.1.4'
@@ -1326,13 +1329,61 @@ class LogicAttacks:
             description='Meta says Explicit VR, data is Implicit VR',
             expected_behavior='Parser should detect encoding mismatch',
             metadata={
-                'coverage_scope': 'negotiated-syntax-enforcement',
+                'coverage_scope': 'file-meta-vs-encoding',
                 'bug_class': 'syntax-vs-encoding-mismatch',
                 'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
                 'sop_instance_uid': '1.2.3.4.5',
             },
         )
-    
+
+    @staticmethod
+    def negotiated_transfer_syntax_mismatch() -> AttackResult:
+        """Dataset encoding contradicts the *negotiated* transfer syntax.
+
+        The sibling above is a file-level mismatch: the Part-10 meta header
+        declares one syntax and the data uses another, which a receiver can
+        catch by reading its own header. This one moves the lie onto the
+        association. The presentation context is negotiated as Implicit VR
+        Little Endian, so the SCP commits to reading bare ``tag + 4-byte
+        length`` elements — but the dataset that arrives is Explicit VR, where
+        those same four bytes are a 2-byte VR followed by a 2-byte length.
+
+        There is no meta header on the wire to cross-check against: PS3.5 §7.1
+        makes the negotiated context the *only* authority on how to decode the
+        C-STORE dataset. A receiver that sniffs the encoding instead of obeying
+        the context takes a legacy, rarely exercised path; one that obeys it
+        reads ``'OB'`` as a 32-bit length and derives an enormous element
+        length from ASCII VR bytes. Either way this is the decode path that
+        only ever runs against a peer that is lying.
+        """
+        ds = _injection_base_dataset()
+        ds = ds / Element(0x0028, 0x0010, 'US', 4)               # Rows
+        ds = ds / Element(0x0028, 0x0011, 'US', 4)               # Columns
+        ds = ds / Element(0x0028, 0x0100, 'US', 8)               # Bits Allocated
+        ds = ds / Element(0x7FE0, 0x0010, 'OB', b'\xAA' * 16)    # Pixel Data
+
+        return AttackResult(
+            name='negotiated_transfer_syntax_mismatch',
+            category='logic',
+            # Explicit VR bytes delivered on an Implicit VR context.
+            payload=ds.encode(implicit_vr=False),
+            description=('Dataset is Explicit VR LE but the presentation '
+                         'context negotiates Implicit VR LE'),
+            expected_behavior=('SCP should decode per the negotiated context '
+                               'and reject the object, not sniff the encoding'),
+            metadata={
+                'coverage_scope': 'negotiated-syntax-enforcement',
+                'bug_class': 'syntax-vs-encoding-mismatch',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+                # Pins what send_cstore negotiates; the payload above is
+                # deliberately encoded the other way.
+                'transfer_syntax': IMPLICIT_VR_LITTLE_ENDIAN_UID,
+                'encoded_transfer_syntax': EXPLICIT_VR_LITTLE_ENDIAN_UID,
+                'delivery_hint': 'cstore',
+            },
+        )
+
     @staticmethod
     def sop_class_mismatch() -> AttackResult:
         """SOP Class UID doesn't match actual content."""
@@ -1446,6 +1497,7 @@ class LogicAttacks:
     def all(cls) -> Generator[AttackResult, None, None]:
         """Yield every logic attack payload."""
         yield cls.transfer_syntax_mismatch()
+        yield cls.negotiated_transfer_syntax_mismatch()
         yield cls.sop_class_mismatch()
         yield cls.private_creator_missing()
         yield cls.uri_ssrf()

@@ -89,13 +89,45 @@ class TestSarifAdapters:
         assert ar.success is False  # SARIF "error"
         assert ar.metadata["granted_scp_role"] == 0
 
-    def test_role_negotiation_grant_is_not_a_finding(self):
+    def test_role_negotiation_unauthenticated_grant_is_authz_bypass(self):
+        """Granting an anonymous SCU the Storage SCP role is the finding.
+
+        scp_role=1 is what lets a C-GET SCU receive objects back, so a peer
+        that hands it out without authenticating the requestor lets anyone
+        retrieve images.
+        """
         from c_scare import RoleNegotiationResult
         rn = RoleNegotiationResult(
             sop_class_uid="1.2.840.10008.5.1.4.1.1.2",
-            requested_scp_role=1, granted_scp_role=1, aborted=False)
+            requested_scp_role=1, granted_scp_role=1, aborted=False,
+            authenticated=False)
         ar = rn.to_attack_result()
+        assert rn.is_authz_bypass
+        assert ar.category == "authz_bypass"
+        assert ar.success is True
+        assert ar.metadata["authenticated"] is False
+
+    def test_role_negotiation_authenticated_grant_is_not_a_finding(self):
+        """The same grant to a requestor that authenticated is normal."""
+        from c_scare import RoleNegotiationResult
+        rn = RoleNegotiationResult(
+            sop_class_uid="1.2.840.10008.5.1.4.1.1.2",
+            requested_scp_role=1, granted_scp_role=1, aborted=False,
+            authenticated=True)
+        ar = rn.to_attack_result()
+        assert not rn.is_authz_bypass
+        assert ar.category == "role-negotiation"
         assert ar.success is None
+
+    def test_role_negotiation_withheld_role_is_not_authz_bypass(self):
+        """A peer that declines the role has not bypassed anything."""
+        from c_scare import RoleNegotiationResult
+        rn = RoleNegotiationResult(
+            sop_class_uid="1.2.840.10008.5.1.4.1.1.2",
+            requested_scp_role=1, granted_scp_role=0, aborted=False,
+            authenticated=False)
+        assert not rn.is_authz_bypass
+        assert rn.to_attack_result().category == "role-negotiation"
 
     def test_hostile_observation_carries_monitor_reports(self):
         from c_scare import HostileObservation
@@ -447,8 +479,9 @@ class TestDeliveryRouting:
                  b'STORESCP        ' + b'C-SCARE-FZ      ' + b'\x00' * 32)
         sent = {}
 
-        def fake_send_sequence(target, steps, timeout):
+        def fake_send_sequence(target, steps, timeout, **kwargs):
             sent['steps'] = steps
+            sent['kwargs'] = kwargs
             return [b'\x02', b'\x05']
 
         monkeypatch.setattr(runner.deliver, 'send_sequence', fake_send_sequence)
@@ -477,8 +510,9 @@ class TestDeliveryRouting:
                  b'../ORTHO        '[:16] + b'C-SCARE-FZ      ' + b'\x00' * 32)
         sent = {}
 
-        def fake_send_sequence(target, steps, timeout):
+        def fake_send_sequence(target, steps, timeout, **kwargs):
             sent['steps'] = steps
+            sent['kwargs'] = kwargs
             return [b'\x02']
 
         monkeypatch.setattr(runner.deliver, 'send_sequence', fake_send_sequence)

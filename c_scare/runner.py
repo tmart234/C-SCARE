@@ -33,6 +33,7 @@ import time
 import struct
 import copy
 import hashlib
+import re
 from typing import Dict, List, Optional, Tuple
 import tempfile
 
@@ -102,6 +103,12 @@ DATASET_CATEGORIES = frozenset({
     'path_traversal', 'command_injection',
 })
 
+# Categories that can degrade the target's availability rather than just probe
+# it: allocation/disk-pressure payloads, and state-machine sequences that leave
+# associations aborted. Against a live PACS these are the ones that show up as
+# a clinical outage, so they require --allow-availability.
+AVAILABILITY_CATEGORIES = frozenset({'memory', 'storage_abuse', 'state_machine'})
+
 _LONG_EXPLICIT_VR = frozenset({
     b'OB', b'OD', b'OF', b'OL', b'OV', b'OW', b'SQ', b'UC', b'UR', b'UT', b'UN',
 })
@@ -113,6 +120,9 @@ _LONG_EXPLICIT_VR = frozenset({
 _DEFAULT_STORE_SOP = "1.2.840.10008.5.1.4.1.1.7"  # Secondary Capture Image Storage
 _DEFAULT_STORE_TRANSFER_SYNTAX = "1.2.840.10008.1.2"  # Implicit VR Little Endian
 _ASSOCIATE_RQ_PDU_TYPE = 0x01
+_PDATA_PDU_TYPE = 0x04
+_ABORT_PDU_TYPE = 0x07
+_PDU_HEADER_LEN = 6
 _ASSOCIATE_RQ_MIN_LEN = 74
 _ASSOCIATE_CALLED_AE_OFFSET = 10
 _ASSOCIATE_CALLING_AE_OFFSET = 26
@@ -174,6 +184,57 @@ def _render_association_ae_titles(payload: bytes, args, result: AttackResult) ->
 
 def _render_sequence_steps(args, result: AttackResult, steps: List[bytes]) -> List[bytes]:
     return [_render_association_ae_titles(step, args, result) for step in steps]
+
+
+def _pdata_carries_last_fragment(step: bytes) -> bool:
+    """True if a P-DATA-TF PDU closes at least one DIMSE message.
+
+    Walks the PDV items (PS3.8 §9.3.5): each is a 4-byte length, a context ID,
+    then a Message Control Header whose bit 1 is the last-fragment flag. A PDU
+    carrying only ``is_last=0`` fragments leaves the DIMSE message incomplete,
+    so the peer cannot have anything to answer yet.
+    """
+    offset = _PDU_HEADER_LEN
+    while offset + 6 <= len(step):
+        item_len = int.from_bytes(step[offset:offset + 4], 'big')
+        if item_len < 2:
+            break
+        if step[offset + 5] & 0x02:
+            return True
+        offset += 4 + item_len
+    return False
+
+
+def _sequence_expectations(steps: List[bytes]) -> List[bool]:
+    """Per-step "wait for a reply?" flags for :func:`deliver.send_sequence`.
+
+    Only steps the DIMSE/DUL state machine *cannot* answer are marked no-wait,
+    so nothing that would have produced a response is skipped and the
+    request/response pairing never desyncs:
+
+    * an A-ABORT we send, and every step after it — the association is dead;
+    * a P-DATA-TF carrying only non-final fragments — the message is still
+      incomplete, so no DIMSE response is due yet.
+
+    Everything else keeps blocking. That matters for the multi-P-DATA DIMSE-N
+    sequences, where each complete message draws its own N-xxx-RSP: skipping a
+    read there would leave the reply queued and hand it to the *next* step.
+    """
+    expectations: List[bool] = []
+    association_dead = False
+    for step in steps:
+        if association_dead or not step:
+            expectations.append(False)
+            continue
+        pdu_type = step[0]
+        if pdu_type == _ABORT_PDU_TYPE:
+            association_dead = True
+            expectations.append(False)
+        elif pdu_type == _PDATA_PDU_TYPE and not _pdata_carries_last_fragment(step):
+            expectations.append(False)
+        else:
+            expectations.append(True)
+    return expectations
 
 
 def _uid_str(value) -> Optional[str]:
@@ -628,6 +689,57 @@ def _delivery_kind(args, result: AttackResult) -> str:
     return 'pdu'
 
 
+class AssociationBudgetExceeded(Exception):
+    """Raised when a run reaches its ``--max-associations`` budget."""
+
+
+def _association_cost(kind: str, result: AttackResult) -> int:
+    """Associations one delivery opens. Each 'pdu'/'cstore' delivery makes a
+    single connection; a 'sequence' shares one connection across its steps,
+    except ``sm_double_association``-style attacks whose steps each carry an
+    A-ASSOCIATE-RQ."""
+    if kind != 'sequence':
+        return 1
+    steps = result.metadata.get('steps') or []
+    return max(1, sum(1 for s in steps if s and s[0] == _ASSOCIATE_RQ_PDU_TYPE))
+
+
+def _charge_associations(args, count: int) -> None:
+    """Charge ``count`` associations against the run budget.
+
+    ``--max-associations`` is a whole-run budget, not a concurrency limit: the
+    DAST loop is sequential, so it never holds two associations at once. What
+    it bounds is total connection churn against a live PACS, which is the thing
+    that actually shows up in an operations team's monitoring.
+    """
+    limit = getattr(args, 'max_associations', None)
+    if not limit or getattr(args, 'dry_run', None):
+        # A dry run opens no connections, so it spends no budget.
+        return
+    already = getattr(args, '_associations_used', 0)
+    if already + count > limit:
+        raise AssociationBudgetExceeded(
+            f"association budget reached: {already}/{limit} used, next delivery "
+            f"needs {count} more (raise or clear --max-associations to continue)")
+    args._associations_used = already + count
+
+
+def _dry_run_write(args, result: AttackResult, kind: str, payloads: List[bytes]) -> None:
+    """Write what would have gone on the wire to the --dry-run directory."""
+    out_dir = getattr(args, 'dry_run', None)
+    if not out_dir:
+        return
+    os.makedirs(out_dir, exist_ok=True)
+    safe = re.sub(r'[^A-Za-z0-9_.-]', '_', result.name) or 'payload'
+    ext = '.dcm' if kind == 'cstore' else '.bin'
+    for i, blob in enumerate(payloads):
+        suffix = f'.{i:02d}' if len(payloads) > 1 else ''
+        path = os.path.join(out_dir, f'{safe}{suffix}{ext}')
+        with open(path, 'wb') as fh:
+            fh.write(blob or b'')
+    result.metadata['dry_run_files'] = len(payloads)
+
+
 def _deliver(args, result: AttackResult, target, timeout: float):
     """Deliver one (optionally mutated) payload by the chosen method. Returns
     ``(response, error)`` where response is bytes/None and error is a short
@@ -645,12 +757,22 @@ def _deliver(args, result: AttackResult, target, timeout: float):
 
     kind = _delivery_kind(args, result)
     result.metadata['delivery'] = kind
+    _charge_associations(args, _association_cost(kind, result))
     try:
         if kind == 'sequence':
             steps = _render_sequence_steps(args, result,
                                            list(result.metadata.get('steps') or [payload]))
-            responses = deliver.send_sequence(target, steps, timeout=timeout)
-            last = responses[-1] if responses else None
+            if getattr(args, 'dry_run', None):
+                _dry_run_write(args, result, kind, steps)
+                return None, 'dry_run'
+            expectations = _sequence_expectations(steps)
+            responses = deliver.send_sequence(target, steps, timeout=timeout,
+                                              expect_response=expectations)
+            # The verdict is the last reply the peer actually sent. Reading
+            # responses[-1] would report 'timeout' for every sequence that ends
+            # on a deliberately unanswerable step (a trailing A-ABORT, a
+            # dangling fragment) even though the peer answered earlier steps.
+            last = next((r for r in reversed(responses) if r is not None), None)
             return last, ('timeout' if last is None else None)
         if kind == 'cstore':
             file_payload = _cstore_file_payload_for_result(args, result)
@@ -668,6 +790,9 @@ def _deliver(args, result: AttackResult, target, timeout: float):
                     or getattr(args, 'store_transfer_syntax', None)
                 if part10_meta.get('part10_stripped'):
                     result.metadata['cstore_stripped_part10'] = True
+            if getattr(args, 'dry_run', None):
+                _dry_run_write(args, result, kind, [cstore_payload])
+                return None, 'dry_run'
             status = deliver.send_cstore(
                 target, cstore_payload, sop_class, sop_inst,
                 transfer_syntax=transfer_syntax,
@@ -681,6 +806,9 @@ def _deliver(args, result: AttackResult, target, timeout: float):
                 return None, 'timeout'
             return bytes([(status >> 8) & 0xFF, status & 0xFF]), 'cstore_status'
         payload = _render_association_ae_titles(payload, args, result)
+        if getattr(args, 'dry_run', None):
+            _dry_run_write(args, result, kind, [payload])
+            return None, 'dry_run'
         return deliver.send_pdu(target, payload, timeout=timeout), None
     except ConnectionRefusedError:
         return None, 'refused'
@@ -1073,8 +1201,8 @@ def run_protocol_fuzzing(args) -> int:
                             if report.detected:
                                 print(f"  Monitor: {report.finding_type} - {report.description}")
             else:
-                response = deliver.send_pdu(target, result.payload, timeout=args.timeout)
-                interesting = (
+                response, err = _deliver(args, result, target, args.timeout)
+                interesting = err != 'dry_run' and (
                     response is None or
                     len(response) == 0 or
                     (response and response[0] not in (0x02, 0x03, 0x07))
@@ -1095,6 +1223,9 @@ def run_protocol_fuzzing(args) -> int:
         print(f"\nInteresting results: {interesting_count}/{args.count}")
         _collect_results(args, all_results)
 
+    except AssociationBudgetExceeded:
+        _collect_results(args, all_results)
+        raise
     except Exception as e:
         print(f"ERROR: Fuzzing failed: {e}")
         return 1
@@ -1170,6 +1301,26 @@ def run_generate_corpus(args) -> int:
     return 0
 
 
+def _availability_blocked(args, category: str, label: str) -> bool:
+    """True if ``category`` needs ``--allow-availability`` and did not get it.
+
+    Gating here rather than by pruning ``run_all_tests``'s command list keeps
+    the "``all`` runs every category" invariant intact — the category still
+    runs, it just declines to deliver anything without the opt-in. A dry run
+    sends nothing, so it is exempt.
+    """
+    if category not in AVAILABILITY_CATEGORIES:
+        return False
+    if getattr(args, 'allow_availability', False) or getattr(args, 'dry_run', None):
+        return False
+    print(f"\n=== {label} ===\n")
+    print(f"SKIPPED: '{category}' can degrade target availability "
+          f"(resource exhaustion / aborted associations).")
+    print("Pass --allow-availability to run it, or --dry-run DIR to inspect "
+          "the payloads without sending them.")
+    return True
+
+
 def _maybe_deliver(args, result: AttackResult, index: int):
     """Deliver the payload to a live target when monitors are active."""
     monitors = _get_monitors(args)
@@ -1200,6 +1351,9 @@ def _run_catalog(args, catalog, label: str, note: Optional[str] = None) -> int:
             _maybe_deliver(args, result, i)
             print_result(result, args.verbose)
             results.append(result)
+        except AssociationBudgetExceeded:
+            _collect_results(args, results)
+            raise
         except Exception as e:
             print(f"FAIL {result.name}: {e}")
 
@@ -1233,6 +1387,8 @@ def run_logic_attacks(args) -> int:
 
 def run_storage_scp_abuse_attacks(args) -> int:
     """Run unauthenticated Storage SCP abuse tests."""
+    if _availability_blocked(args, 'storage_abuse', "Storage SCP Abuse Attacks"):
+        return 0
     return _run_catalog(args, StorageSCPAbuseAttacks, "Storage SCP Abuse Attacks")
 
 
@@ -1255,6 +1411,8 @@ def run_path_traversal_attacks(args) -> int:
 
 def run_state_machine_attacks(args) -> int:
     """Run state machine attack tests."""
+    if _availability_blocked(args, 'state_machine', "State Machine Attacks"):
+        return 0
     if not args.target:
         print("ERROR: --target required for state machine attacks (format: host:port)")
         print("Example: python -m c_scare state_machine_attacks --target 127.0.0.1:4242")
@@ -1279,34 +1437,20 @@ def run_state_machine_attacks(args) -> int:
 
     for i, result in enumerate(StateMachineAttacks.all()):
         try:
+            # Route through the shared delivery path rather than calling
+            # deliver.* directly, so state-machine sequences get the same
+            # --dry-run, --max-associations and per-step response handling as
+            # every other category. This is the category most likely to
+            # disturb a live PACS, so it must not be the one that bypasses
+            # the guardrails.
             if monitors:
-                for monitor in monitors:
-                    monitor.pre_test(i)
-
-            steps = result.metadata.get('steps')
-            if steps:
-                responses = deliver.send_sequence(target, steps, timeout=args.timeout)
-                result.response = responses[-1] if responses else None
+                _run_monitored_test(args, result, target, args.timeout)
             else:
-                result.response = deliver.send_pdu(target, result.payload, timeout=args.timeout)
-
-            if monitors:
-                for monitor in monitors:
-                    if isinstance(monitor, ProtocolMonitor):
-                        monitor.set_response(result.response)
-                if any(isinstance(m, SanitizerMonitor) for m in monitors):
-                    time.sleep(SANITIZER_FLUSH_DELAY)
-                for monitor in monitors:
-                    report = monitor.post_test()
-                    result.monitor_reports.append(report)
-                    if report.detected:
-                        result.success = True
-                proc = _get_process(args)
-                if proc and not proc.is_alive():
-                    proc.restart()
-                    time.sleep(0.5)
-            else:
+                result.response, _err = _deliver(args, result, target, args.timeout)
                 result.success = True
+        except AssociationBudgetExceeded:
+            _collect_results(args, results)
+            raise
         except Exception as e:
             result.success = False
             result.description = f'Failed: {e}'
@@ -1331,6 +1475,8 @@ def run_dimse_n_attacks(args) -> int:
 
 def run_memory_attacks(args) -> int:
     """Run memory corruption attack tests."""
+    if _availability_blocked(args, 'memory', "Memory Attacks"):
+        return 0
     return _run_catalog(args, MemoryAttacks, "Memory Attacks")
 
 
@@ -1372,6 +1518,9 @@ def run_all_tests(args) -> int:
         try:
             ret = func(args)
             results[name] = 'PASS' if ret == 0 else 'FAIL'
+        except AssociationBudgetExceeded:
+            results[name] = 'ABORTED'
+            raise
         except Exception as e:
             print(f"\nERROR in {name}: {e}")
             results[name] = 'ERROR'
@@ -1729,6 +1878,9 @@ def _cmd_workflow(argv: List[str]) -> int:
         if a.wfcmd == 'get':
             contexts = {get_uid: [DEFAULT_TRANSFER_SYNTAX_UID]}
             roles = None
+            # `wf get` associates with no User Identity Negotiation, so any
+            # role the peer grants here was granted to an anonymous SCU.
+            authenticated = False
             storage_sops = a.storage_sops or [
                 "1.2.840.10008.5.1.4.1.1.2",    # CT Image Storage
                 "1.2.840.10008.5.1.4.1.1.7",    # Secondary Capture Image Storage
@@ -1755,7 +1907,7 @@ def _cmd_workflow(argv: List[str]) -> int:
                             sop_class_uid=s, requested_scp_role=1,
                             granted_scp_role=out.get(
                                 'negotiated_roles', {}).get(s, (0, 0))[1],
-                            aborted=True,
+                            aborted=True, authenticated=authenticated,
                             negotiated_roles=out.get('negotiated_roles', {}))
                         a.result_collector.append(rn.to_attack_result())
             else:
@@ -1767,7 +1919,11 @@ def _cmd_workflow(argv: List[str]) -> int:
                         rn = wf.RoleNegotiationResult(
                             sop_class_uid=s, requested_scp_role=1,
                             granted_scp_role=granted, aborted=False,
+                            authenticated=authenticated,
                             negotiated_roles=out.get('negotiated_roles', {}))
+                        if rn.is_authz_bypass:
+                            print(f"[!] {s}: storage SCP role granted without "
+                                  f"authentication (authz bypass)")
                         a.result_collector.append(rn.to_attack_result())
             if a.sarif and a.result_collector:
                 write_sarif(a.result_collector, a.sarif)
@@ -2036,6 +2192,42 @@ def main(argv: Optional[List[str]] = None):
              'the SARIF result\'s properties.mutation.'
     )
 
+    # --- Clinical safety guardrails -------------------------------------
+    # A PACS is often a live clinical system. These bound what a run can do to
+    # it, and make the availability-affecting categories opt-in rather than
+    # something you get by typing --category all.
+    parser.add_argument(
+        '--dry-run',
+        dest='dry_run',
+        metavar='DIR',
+        default=None,
+        help='Do not touch the network. Write each payload that would have '
+             'been delivered into DIR (.dcm for C-STORE datasets, .bin for raw '
+             'PDUs and sequence steps) and report every test as a non-finding. '
+             'Use this to review a catalog before pointing it at a live PACS.'
+    )
+
+    parser.add_argument(
+        '--max-associations',
+        dest='max_associations',
+        type=int,
+        metavar='N',
+        default=None,
+        help='Abort the run once it has opened N associations against the '
+             'target (default: unlimited). A whole-run budget on connection '
+             'churn, not a concurrency cap — delivery is sequential.'
+    )
+
+    parser.add_argument(
+        '--allow-availability',
+        dest='allow_availability',
+        action='store_true',
+        help='Opt in to categories that can degrade target availability '
+             f'({", ".join(sorted(AVAILABILITY_CATEGORIES))}): resource '
+             'exhaustion, disk pressure, and state-machine sequences that '
+             'abort associations. Without this flag they are skipped.'
+    )
+
     parser.add_argument(
         '--asan-binary',
         metavar='PATH',
@@ -2092,6 +2284,15 @@ def main(argv: Optional[List[str]] = None):
     # Set up monitors if --asan-binary is specified
     args._monitors = []
     args._managed_process = None
+    args._associations_used = 0
+
+    if args.dry_run:
+        print(f"DRY RUN: writing payloads to {os.path.abspath(args.dry_run)} "
+              f"(nothing is sent to {args.target})")
+        print()
+    if args.max_associations:
+        print(f"Association budget: {args.max_associations}")
+        print()
 
     if args.asan_binary:
         asan_port = args.asan_port or args.port
@@ -2121,8 +2322,9 @@ def main(argv: Optional[List[str]] = None):
         print(f"Target: {args.target}")
         print()
 
-    if args.cstore_smoke:
+    if args.cstore_smoke and not args.dry_run:
         host, port = args.target.rsplit(':', 1)
+        _charge_associations(args, 1)
         smoke_rc = _run_cstore_smoke(args, (host, int(port)))
         print()
         if smoke_rc != 0:
@@ -2130,6 +2332,11 @@ def main(argv: Optional[List[str]] = None):
 
     try:
         ret = run_command(command, args)
+    except AssociationBudgetExceeded as e:
+        # Not a failure: the run stopped exactly where it was told to. Results
+        # gathered so far are still collected and reported below.
+        print(f"\nSTOPPED: {e}")
+        ret = 0
     except KeyboardInterrupt:
         print("\nInterrupted by user")
         ret = 130

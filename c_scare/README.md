@@ -14,7 +14,7 @@ The `c_scare` package. See the [project README](../README.md) for an overview an
 | `attacks.py` | Static attack catalog + seed generators — classes expose `all()` iterators of `AttackResult` |
 | `workflows.py` | SCU-side attack workflows (issuer) — `ae_brute()`, `cred_brute()`, `build_query()`; query/retrieve flows (`c_find`/`c_get`/`c_move`) live on `DICOMSession` |
 | `responders.py` | SCP-side workflow responders (exercise an SCU client) — `accept_association()`, DIMSE RSP builders, `WorkflowResponder` |
-| `deliver.py` | Black-box delivery — `send_pdu()`, `send_sequence()`, `send_cstore()` (optional `user_identity=` to authenticate first) |
+| `deliver.py` | Black-box delivery — `send_pdu()`, `send_sequence()`, `send_cstore()` (optional `user_identity=` to authenticate first). Responses are framed with `read_dul_pdu()` so exactly one PDU comes back, and every connection is torn down with an A-ABORT rather than a bare close |
 | `greybox.py` | Grey-box bridge — launches AFL++/AFLNet harnesses, triages crashes to SARIF |
 | `monitor.py` | Crash/anomaly detection — sanitizer, protocol and process-health monitors |
 | `runner.py` | CLI (`c-scare` / `python -m c_scare`) |
