@@ -6,7 +6,6 @@ thread; a real pynetdicom SCU then attempts to associate and must fail.
 """
 
 import logging
-import time
 
 import pytest
 
@@ -17,8 +16,22 @@ from scapy.packet import raw
 pytest.importorskip('pynetdicom')
 
 
+@pytest.fixture(autouse=True)
+def _quiet_logging():
+    """Undo the process-global logging suppression after each test."""
+    logging.disable(logging.CRITICAL)
+    try:
+        yield
+    finally:
+        logging.disable(logging.NOTSET)
+
+
 def _start_rogue(port, response):
-    """Start a rogue SCP that answers every A-ASSOCIATE-RQ with ``response``."""
+    """Start a rogue SCP that answers every A-ASSOCIATE-RQ with ``response``.
+
+    ``RawSCP.start`` completes bind() and listen() before returning, so the
+    port accepts connections immediately and no readiness sleep is required.
+    """
     scp = RawSCP(host='127.0.0.1', port=port)
 
     @scp.on_associate_rq
@@ -26,7 +39,6 @@ def _start_rogue(port, response):
         return response
 
     scp.start(blocking=False)
-    time.sleep(0.5)
     return scp
 
 
@@ -109,7 +121,6 @@ def test_hostile_cget_pushes_malicious_store():
         return None
 
     responder.start(blocking=False)
-    time.sleep(0.5)
     try:
         query = build_query(level='study',
                             match_keys={(0x0020, 0x000D, 'UI'): '1.2.3'})

@@ -84,39 +84,71 @@ class RoleNegotiationResult:
     """Outcome of a strict-peer C-GET role negotiation, convertible to the
     catalog AttackResult so it rides the same SARIF path.
 
-    A strict abort (the peer withheld the storage SCP role) is a reportable
-    finding: ``aborted=True`` maps to ``success=False`` (SARIF ``error``)."""
+    Both outcomes can be reportable, for opposite reasons:
+
+    * ``aborted=True`` — the peer withheld the storage SCP role, so the C-GET
+      could not proceed. Interop failure; ``success=False`` (SARIF ``error``).
+    * granted to an *unauthenticated* requestor (``authenticated=False``) — the
+      peer handed an anonymous SCU the Storage SCP role, which is what lets a
+      C-GET pull objects back. That is an authorization finding in its own
+      right, reported as ``authz_bypass`` with ``success=True``.
+
+    A grant to a requestor that *did* authenticate is normal operation and is
+    recorded without being flagged.
+    """
 
     sop_class_uid: str
     requested_scp_role: int = 1
     granted_scp_role: int = 0
     aborted: bool = False
+    authenticated: bool = False
     negotiated_roles: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def is_authz_bypass(self) -> bool:
+        """The peer granted the storage SCP role without authenticating us."""
+        return (not self.aborted
+                and int(self.granted_scp_role) == 1
+                and not self.authenticated)
 
     def to_attack_result(self):
         """Adapt to ``attacks.AttackResult`` for SARIF output."""
         from .attacks import AttackResult
+        category = "role-negotiation"
+        success = None
+        expected = ("Peer should grant scp_role=1 for the storage SOP "
+                    "class so a C-GET SCU can receive objects")
         if self.aborted:
             desc = (f"Peer withheld the storage SCP role for {self.sop_class_uid} "
                     f"(requested scp_role={self.requested_scp_role}, "
                     f"granted={self.granted_scp_role}); C-GET aborted")
+            success = False
+        elif self.is_authz_bypass:
+            category = "authz_bypass"
+            desc = (f"Peer granted the storage SCP role for {self.sop_class_uid} "
+                    f"to an unauthenticated requestor (scp_role="
+                    f"{self.granted_scp_role}); a C-GET SCU can retrieve "
+                    f"objects with no credentials")
+            expected = ("Peer should require authentication before granting "
+                        "scp_role=1 for a storage SOP class")
+            success = True
         else:
             desc = (f"Peer granted the storage SCP role for {self.sop_class_uid} "
                     f"(scp_role={self.granted_scp_role})")
         return AttackResult(
             name=f"storage-scp-role/{self.sop_class_uid}",
-            category="role-negotiation",
+            category=category,
             payload=b"",
             description=desc,
-            expected_behavior=("Peer should grant scp_role=1 for the storage SOP "
-                               "class so a C-GET SCU can receive objects"),
+            expected_behavior=expected,
             metadata={
                 "sop_class_uid": self.sop_class_uid,
                 "requested_scp_role": self.requested_scp_role,
                 "granted_scp_role": self.granted_scp_role,
+                "authenticated": self.authenticated,
                 "negotiated_roles": dict(self.negotiated_roles),
             },
-            success=False if self.aborted else None,
+            success=success,
         )
 
 

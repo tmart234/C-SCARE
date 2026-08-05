@@ -137,6 +137,36 @@ c-scare corpus -o ./corpus
 
 (`python -m c_scare …` is equivalent to the `c-scare` console command.)
 
+### Safety guardrails for live clinical systems
+
+A PACS in service is a clinical system, and part of this catalog is designed to
+exhaust its resources. Three flags bound what a run can do:
+
+| Flag | Effect |
+|---|---|
+| `--dry-run DIR` | Never touches the network. Writes every payload that *would* have been delivered into `DIR` (`.dcm` for C-STORE datasets, `.bin` for raw PDUs and sequence steps) and reports every test as a non-finding. |
+| `--max-associations N` | Stops the run once it has opened `N` associations. Results collected up to that point are still printed and written to SARIF. |
+| `--allow-availability` | Required to run the categories that can degrade availability — `memory`, `storage_abuse`, `state_machine`. Without it they are skipped with a notice, including under `--category all`. |
+
+```bash
+# Review what the catalog would send, without sending any of it
+c-scare --ip 192.0.2.10 --port 104 --ae-title PACS \
+  --category all --dry-run ./payloads
+
+# A bounded probe of a production PACS: read-only categories, 50 associations
+c-scare --ip 192.0.2.10 --port 104 --ae-title PACS \
+  --category cve --max-associations 50 --sarif findings.sarif
+
+# Opt in to the availability-affecting categories (lab targets)
+c-scare --ip 127.0.0.1 --port 4242 --ae-title ORTHANC \
+  --category memory --allow-availability
+```
+
+`--dry-run` implies the availability opt-in, since nothing is sent.
+
+Delivery is sequential — one association at a time — so `--max-associations` is
+a budget on total connection churn, not a concurrency cap.
+
 ### Start with a known-good C-STORE
 
 Before interpreting malformed dataset results, prove that the same association

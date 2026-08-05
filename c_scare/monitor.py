@@ -306,6 +306,14 @@ class ProtocolMonitor(BaseMonitor):
         self._error = error
 
     def post_test(self) -> MonitorReport:
+        if self._error == 'dry_run':
+            # Nothing was sent, so there is nothing to conclude. Reporting the
+            # absent response as a timeout would mark every payload in a
+            # --dry-run as a finding.
+            return MonitorReport(
+                detected=False,
+                description='Dry run — payload written to disk, not sent',
+            )
         if self._error == 'cstore_status':
             status = None
             if self._response and len(self._response) >= 2:

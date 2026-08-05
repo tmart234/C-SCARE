@@ -11,7 +11,6 @@ conformant AC (accept_association) lets it through to the DIMSE stage.
 """
 
 import logging
-import time
 
 import pytest
 
@@ -24,13 +23,32 @@ from c_scare import (  # noqa: E402
 HOST = "127.0.0.1"
 
 
-def _quiet():
+@pytest.fixture(autouse=True)
+def _quiet_logging():
+    """Silence pynetdicom's association chatter for the duration of one test.
+
+    ``logging.disable`` is process-global, so it has to be undone. Leaving it
+    set leaked into every module that ran afterwards and silently suppressed
+    their logging too.
+    """
     logging.disable(logging.CRITICAL)
+    try:
+        yield
+    finally:
+        logging.disable(logging.NOTSET)
+
+
+def _quiet():
+    """Retained for tests that call it explicitly; the fixture does the work."""
 
 
 def _start(responder):
+    """Start a responder and return it.
+
+    ``RawSCP.start`` binds and listens before spawning its accept thread, so
+    the port is already accepting when this returns — no sleep needed.
+    """
     responder.start(blocking=False)
-    time.sleep(0.5)
     return responder
 
 
@@ -370,7 +388,6 @@ def test_accept_association_echoes_proposed_roles():
         return accept_association(pdu_bytes, echo_proposed_roles=True)
 
     scp.start(blocking=False)
-    time.sleep(0.4)
     try:
         with DICOMSession(HOST, 11640, "C_SCARE_SCP", "C_SCARE", read_timeout=5) as sock:
             ok = sock.associate(
@@ -398,7 +415,6 @@ def test_reject_association_blocks_scu():
         return reject_association(result=1, source=1, reason=7)
 
     scp.start(blocking=False)
-    time.sleep(0.4)
     try:
         ae = AE()
         ae.add_requested_context(Verification)
