@@ -14,7 +14,7 @@ C-SCARE ships **5 scripted workflows**, driven via `c-scare wf …`:
 |----|------------|----------|--------------|----------|
 | **W1** | `ae-brute` | AE-title brute force | Attempt association per Called AE Title and read each accepted AET's Application Context payload (AC UID, Implementation Class UID, Version Name) | `ae_brute()` |
 | **W2** | `cred-brute` | Credential brute force | Brute-force User Identity credentials, surfacing the `0x59` server response | `cred_brute()` |
-| **W3** | `find` | Sculpted C-FIND | Query with an exact return-key set — a key is returned only if you asked for it | `build_query()` + `DICOMSession.c_find` |
+| **W3** | `find` | Sculpted C-FIND | Query with an exact return-key set — a key is returned only if you asked for it. VRs come from the DICOM dictionary, so identifiers are valid under explicit-VR too | `build_query()` + `DICOMSession.c_find` |
 | **W4** | `get` | C-GET retrieval | Retrieve matched objects over the same association | `DICOMSession.c_get` |
 | **W5** | `move` | C-MOVE pivot | Redirect matched objects to a third AE | `DICOMSession.c_move` |
 
@@ -22,6 +22,37 @@ C-SCARE ships **5 scripted workflows**, driven via `c-scare wf …`:
 **independent**: an accepted-or-rejected-for-any-other-reason association means
 the AET is valid (`aet_recognized`), so the operator can fix the AET axis (W1)
 before brute-forcing credentials (W2).
+
+### Reading W1/W2 results honestly
+
+Recon output ends up in reports, so both drivers separate what was *observed*
+from what may be *concluded*.
+
+**A target that never answered is not a target that said no.** If an attempt
+produces no A-ASSOCIATE-RJ — connection refused, timeout, reset — the result
+carries `error` and `conclusive` is False. `accepted` and `aet_recognized` mean
+nothing in that case, and the CLI prints `[?] … NO ANSWER`. Without this an
+unreachable host reads as "every AE title rejected", or worse, as every AE
+title recognized.
+
+**An accepted association is not a verified credential.** User Identity
+Negotiation is optional in DICOM, and a great many SCPs accept the association
+and ignore the sub-item entirely. Against one of those, the first credential
+tried looks correct — and `stop_on_success` then stops and reports it.
+
+So W2 calibrates itself. Before the wordlist, it submits one synthetic
+credential the target cannot know:
+
+| Baseline outcome | `identity_enforced` | Meaning |
+|---|---|---|
+| rejected | `True` | the target discriminates; later acceptances are real |
+| accepted | `False` | the target accepts anything — no credential below proves anything |
+| no answer | `None` | inconclusive; nothing can be said either way |
+
+Report on `credential_verified`, not `accepted`. A target with
+`identity_enforced=False` is itself the finding: it is not enforcing identity
+at all. Pass `baseline=False` to skip calibration when you already know the
+target enforces identity and want to save one association.
 
 ### Examples
 

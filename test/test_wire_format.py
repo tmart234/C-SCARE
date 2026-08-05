@@ -208,3 +208,103 @@ class TestUidPadding:
         item.decode(data)
         assert str(item.abstract_transfer_syntax_sub_items[0].abstract_syntax_name) \
             == CT_IMAGE_STORAGE_SOP_CLASS_UID
+
+
+class TestDimseCommandSets:
+    """DIMSE command sets are implicit-VR little-endian data sets, so pydicom
+    reads them directly - an oracle independent of the code that wrote them.
+
+    Every association-borne attack ships one of these. A wrong command field or
+    a UID under the wrong tag would be answered with "unrecognized operation"
+    and the payload behind it would never be looked at.
+    """
+
+    # PS3.7 Table 9.1-1 (composite) and 10.1-1 (normalized):
+    # command field code, SOP Class UID tag, SOP Instance UID tag.
+    # N-GET/N-SET/N-ACTION/N-DELETE address an existing instance and use
+    # *Requested* (0000,0003 / 0000,1001); N-CREATE and N-EVENT-REPORT use
+    # *Affected* (0000,0002 / 0000,1000). Swapping them is the classic
+    # DIMSE-N encoding mistake and is invisible without a decoder.
+    SPEC = {
+        'C_ECHO_RQ':         (0x0030, 0x0002, None),
+        'C_STORE_RQ':        (0x0001, 0x0002, 0x1000),
+        'C_FIND_RQ':         (0x0020, 0x0002, None),
+        'C_MOVE_RQ':         (0x0021, 0x0002, None),
+        'C_GET_RQ':          (0x0010, 0x0002, None),
+        'C_CANCEL_RQ':       (0x0FFF, None,   None),
+        'N_EVENT_REPORT_RQ': (0x0100, 0x0002, 0x1000),
+        'N_GET_RQ':          (0x0110, 0x0003, 0x1001),
+        'N_SET_RQ':          (0x0120, 0x0003, 0x1001),
+        'N_ACTION_RQ':       (0x0130, 0x0003, 0x1001),
+        'N_CREATE_RQ':       (0x0140, 0x0002, 0x1000),
+        'N_DELETE_RQ':       (0x0150, 0x0003, 0x1001),
+    }
+
+    def _build(self, name):
+        cls = getattr(sd, name)
+        fields = {f.name for f in cls.fields_desc}
+        kwargs = {}
+        if 'message_id' in fields:
+            kwargs['message_id'] = 1
+        if 'message_id_being_responded_to' in fields:
+            kwargs['message_id_being_responded_to'] = 1
+        for field in fields:
+            if field.endswith('sop_class_uid'):
+                kwargs[field] = '1.2.840.10008.1.1'
+            elif field.endswith('sop_instance_uid'):
+                kwargs[field] = '1.2.3.4.5'
+        return raw(cls(**kwargs))
+
+    def _read(self, data):
+        import io
+        from pydicom.filereader import read_dataset
+        return read_dataset(io.BytesIO(data), is_implicit_VR=True,
+                            is_little_endian=True)
+
+    @pytest.mark.parametrize('name', sorted(SPEC))
+    def test_command_set_parses_and_group_length_is_right(self, name):
+        data = self._build(name)
+        dataset = self._read(data)
+        group_length = dataset[(0x0000, 0x0000)].value
+        # The Command Group Length element itself is 12 bytes and is not
+        # counted in its own value.
+        assert group_length == len(data) - 12, (
+            f'{name} group length {group_length} != {len(data) - 12}')
+
+    @pytest.mark.parametrize('name', sorted(SPEC))
+    def test_command_field_and_uid_tags_match_ps37(self, name):
+        command_field, class_tag, instance_tag = self.SPEC[name]
+        dataset = self._read(self._build(name))
+        assert dataset[(0x0000, 0x0100)].value == command_field, name
+
+        tags = {int(element.tag) & 0xFFFF for element in dataset}
+        if class_tag:
+            assert class_tag in tags, (
+                f'{name} must carry (0000,{class_tag:04X})')
+        if instance_tag:
+            assert instance_tag in tags, (
+                f'{name} must carry (0000,{instance_tag:04X})')
+
+    def test_dimse_n_attacks_carry_decodable_command_sets(self):
+        """The catalog's DIMSE-N payloads, not just the packet classes."""
+        from pynetdicom.pdu import P_DATA_TF
+
+        from c_scare.attacks import DimseNAttacks
+
+        seen = set()
+        for result in DimseNAttacks.all():
+            for step in result.metadata['steps']:
+                if step[0] != 0x04:          # only P-DATA-TF carries DIMSE
+                    continue
+                pdata = P_DATA_TF()
+                pdata.decode(step)
+                for item in pdata.presentation_data_value_items:
+                    if not item.data[0] & 0x01:   # command PDV only
+                        continue
+                    dataset = self._read(item.data[1:])
+                    command_field = dataset[(0x0000, 0x0100)].value
+                    assert command_field in {v[0] for v in self.SPEC.values()}, (
+                        f'{result.name}: unknown command field {command_field:#06x}')
+                    seen.add(command_field)
+        # The catalog must actually reach the normalized services it claims.
+        assert {0x0100, 0x0110, 0x0120, 0x0130, 0x0140, 0x0150} & seen

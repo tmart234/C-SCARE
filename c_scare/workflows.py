@@ -22,6 +22,7 @@ The decisive capability across all of these is *reading the response payload*,
 not just classifying accept/reject — see docs/dicom-attack-workflows.md.
 """
 
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -47,6 +48,7 @@ __all__ = [
     "AETResult",
     "CredResult",
     "QR_MODELS",
+    "default_vr_for_tag",
     "build_query",
     "ae_brute",
     "cred_brute",
@@ -169,6 +171,16 @@ class AETResult:
     reject: Optional[Dict[str, int]] = None
     reason: Optional[str] = None
     aet_recognized: bool = False
+    #: Set when the attempt never produced a DICOM answer (connection refused,
+    #: timeout, reset). ``accepted`` and ``aet_recognized`` say nothing in that
+    #: case - an unreachable target must not read as "every AET rejected", nor
+    #: as "every AET recognized".
+    error: Optional[str] = None
+
+    @property
+    def conclusive(self) -> bool:
+        """True when the target actually answered, so the verdict means something."""
+        return self.error is None and (self.accepted or self.reject is not None)
 
 
 @dataclass
@@ -185,6 +197,42 @@ class CredResult:
     reject: Optional[Dict[str, int]] = None
     reason: Optional[str] = None
     aet_problem: bool = False
+    #: Transport failure - no DICOM answer was received (see AETResult.error).
+    error: Optional[str] = None
+    #: False once the baseline probe shows the target accepts a credential it
+    #: cannot possibly know, i.e. it is not checking identity at all. None when
+    #: no baseline was run.
+    identity_enforced: Optional[bool] = None
+    #: True only for a credential this target actually validated. An accepted
+    #: association is NOT evidence on its own: User Identity Negotiation is
+    #: optional in DICOM, so most SCPs accept the association and ignore the
+    #: sub-item entirely.
+    credential_verified: bool = False
+    #: Marks the synthetic credential used to calibrate the run.
+    is_baseline: bool = False
+
+
+def default_vr_for_tag(tag: int) -> str:
+    """VR for ``tag`` from the DICOM data dictionary, or ``LO`` if unknown.
+
+    Guessing ``LO`` for everything is wrong in ways that bite: Study Instance
+    UID is UI, Study Date is DA, Patient Name is PN. Implicit VR hides the
+    mistake because the VR is not on the wire, but an explicit-VR identifier
+    built that way is malformed, and an SCP that validates the VR of a matching
+    key can fail to match on a correctly-spelled value. Private and unknown
+    tags legitimately fall back to LO.
+    """
+    try:
+        from pydicom.datadict import dictionary_VR
+        vr = dictionary_VR(tag)
+    except Exception:
+        return "LO"
+    # Dictionary entries for ambiguous or multi-VR tags are written like
+    # "US or SS"; pick the first, and never hand back a sequence VR here.
+    vr = str(vr).split(" or ")[0].strip()
+    if not vr or vr in ("SQ", "??"):
+        return "LO"
+    return vr
 
 
 def build_query(level: str = "study",
@@ -193,27 +241,35 @@ def build_query(level: str = "study",
     """Build a sculpted C-FIND/C-MOVE/C-GET identifier dataset.
 
     ``level``      - one of patient/study/series/image (sets QueryRetrieveLevel).
+                     An unrecognized level raises: an identifier with no
+                     QueryRetrieveLevel is invalid, and silently omitting it
+                     turns a typo into an unexplained empty result set.
     ``return_keys``- tags requested back with universal matching (empty value).
-                     Each entry is ``(group, element[, vr])`` or an int tag; a
-                     VR defaults to a sensible string VR. Private tags are fine.
+                     Each entry is ``(group, element[, vr])`` or an int tag. The
+                     VR is looked up in the DICOM dictionary unless given
+                     explicitly; private tags fall back to LO.
     ``match_keys`` - ``{(group, element[, vr]): value}`` matching constraints.
 
     The return-key discipline is the point: a key is returned only if it is in
     the set, so an operator must ask for exactly what they want.
     """
     ds = Dataset()
-    lvl = _QR_LEVEL.get(level.lower())
-    if lvl is not None:
-        ds / Element(0x0008, 0x0052, "CS", lvl)  # QueryRetrieveLevel
+    key = level.lower() if isinstance(level, str) else level
+    if key not in _QR_LEVEL:
+        raise ValueError(
+            f"unknown query level {level!r}; expected one of "
+            f"{sorted(_QR_LEVEL)}")
+    ds / Element(0x0008, 0x0052, "CS", _QR_LEVEL[key])  # QueryRetrieveLevel
 
     def _coerce(key):
         # Returns (group, element, vr)
         if isinstance(key, (tuple, list)):
             if len(key) == 3:
                 return int(key[0]), int(key[1]), str(key[2])
-            return int(key[0]), int(key[1]), "LO"
+            group, element = int(key[0]), int(key[1])
+            return group, element, default_vr_for_tag((group << 16) | element)
         tag = int(key)
-        return (tag >> 16) & 0xFFFF, tag & 0xFFFF, "LO"
+        return (tag >> 16) & 0xFFFF, tag & 0xFFFF, default_vr_for_tag(tag)
 
     for key in (return_keys or []):
         g, e, vr = _coerce(key)
@@ -260,13 +316,22 @@ def ae_brute(ip: str, port: int, aets: Sequence[str],
                 ))
             else:
                 rj = sock.last_reject
-                results.append(AETResult(
-                    aet=aet, accepted=False, reject=rj,
-                    reason=classify_reject(rj),
-                    aet_recognized=not reject_is_called_aet_unrecognized(rj),
-                ))
-        except Exception:
-            results.append(AETResult(aet=aet, accepted=False))
+                if rj is None:
+                    # associate() failed without an A-ASSOCIATE-RJ: the peer
+                    # never answered. Reporting aet_recognized here would mark
+                    # every AET valid against an unreachable host.
+                    results.append(AETResult(
+                        aet=aet, accepted=False,
+                        error=sock.last_error or "no response from peer"))
+                else:
+                    results.append(AETResult(
+                        aet=aet, accepted=False, reject=rj,
+                        reason=classify_reject(rj),
+                        aet_recognized=not reject_is_called_aet_unrecognized(rj),
+                    ))
+        except Exception as exc:
+            results.append(AETResult(
+                aet=aet, accepted=False, error=f"{type(exc).__name__}: {exc}"))
         finally:
             try:
                 sock.__exit__(None, None, None)
@@ -281,21 +346,34 @@ def cred_brute(ip: str, port: int, called_ae: str,
                identity_type: int = 2,
                requested_contexts: Optional[Dict[str, List[str]]] = None,
                stop_on_success: bool = True,
-               timeout: float = 10.0) -> List[CredResult]:
+               timeout: float = 10.0,
+               baseline: bool = True) -> List[CredResult]:
     """Brute-force User Identity credentials (workflow W2).
 
-    Sends a real Type 0x58 sub-item per attempt and **surfaces the Type 0x59
-    server-response bytes** on success — that payload only appears when a valid
-    credential is submitted. ``creds`` is a sequence of ``(username, passcode)``
-    (passcode ignored for non-type-2 identities, where ``username`` carries the
-    token bytes).
+    Sends a real Type 0x58 sub-item per attempt and surfaces the Type 0x59
+    server-response bytes when the peer returns one.
+
+    **An accepted association is not evidence that a credential is valid.**
+    User Identity Negotiation is optional in DICOM, so a great many SCPs accept
+    the association and ignore the sub-item entirely. Taken at face value that
+    makes the first credential tried look correct - and with
+    ``stop_on_success`` the run then stops and reports it.
+
+    So the run calibrates itself first: ``baseline=True`` submits one synthetic
+    credential the target cannot know. If that is accepted, the target is not
+    enforcing identity, every later acceptance is meaningless, and results are
+    marked ``identity_enforced=False`` with ``credential_verified=False``.
+    ``credential_verified`` is the field to report on; ``accepted`` only
+    records what the association did.
+
+    ``creds`` is a sequence of ``(username, passcode)`` (passcode ignored for
+    non-type-2 identities, where ``username`` carries the token bytes).
     """
     if requested_contexts is None:
         from .scapy_dicom import VERIFICATION_SOP_CLASS_UID
         requested_contexts = {VERIFICATION_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID]}
 
-    results: List[CredResult] = []
-    for username, passcode in creds:
+    def _attempt(username: str, passcode: str, is_baseline: bool = False) -> CredResult:
         identity = {
             "type": identity_type,
             "primary": username,
@@ -306,25 +384,61 @@ def cred_brute(ip: str, port: int, called_ae: str,
         try:
             ok = sock.associate(requested_contexts, user_identity=identity)
             if ok:
-                results.append(CredResult(
-                    username=username,
-                    accepted=True,
+                return CredResult(
+                    username=username, accepted=True, is_baseline=is_baseline,
                     server_response=sock.user_identity_response,
-                ))
-                if stop_on_success:
-                    break
-            else:
-                rj = sock.last_reject
-                results.append(CredResult(
-                    username=username, accepted=False, reject=rj,
-                    reason=classify_reject(rj),
-                    aet_problem=reject_is_called_aet_unrecognized(rj),
-                ))
-        except Exception:
-            results.append(CredResult(username=username, accepted=False))
+                )
+            rj = sock.last_reject
+            if rj is None:
+                return CredResult(
+                    username=username, accepted=False, is_baseline=is_baseline,
+                    error=sock.last_error or "no response from peer")
+            return CredResult(
+                username=username, accepted=False, is_baseline=is_baseline,
+                reject=rj, reason=classify_reject(rj),
+                aet_problem=reject_is_called_aet_unrecognized(rj))
+        except Exception as exc:
+            return CredResult(username=username, accepted=False,
+                              is_baseline=is_baseline,
+                              error=f"{type(exc).__name__}: {exc}")
         finally:
             try:
                 sock.__exit__(None, None, None)
             except Exception:
                 pass
+
+    results: List[CredResult] = []
+    identity_enforced: Optional[bool] = None
+
+    if baseline:
+        # Random enough that no target could have it provisioned, and clearly
+        # labelled so it is recognizable in the target's logs.
+        probe_user = f"c-scare-baseline-{uuid.uuid4().hex[:16]}"
+        probe = _attempt(probe_user, uuid.uuid4().hex, is_baseline=True)
+        if probe.error is None:
+            # Only conclusive when the peer actually answered.
+            identity_enforced = not probe.accepted
+        probe.identity_enforced = identity_enforced
+        results.append(probe)
+        if identity_enforced is False:
+            # Nothing further can be learned about credentials from this target;
+            # run the list anyway so the operator sees it was not a fluke, but
+            # never mark any of it verified.
+            for username, passcode in creds:
+                attempt = _attempt(username, passcode)
+                attempt.identity_enforced = False
+                results.append(attempt)
+            return results
+
+    for username, passcode in creds:
+        attempt = _attempt(username, passcode)
+        attempt.identity_enforced = identity_enforced
+        # A credential counts as verified only when the target demonstrably
+        # discriminates. A Type 0x59 response is the affirmative signal; with a
+        # passing baseline, an accepted association is sufficient evidence.
+        attempt.credential_verified = bool(
+            attempt.accepted and identity_enforced is not False)
+        results.append(attempt)
+        if attempt.credential_verified and stop_on_success:
+            break
     return results
