@@ -28,16 +28,21 @@ Examples:
 import sys
 import os
 import argparse
+import datetime as dt
 import time
-from typing import List, Optional
+import struct
+import copy
+import hashlib
+from typing import Dict, List, Optional, Tuple
 import tempfile
 
 # Import attack modules
 try:
     from .attacks import (
         ParserAttacks, ProtocolAttacks, MemoryAttacks, LogicAttacks,
-        CommandInjectionAttacks, PathTraversalAttacks, StateMachineAttacks,
-        CVEAttacks, ProtocolFuzzer, AttackResult, SCAPY_AVAILABLE
+        StorageSCPAbuseAttacks, CommandInjectionAttacks,
+        PathTraversalAttacks, StateMachineAttacks, CVEAttacks,
+        ProtocolFuzzer, AttackResult, SCAPY_AVAILABLE
     )
     from . import deliver
     from .monitor import (
@@ -48,8 +53,9 @@ try:
 except ImportError:
     from attacks import (
         ParserAttacks, ProtocolAttacks, MemoryAttacks, LogicAttacks,
-        CommandInjectionAttacks, PathTraversalAttacks, StateMachineAttacks,
-        CVEAttacks, ProtocolFuzzer, AttackResult, SCAPY_AVAILABLE
+        StorageSCPAbuseAttacks, CommandInjectionAttacks,
+        PathTraversalAttacks, StateMachineAttacks, CVEAttacks,
+        ProtocolFuzzer, AttackResult, SCAPY_AVAILABLE
     )
     import deliver
     from monitor import (
@@ -61,6 +67,12 @@ except ImportError:
 __all__ = ['main', 'run_command', 'write_sarif']
 
 SANITIZER_FLUSH_DELAY = 0.3
+
+
+def _timestamp_from_ns(value: int) -> str:
+    return dt.datetime.fromtimestamp(value / 1_000_000_000).astimezone().isoformat(
+        timespec="microseconds"
+    )
 
 
 def _collect_results(args, results: list):
@@ -84,7 +96,12 @@ def _get_process(args):
 # the target's import/parse path they must ride inside a valid C-STORE
 # association, not be dropped raw on the listening port.
 DATASET_CATEGORIES = frozenset({
-    'parser', 'memory', 'path_traversal', 'command_injection',
+    'parser', 'memory', 'logic', 'storage_abuse',
+    'path_traversal', 'command_injection',
+})
+
+_LONG_EXPLICIT_VR = frozenset({
+    b'OB', b'OD', b'OF', b'OL', b'OV', b'OW', b'SQ', b'UC', b'UR', b'UT', b'UN',
 })
 
 # Fallback storage SOP class for C-STORE delivery when an attack does not name
@@ -92,6 +109,494 @@ DATASET_CATEGORIES = frozenset({
 # path-traversal payloads already target. Hard-coded so this module imports
 # without scapy; delivery itself (send_cstore) requires scapy at call time.
 _DEFAULT_STORE_SOP = "1.2.840.10008.5.1.4.1.1.7"  # Secondary Capture Image Storage
+_DEFAULT_STORE_TRANSFER_SYNTAX = "1.2.840.10008.1.2"  # Implicit VR Little Endian
+_ASSOCIATE_RQ_PDU_TYPE = 0x01
+_ASSOCIATE_RQ_MIN_LEN = 74
+_ASSOCIATE_CALLED_AE_OFFSET = 10
+_ASSOCIATE_CALLING_AE_OFFSET = 26
+_ASSOCIATE_AE_LEN = 16
+
+
+def _ae_title_field(value: str) -> bytes:
+    return str(value or "")[:_ASSOCIATE_AE_LEN].ljust(_ASSOCIATE_AE_LEN).encode(
+        "ascii", errors="replace")
+
+
+def _is_associate_rq(payload: bytes) -> bool:
+    return len(payload) >= _ASSOCIATE_RQ_MIN_LEN and payload[0] == _ASSOCIATE_RQ_PDU_TYPE
+
+
+def _association_ae_titles_are_tested(result: AttackResult) -> bool:
+    metadata = result.metadata or {}
+    if metadata.get("preserve_association_ae_titles"):
+        return True
+    if any(key in metadata for key in (
+        "called_ae_title", "calling_ae_title", "called_ae", "calling_ae")):
+        return True
+    text = " ".join(str(value) for value in (
+        result.name,
+        result.description,
+        metadata.get("target_field", ""),
+        metadata.get("coverage_scope", ""),
+    )).lower()
+    return ("ae title" in text or "called ae" in text or "calling ae" in text
+            or "called_ae" in text or "calling_ae" in text)
+
+
+def _render_association_ae_titles(payload: bytes, args, result: AttackResult) -> bytes:
+    """Apply live-target AE titles to raw A-ASSOCIATE-RQ payloads.
+
+    Catalog sequences are useful as corpus seeds with fixed AE fields, but live
+    product DAST should negotiate against the operator-selected AE titles unless
+    the test itself is probing AE-title handling.
+    """
+    if _association_ae_titles_are_tested(result) or not _is_associate_rq(payload):
+        return payload
+
+    called_ae = getattr(args, "ae_title", None)
+    calling_ae = getattr(args, "calling_ae", None)
+    if called_ae is None and calling_ae is None:
+        return payload
+
+    rendered = bytearray(payload)
+    if called_ae is not None:
+        rendered[_ASSOCIATE_CALLED_AE_OFFSET:
+                 _ASSOCIATE_CALLED_AE_OFFSET + _ASSOCIATE_AE_LEN] = _ae_title_field(called_ae)
+        result.metadata["rendered_called_ae_title"] = str(called_ae)
+    if calling_ae is not None:
+        rendered[_ASSOCIATE_CALLING_AE_OFFSET:
+                 _ASSOCIATE_CALLING_AE_OFFSET + _ASSOCIATE_AE_LEN] = _ae_title_field(calling_ae)
+        result.metadata["rendered_calling_ae_title"] = str(calling_ae)
+    return bytes(rendered)
+
+
+def _render_sequence_steps(args, result: AttackResult, steps: List[bytes]) -> List[bytes]:
+    return [_render_association_ae_titles(step, args, result) for step in steps]
+
+
+def _uid_str(value) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _encode_pydicom_dataset(dataset, transfer_syntax: str) -> bytes:
+    try:
+        from pydicom.filebase import DicomBytesIO
+        from pydicom.filewriter import write_dataset
+        from pydicom.uid import UID
+    except ImportError as exc:
+        raise RuntimeError("--cstore-file requires pydicom") from exc
+
+    ts_uid = UID(transfer_syntax)
+    dataset.is_implicit_VR = bool(ts_uid.is_implicit_VR)
+    dataset.is_little_endian = bool(ts_uid.is_little_endian)
+    buffer = DicomBytesIO()
+    buffer.is_implicit_VR = dataset.is_implicit_VR
+    buffer.is_little_endian = dataset.is_little_endian
+    write_dataset(buffer, dataset)
+    return buffer.getvalue()
+
+
+def _get_cstore_file_context(args) -> Optional[Dict[str, object]]:
+    path = getattr(args, 'cstore_file', None)
+    if not path:
+        return None
+    path = os.path.abspath(os.fspath(path))
+    cached = getattr(args, '_cstore_file_context', None)
+    if cached and cached.get('path') == path:
+        return cached
+
+    try:
+        import pydicom
+    except ImportError as exc:
+        raise RuntimeError("--cstore-file requires pydicom") from exc
+
+    dataset = pydicom.dcmread(path)
+    file_meta = getattr(dataset, 'file_meta', None)
+    transfer_syntax = _uid_str(getattr(file_meta, 'TransferSyntaxUID', None))
+    if transfer_syntax is None:
+        transfer_syntax = _DEFAULT_STORE_TRANSFER_SYNTAX
+
+    sop_class = (_uid_str(getattr(dataset, 'SOPClassUID', None))
+                 or _uid_str(getattr(file_meta, 'MediaStorageSOPClassUID', None))
+                 or getattr(args, 'store_sop', None)
+                 or _DEFAULT_STORE_SOP)
+    sop_instance = (_uid_str(getattr(dataset, 'SOPInstanceUID', None))
+                    or _uid_str(getattr(file_meta, 'MediaStorageSOPInstanceUID', None))
+                    or f"1.2.826.0.1.3680043.10.543.{int(time.time())}.4")
+
+    context = {
+        'path': path,
+        'dataset': dataset,
+        'transfer_syntax': transfer_syntax,
+        'sop_class_uid': sop_class,
+        'sop_instance_uid': sop_instance,
+    }
+    args._cstore_file_context = context
+    return context
+
+
+def _set_dataset_attr(dataset, keyword: str, value: str) -> None:
+    try:
+        setattr(dataset, keyword, value)
+    except Exception:
+        pass
+
+
+def _unique_uid(suffix: int) -> str:
+    return f"1.2.826.0.1.3680043.10.543.{time.time_ns()}.{suffix}"
+
+
+def _uid_hash(value: str) -> int:
+    digest = hashlib.sha1(value.encode('utf-8', errors='replace')).hexdigest()
+    return int(digest[:8], 16) % 100000000
+
+
+def _series_uid_for_result(result: AttackResult, suffix: int) -> str:
+    run_id = os.environ.get('CSCARE_DAST_RUN_ID')
+    if not run_id:
+        return _unique_uid(suffix)
+    return f"1.2.826.0.1.3680043.10.543.{_uid_hash(run_id)}.{_uid_hash(result.name)}.{suffix}"
+
+
+def _slice_uid_for_result(result: AttackResult, context: Dict[str, object], suffix: int) -> str:
+    run_id = os.environ.get('CSCARE_DAST_RUN_ID')
+    if not run_id:
+        return _unique_uid(suffix)
+    source_id = str(context.get('sop_instance_uid') or context.get('path') or time.time_ns())
+    return (
+        f"1.2.826.0.1.3680043.10.543.{_uid_hash(run_id)}."
+        f"{_uid_hash(result.name)}.{_uid_hash(source_id)}.{suffix}"
+    )
+
+
+def _apply_field_overrides(dataset, overrides: Dict[str, str]) -> None:
+    for keyword, value in overrides.items():
+        _set_dataset_attr(dataset, keyword, value)
+
+
+def _stamp_cstore_file_identity(dataset, result: AttackResult,
+                                context: Dict[str, object]) -> str:
+    sop_instance = _slice_uid_for_result(result, context, 1)
+    study_instance = _series_uid_for_result(result, 2)
+    series_instance = _series_uid_for_result(result, 3)
+    run_id = os.environ.get('CSCARE_DAST_RUN_ID')
+    patient_suffix = _uid_hash(f"{run_id}:{result.name}") if run_id else time.time_ns() & 0xFFFFFFFF
+    patient_id = f"CSCARE-{patient_suffix:x}"
+    patient_name = f"C-SCARE^{result.name[:48]}"
+
+    _set_dataset_attr(dataset, 'SOPInstanceUID', sop_instance)
+    _set_dataset_attr(dataset, 'StudyInstanceUID', study_instance)
+    _set_dataset_attr(dataset, 'SeriesInstanceUID', series_instance)
+    _set_dataset_attr(dataset, 'PatientName', patient_name)
+    _set_dataset_attr(dataset, 'PatientID', patient_id)
+
+    result.metadata['cstore_file_base_sop_instance_uid'] = sop_instance
+    result.metadata['cstore_file_base_study_instance_uid'] = study_instance
+    result.metadata['cstore_file_base_series_instance_uid'] = series_instance
+    result.metadata['cstore_file_base_patient_id'] = patient_id
+    return sop_instance
+
+
+def _path_display_marker(value: str) -> str:
+    marker = str(value).replace('\x00', '')
+    run_id = os.environ.get('CSCARE_DAST_RUN_ID')
+    if run_id:
+        marker = f"{marker}-{_uid_hash(run_id):08d}"
+    return marker[:64] or 'C-SCARE-PATH'
+
+
+def _set_path_display_markers(dataset, value: str) -> None:
+    marker = _path_display_marker(value)
+    _set_dataset_attr(dataset, 'PatientID', marker)
+    _set_dataset_attr(dataset, 'StudyDescription', marker)
+    _set_dataset_attr(dataset, 'SeriesDescription', marker)
+    _set_dataset_attr(dataset, 'PatientComments', marker)
+
+
+def _attack_dataset_payload(result: AttackResult) -> bytes:
+    payload, _meta = _dataset_from_part10(result.payload)
+    return payload
+
+
+# DICOM element name (as attacks write it in `target_field`) -> pydicom
+# keyword, and the metadata key an attack uses to carry that element's value.
+# An attack names the element it corrupts; this table says where to put it on
+# the carrier object. Nothing here knows individual attack names.
+_CSTORE_TARGET_FIELDS = {
+    '(0008,0018) SOP Instance UID': ('SOPInstanceUID', 'sop_instance_uid'),
+    '(0020,000D) Study Instance UID': ('StudyInstanceUID', 'study_instance_uid'),
+    '(0020,000E) Series Instance UID': ('SeriesInstanceUID', 'series_instance_uid'),
+    '(0010,0010) Patient Name': ('PatientName', 'patient_name'),
+    '(0010,0020) Patient ID': ('PatientID', 'patient_id'),
+}
+
+# `coverage_scope` values that change how a payload is placed rather than
+# where. The two traversal scopes split one value across the C-STORE command
+# set and the data set to prove which half the target actually consumes.
+_SCOPE_COMMAND_UID_ONLY = 'command-sop-instance-uid-only'
+_SCOPE_DATASET_UID_ONLY = 'dataset-sop-instance-uid-only'
+_SCOPE_IDENTITY_VALIDATION = 'identity-validation'
+_SCOPE_DISK_PRESSURE = 'storage-quota-disk-pressure'
+
+
+def _cstore_file_overlay(dataset, result: AttackResult,
+                         command_sop_class: str,
+                         command_sop_instance: str) -> Tuple[str, str, bytes]:
+    """Overlay one attack onto a copy of the carrier object's data set.
+
+    Returns the (possibly rewritten) command-set SOP Class/Instance UIDs and
+    any extra data set bytes to append after the carrier. Placement is driven
+    entirely by ``result.metadata``, so adding an attack never requires editing
+    this function: an attack that declares nothing recognizable here has its
+    own data set appended to the carrier instead.
+    """
+    metadata = result.metadata or {}
+    scope = metadata.get('coverage_scope')
+    applied: List[str] = []
+
+    # Command-vs-dataset consistency attacks name each half explicitly.
+    if isinstance(metadata.get('command_sop_class_uid'), str):
+        command_sop_class = metadata['command_sop_class_uid']
+        applied.append('command_sop_class_uid')
+    if isinstance(metadata.get('dataset_sop_class_uid'), str):
+        _set_dataset_attr(dataset, 'SOPClassUID', metadata['dataset_sop_class_uid'])
+        applied.append('dataset_sop_class_uid')
+    if isinstance(metadata.get('command_sop_instance_uid'), str):
+        command_sop_instance = metadata['command_sop_instance_uid']
+        applied.append('command_sop_instance_uid')
+    if isinstance(metadata.get('dataset_sop_instance_uid'), str):
+        _set_dataset_attr(dataset, 'SOPInstanceUID', metadata['dataset_sop_instance_uid'])
+        applied.append('dataset_sop_instance_uid')
+
+    # An attack may spell out exactly which elements to rewrite.
+    overrides = metadata.get('cstore_field_overrides')
+    if isinstance(overrides, dict):
+        _apply_field_overrides(dataset, overrides)
+        applied.append('cstore_field_overrides')
+        # Command and data set must agree on the SOP Instance UID unless the
+        # attack explicitly split them, or an SCP that names the stored file
+        # from the command set would never see the payload.
+        if 'SOPInstanceUID' in overrides and 'command_sop_instance_uid' not in applied:
+            command_sop_instance = overrides['SOPInstanceUID']
+
+    # The element named by `target_field` carries the payload. Its value comes
+    # from `traversal_payload` or from the per-element metadata key.
+    payload_value = metadata.get('traversal_payload')
+    target = _CSTORE_TARGET_FIELDS.get(metadata.get('target_field'))
+    if scope == _SCOPE_COMMAND_UID_ONLY and isinstance(payload_value, str):
+        # The data set keeps a benign UID; only the command set carries the payload.
+        command_sop_instance = payload_value
+        applied.append('command_sop_instance_uid')
+    elif scope == _SCOPE_DATASET_UID_ONLY and isinstance(payload_value, str):
+        _set_dataset_attr(dataset, 'SOPInstanceUID', payload_value)
+        applied.append('dataset_sop_instance_uid')
+    elif target is not None:
+        keyword, value_key = target
+        value = payload_value if isinstance(payload_value, str) else metadata.get(value_key)
+        if isinstance(value, str):
+            _set_dataset_attr(dataset, keyword, value)
+            applied.append(value_key)
+            if keyword == 'SOPInstanceUID':
+                command_sop_instance = value
+
+    if isinstance(payload_value, str) and applied:
+        # Mirror the path string into human-visible fields so an operator
+        # browsing the target's UI or storage tree can spot where it landed.
+        _set_path_display_markers(dataset, payload_value)
+
+    if scope == _SCOPE_IDENTITY_VALIDATION:
+        _set_dataset_attr(dataset, 'PatientName', '')
+        _set_dataset_attr(dataset, 'PatientID', '')
+        applied.append('empty_identity')
+
+    if scope == _SCOPE_DISK_PRESSURE:
+        size = max(int(metadata.get('size', 0)), _cstore_rss_pressure_bytes())
+        dataset.PixelData = b'X' * size
+        result.metadata['cstore_file_effective_pixel_bytes'] = size
+        applied.append('pixel_data_pressure')
+
+    append_payload = b'' if applied else _attack_dataset_payload(result)
+    result.metadata['cstore_file_mutation'] = (
+        '+'.join(applied) if applied else 'append_attack_dataset')
+    return command_sop_class, command_sop_instance, append_payload
+
+
+def _cstore_file_payload_for_result(args, result: Optional[AttackResult]):
+    """Render an attack as a C-STORE payload carried by a real DICOM object.
+
+    Without ``--cstore-file`` this returns ``None`` and the caller falls back
+    to the attack's own synthetic payload. With it, the attack is overlaid on
+    a copy of a real object read from the target, so payloads survive SCPs
+    that reject datasets missing device-specific required elements.
+    """
+    context = _get_cstore_file_context(args)
+    if context is None:
+        return None
+
+    dataset = copy.deepcopy(context['dataset'])
+    transfer_syntax = (getattr(args, 'store_transfer_syntax', None)
+                       or context['transfer_syntax']
+                       or _DEFAULT_STORE_TRANSFER_SYNTAX)
+    command_sop_class = context['sop_class_uid'] or _DEFAULT_STORE_SOP
+    command_sop_instance = context['sop_instance_uid']
+    append_payload = b''
+
+    if result is not None:
+        result.metadata['cstore_file'] = context['path']
+        result.metadata['cstore_file_transfer_syntax'] = transfer_syntax
+        # Every delivered object gets a fresh identity so one attack's object
+        # cannot collide with, or overwrite, another's on the target.
+        command_sop_instance = _stamp_cstore_file_identity(dataset, result, context)
+        command_sop_class, command_sop_instance, append_payload = _cstore_file_overlay(
+            dataset, result, command_sop_class, command_sop_instance)
+
+    payload = _encode_pydicom_dataset(dataset, transfer_syntax) + append_payload
+    return payload, command_sop_class, command_sop_instance, transfer_syntax
+
+
+def _cstore_rss_pressure_bytes() -> int:
+    """Pixel Data size for disk/memory-pressure attacks, in bytes.
+
+    Defaults to 256 KiB. Raise it via ``CSCARE_CSTORE_RSS_PRESSURE_BYTES``
+    when the target only shows growth under a larger object; capped at 512 MiB
+    so a typo cannot try to allocate the test host's whole memory.
+    """
+    raw = os.environ.get('CSCARE_CSTORE_RSS_PRESSURE_BYTES')
+    if not raw:
+        return 256 * 1024
+    try:
+        size = int(raw, 0)
+    except ValueError:
+        return 256 * 1024
+    return max(0, min(size, 512 * 1024 * 1024))
+
+
+def _cstore_smoke_dataset(sop_class_uid: str, sop_instance_uid: str,
+                          transfer_syntax: str) -> bytes:
+    """Minimal but wholly valid Secondary Capture object for the smoke check."""
+    try:
+        from .element import Dataset, Element
+    except ImportError:
+        from element import Dataset, Element
+
+    study_uid = f"1.2.826.0.1.3680043.10.543.{int(time.time())}.1"
+    series_uid = f"1.2.826.0.1.3680043.10.543.{int(time.time())}.2"
+    ds = Dataset()
+    ds = ds / Element(0x0008, 0x0016, 'UI', sop_class_uid)
+    ds = ds / Element(0x0008, 0x0018, 'UI', sop_instance_uid)
+    ds = ds / Element(0x0008, 0x0020, 'DA', time.strftime('%Y%m%d'))
+    ds = ds / Element(0x0008, 0x0030, 'TM', time.strftime('%H%M%S'))
+    ds = ds / Element(0x0008, 0x0060, 'CS', 'OT')
+    ds = ds / Element(0x0010, 0x0010, 'PN', 'C-SCARE^Smoke')
+    ds = ds / Element(0x0010, 0x0020, 'LO', 'C-SCARE-SMOKE')
+    ds = ds / Element(0x0020, 0x000D, 'UI', study_uid)
+    ds = ds / Element(0x0020, 0x000E, 'UI', series_uid)
+    ds = ds / Element(0x0028, 0x0002, 'US', 1)       # Samples per Pixel
+    ds = ds / Element(0x0028, 0x0004, 'CS', 'MONOCHROME2')
+    ds = ds / Element(0x0028, 0x0010, 'US', 1)       # Rows
+    ds = ds / Element(0x0028, 0x0011, 'US', 1)       # Columns
+    ds = ds / Element(0x0028, 0x0100, 'US', 8)       # Bits Allocated
+    ds = ds / Element(0x0028, 0x0101, 'US', 8)       # Bits Stored
+    ds = ds / Element(0x0028, 0x0102, 'US', 7)       # High Bit
+    ds = ds / Element(0x0028, 0x0103, 'US', 0)       # Pixel Representation
+    ds = ds / Element(0x7FE0, 0x0010, 'OB', b'\x00')
+    return ds.encode(implicit_vr=(transfer_syntax == _DEFAULT_STORE_TRANSFER_SYNTAX))
+
+
+def _run_cstore_smoke(args, target) -> int:
+    """Store one known-good object and report the DIMSE status.
+
+    Run this before and after a catalog to separate "the SCP rejected this
+    attack" from "the SCP stopped accepting anything" — a rejection only means
+    something if the same channel accepts a valid object.
+    """
+    file_payload = _cstore_file_payload_for_result(args, None)
+    if file_payload is not None:
+        payload, sop_class, sop_instance, transfer_syntax = file_payload
+    else:
+        sop_class = getattr(args, 'store_sop', None) or _DEFAULT_STORE_SOP
+        transfer_syntax = (getattr(args, 'store_transfer_syntax', None)
+                           or _DEFAULT_STORE_TRANSFER_SYNTAX)
+        sop_instance = f"1.2.826.0.1.3680043.10.543.{int(time.time())}.3"
+        payload = _cstore_smoke_dataset(sop_class, sop_instance, transfer_syntax)
+    print("C-STORE smoke: sending known-good dataset")
+    if getattr(args, 'cstore_file', None):
+        print(f"  File: {os.path.abspath(os.fspath(args.cstore_file))}")
+    print(f"  SOP Class: {sop_class}")
+    print(f"  Transfer Syntax: {transfer_syntax}")
+    print(f"  Called AE: {getattr(args, 'ae_title', 'TARGET')}")
+    print(f"  Calling AE: {getattr(args, 'calling_ae', 'ATTACKER')}")
+    status = deliver.send_cstore(
+        target, payload, sop_class, sop_instance,
+        transfer_syntax=transfer_syntax,
+        called_ae=getattr(args, 'ae_title', 'TARGET'),
+        calling_ae=getattr(args, 'calling_ae', 'ATTACKER'),
+        timeout=getattr(args, 'timeout', 5.0),
+    )
+    if status == 0x0000:
+        print("C-STORE smoke: PASS status=0x0000")
+        return 0
+    if status is None:
+        print("C-STORE smoke: FAIL association/C-STORE failed")
+    else:
+        print(f"C-STORE smoke: FAIL status=0x{status:04X}")
+    return 1
+
+
+def _decode_uid_value(value: bytes) -> str:
+    """Decode a DICOM UI value from file meta information."""
+    return value.rstrip(b'\x00 ').decode('ascii', errors='ignore')
+
+
+def _dataset_from_part10(payload: bytes) -> Tuple[bytes, Dict[str, str]]:
+    """Strip a Part-10 file wrapper for C-STORE delivery.
+
+    C-STORE carries only a DICOM data set. Several catalog CVE payloads are
+    stored as complete Part-10 files so they are useful as file-parser seeds;
+    when those same payloads are delivered over C-STORE, remove the preamble
+    and group-0002 file meta header while preserving the malformed data set.
+    """
+    meta: Dict[str, str] = {}
+    if len(payload) < 132 or payload[128:132] != b'DICM':
+        return payload, meta
+
+    pos = 132
+    end = len(payload)
+    while pos + 8 <= end:
+        group, elem = struct.unpack_from('<HH', payload, pos)
+        if group != 0x0002:
+            break
+
+        vr = payload[pos + 4:pos + 6]
+        if vr in _LONG_EXPLICIT_VR:
+            if pos + 12 > end:
+                break
+            length = struct.unpack_from('<I', payload, pos + 8)[0]
+            value_start = pos + 12
+        else:
+            length = struct.unpack_from('<H', payload, pos + 6)[0]
+            value_start = pos + 8
+
+        value_end = value_start + length
+        if length == 0xFFFFFFFF or value_end > end:
+            break
+
+        value = payload[value_start:value_end]
+        if elem == 0x0002:
+            meta['sop_class_uid'] = _decode_uid_value(value)
+        elif elem == 0x0003:
+            meta['sop_instance_uid'] = _decode_uid_value(value)
+        elif elem == 0x0010:
+            meta['transfer_syntax'] = _decode_uid_value(value)
+        pos = value_end
+
+    if pos > 132:
+        meta['part10_stripped'] = 'true'
+        return payload[pos:], meta
+    return payload, meta
 
 
 def _delivery_kind(args, result: AttackResult) -> str:
@@ -114,6 +619,8 @@ def _delivery_kind(args, result: AttackResult) -> str:
     # auto
     if has_steps:
         return 'sequence'
+    if result.metadata.get('delivery_hint') == 'cstore':
+        return 'cstore'
     if has_sop or result.category in DATASET_CATEGORIES:
         return 'cstore'
     return 'pdu'
@@ -138,24 +645,40 @@ def _deliver(args, result: AttackResult, target, timeout: float):
     result.metadata['delivery'] = kind
     try:
         if kind == 'sequence':
-            steps = list(result.metadata.get('steps') or [payload])
+            steps = _render_sequence_steps(args, result,
+                                           list(result.metadata.get('steps') or [payload]))
             responses = deliver.send_sequence(target, steps, timeout=timeout)
             last = responses[-1] if responses else None
             return last, ('timeout' if last is None else None)
         if kind == 'cstore':
-            sop_class = result.metadata.get('sop_class_uid') \
-                or getattr(args, 'store_sop', None) or _DEFAULT_STORE_SOP
-            sop_inst = result.metadata.get('sop_instance_uid', '1.2.3.4.5')
+            file_payload = _cstore_file_payload_for_result(args, result)
+            if file_payload is not None:
+                cstore_payload, sop_class, sop_inst, transfer_syntax = file_payload
+            else:
+                cstore_payload, part10_meta = _dataset_from_part10(payload)
+                sop_class = result.metadata.get('sop_class_uid') \
+                    or part10_meta.get('sop_class_uid') \
+                    or getattr(args, 'store_sop', None) or _DEFAULT_STORE_SOP
+                sop_inst = result.metadata.get('sop_instance_uid') \
+                    or part10_meta.get('sop_instance_uid') or '1.2.3.4.5'
+                transfer_syntax = result.metadata.get('transfer_syntax') \
+                    or part10_meta.get('transfer_syntax') \
+                    or getattr(args, 'store_transfer_syntax', None)
+                if part10_meta.get('part10_stripped'):
+                    result.metadata['cstore_stripped_part10'] = True
             status = deliver.send_cstore(
-                target, payload, sop_class, sop_inst,
-                transfer_syntax=result.metadata.get('transfer_syntax'),
+                target, cstore_payload, sop_class, sop_inst,
+                transfer_syntax=transfer_syntax,
+                called_ae=getattr(args, 'ae_title', 'TARGET'),
+                calling_ae=getattr(args, 'calling_ae', 'ATTACKER'),
                 timeout=timeout)
             result.metadata['cstore_status'] = status
             # A None status means association/C-STORE failed (no parse reached
             # OR the server died); surface it to ProtocolMonitor as a timeout.
             if status is None:
                 return None, 'timeout'
-            return bytes([(status >> 8) & 0xFF, status & 0xFF]), None
+            return bytes([(status >> 8) & 0xFF, status & 0xFF]), 'cstore_status'
+        payload = _render_association_ae_titles(payload, args, result)
         return deliver.send_pdu(target, payload, timeout=timeout), None
     except ConnectionRefusedError:
         return None, 'refused'
@@ -168,6 +691,10 @@ def _run_monitored_test(args, result: AttackResult, target, timeout: float):
     monitors = _get_monitors(args)
     if not monitors:
         return
+
+    started_ns = time.time_ns()
+    result.metadata['started_at'] = _timestamp_from_ns(started_ns)
+    result.metadata['started_epoch_ns'] = started_ns
 
     for i, monitor in enumerate(monitors):
         monitor.pre_test(i)
@@ -187,6 +714,11 @@ def _run_monitored_test(args, result: AttackResult, target, timeout: float):
         result.monitor_reports.append(report)
         if report.detected:
             result.success = True
+
+    ended_ns = time.time_ns()
+    result.metadata['ended_at'] = _timestamp_from_ns(ended_ns)
+    result.metadata['ended_epoch_ns'] = ended_ns
+    result.metadata['duration_ms'] = round((ended_ns - started_ns) / 1_000_000, 3)
 
     proc = _get_process(args)
     if proc and not proc.is_alive():
@@ -215,6 +747,28 @@ def _sarif_fingerprint(result, detections) -> str:
     return hashlib.sha256("\n".join(parts).encode()).hexdigest()[:16]
 
 
+_SARIF_ERROR_FINDING_PREFIXES = (
+    "asan:", "ubsan:", "msan:", "lsan:", "crash:",
+    "protocol:accepted", "resource:", "canary:", "coredump:",
+    "filesystem-canary", "target-coredump",
+)
+_SARIF_WARNING_FINDING_PREFIXES = ("network:", "protocol:unexpected_pdu")
+
+
+def _sarif_level(result, detections) -> str:
+    """Map evidence strength to SARIF severity without promoting transport noise."""
+    finding_types = [report.finding_type or "" for report in detections]
+    if any(kind.startswith(_SARIF_ERROR_FINDING_PREFIXES) for kind in finding_types):
+        return "error"
+    if any(kind.startswith(_SARIF_WARNING_FINDING_PREFIXES) for kind in finding_types):
+        return "warning"
+    if detections:
+        return "warning"
+    if result.success is None:
+        return "note"
+    return "error"
+
+
 def write_sarif(results: list, filepath: str):
     """Write SARIF v2.1.0 report from AttackResult objects."""
     import json
@@ -232,17 +786,11 @@ def write_sarif(results: list, filepath: str):
                 rule_def["helpUri"] = f"https://cve.mitre.org/cgi-bin/cvename.cgi?name={r.cve}"
             rules[rule_id] = rule_def
 
-        # SARIF severity follows the tri-state finding flag AttackResult.success:
-        #   True  -> an anomaly was actively detected (sanitizer crash/leak,
-        #            protocol/process monitor, hostile-client misbehavior)
-        #   False -> a finding established by an expected failure: the peer
-        #            aborted us (role withheld), or a payload could not be built
-        #   None  -> delivered with no finding / not monitored / inconclusive
-        # Both True and False are reportable findings and map to "error"; only
-        # the no-finding case is informational.
-        level = "note" if r.success is None else "error"
-
         detections = [rpt for rpt in r.monitor_reports if rpt.detected]
+        # Transport failures alone are weak evidence because malformed inputs
+        # commonly provoke resets/timeouts. Confirmed acceptance, crashes,
+        # canaries, coredumps, sanitizer output, and resource growth are errors.
+        level = _sarif_level(r, detections)
         result_obj = {
             "ruleId": rule_id,
             "level": level,
@@ -266,7 +814,10 @@ def write_sarif(results: list, filepath: str):
             }]
         if r.cve:
             result_obj["properties"]["cve"] = r.cve
-        for key in ("delivery", "mutation"):
+        for key in (
+            "delivery", "mutation", "started_at", "ended_at",
+            "started_epoch_ns", "ended_epoch_ns", "duration_ms",
+        ):
             if r.metadata.get(key) is not None:
                 result_obj["properties"][key] = r.metadata[key]
         if detections:
@@ -317,12 +868,12 @@ def print_banner():
 
 def print_result(result: AttackResult, verbose: bool = False):
     """Print an attack result."""
-    status = "✓" if result.success is True else ("✗" if result.success is False else "?")
+    status = "OK" if result.success is True else ("FAIL" if result.success is False else "?")
     cve_tag = f" [{result.cve}]" if result.cve else ""
 
     detections = [r for r in result.monitor_reports if r.detected]
     if detections:
-        detection_str = f" → {detections[0].finding_type}"
+        detection_str = f" -> {detections[0].finding_type}"
     else:
         detection_str = ""
 
@@ -371,7 +922,7 @@ def run_cve_attacks(args) -> int:
 def run_fuzz_packets(args) -> int:
     """Test fuzzed DIMSE packets."""
     if not SCAPY_AVAILABLE:
-        print("⚠ Scapy not available - skipping fuzz packet tests")
+        print("WARNING: Scapy not available - skipping fuzz packet tests")
         print("  (This is optional, install with: pip install scapy)")
         return 0  # Return success - Scapy is optional
     
@@ -412,7 +963,7 @@ def run_fuzz_packets(args) -> int:
             print_result(result, args.verbose)
             results.append(result)
         except Exception as e:
-            print(f"✗ Failed to create C_ECHO_RQ #{i}: {e}")
+            print(f"FAIL Failed to create C_ECHO_RQ #{i}: {e}")
     
     # Test 2: C_STORE with variations
     print("\n2. C_STORE_RQ with field variations")
@@ -435,7 +986,7 @@ def run_fuzz_packets(args) -> int:
             print_result(result, args.verbose)
             results.append(result)
         except Exception as e:
-            print(f"✗ Failed to create C_STORE_RQ #{i}: {e}")
+            print(f"FAIL Failed to create C_STORE_RQ #{i}: {e}")
     
     # Test 3: Generic Scapy fuzz()
     print("\n3. Generic Scapy fuzz()")
@@ -453,7 +1004,7 @@ def run_fuzz_packets(args) -> int:
             print_result(result, args.verbose)
             results.append(result)
         except Exception as e:
-            print(f"✗ Failed to create fuzzed C_ECHO_RQ #{i}: {e}")
+            print(f"FAIL Failed to create fuzzed C_ECHO_RQ #{i}: {e}")
     
     print(f"\nTotal fuzz test cases: {len(results)}")
     _collect_results(args, results)
@@ -475,7 +1026,7 @@ def run_fuzz_packets(args) -> int:
 def run_protocol_fuzzing(args) -> int:
     """Run live protocol fuzzing against a target."""
     if not SCAPY_AVAILABLE:
-        print("⚠ Scapy not available - skipping protocol fuzzing tests")
+        print("WARNING: Scapy not available - skipping protocol fuzzing tests")
         print("  (This is optional, install with: pip install scapy)")
         return 0
 
@@ -505,13 +1056,13 @@ def run_protocol_fuzzing(args) -> int:
 
         for i, result in enumerate(ProtocolFuzzer.fuzz_association(count=args.count)):
             if not result.payload:
-                print(f"✗ #{i+1}: {result.description}")
+                print(f"FAIL #{i+1}: {result.description}")
                 continue
 
             if monitors:
                 _run_monitored_test(args, result, target, args.timeout)
                 detected = any(r.detected for r in result.monitor_reports)
-                status = "!" if detected else "✓"
+                status = "!" if detected else "OK"
                 print(f"{status} #{i+1}: {result.name}")
                 if detected:
                     interesting_count += 1
@@ -526,7 +1077,7 @@ def run_protocol_fuzzing(args) -> int:
                     len(response) == 0 or
                     (response and response[0] not in (0x02, 0x03, 0x07))
                 )
-                status = "!" if interesting else "✓"
+                status = "!" if interesting else "OK"
                 print(f"{status} #{i+1}: {result.name}")
                 if interesting:
                     interesting_count += 1
@@ -558,9 +1109,9 @@ def _save_corpus_file(result: AttackResult, output_dir: str) -> str:
     else:
         ext = '.dcm'
         payload = result.payload or b''
-        # A payload already carrying the Part 10 magic — a raw file (DICM at
+        # A payload already carrying the Part 10 magic - a raw file (DICM at
         # offset 0) or a complete file with a 128-byte preamble (DICM at
-        # offset 128, e.g. the CVE-2019-11687 polyglots) — must be written
+        # offset 128, e.g. the CVE-2019-11687 polyglots) - must be written
         # verbatim. Re-wrapping a polyglot buries its executable preamble at
         # offset 132 and destroys the seed.
         if payload.startswith(b'DICM') or payload[128:132] == b'DICM':
@@ -589,6 +1140,7 @@ def run_generate_corpus(args) -> int:
         ('Parser attacks', ParserAttacks),
         ('Memory attacks', MemoryAttacks),
         ('Logic attacks', LogicAttacks),
+        ('Storage SCP abuse attacks', StorageSCPAbuseAttacks),
         ('Command injection attacks', CommandInjectionAttacks),
         ('Path traversal attacks', PathTraversalAttacks),
         ('CVE attacks', CVEAttacks),
@@ -606,7 +1158,7 @@ def run_generate_corpus(args) -> int:
                 print(f"  {os.path.basename(filepath):30s} {filesize:>8} bytes  {result.description}")
                 results.append(result)
             except Exception as e:
-                print(f"  ✗ {result.name:30s}  SKIPPED  {e}")
+                print(f"  FAIL {result.name:30s}  SKIPPED  {e}")
 
     print(f"\nCorpus saved to: {output_dir}")
     print(f"Total files: {len(results)}")
@@ -615,7 +1167,7 @@ def run_generate_corpus(args) -> int:
 
 
 def _maybe_deliver(args, result: AttackResult, index: int):
-    """If monitors are active, deliver the payload and run monitors."""
+    """Deliver the payload to a live target when monitors are active."""
     monitors = _get_monitors(args)
     if not monitors:
         return
@@ -628,11 +1180,11 @@ def _maybe_deliver(args, result: AttackResult, index: int):
 
 
 def _run_catalog(args, catalog, label: str, note: Optional[str] = None) -> int:
-    """Run one static attack catalog: deliver each payload (when monitors are
-    active), print results, collect findings, and optionally write the payloads
+    """Run one static attack catalog: deliver each payload to a monitored live
+    target, print results, collect findings, and optionally write the payloads
     to ``args.output`` as corpus files.
 
-    The 8 catalog categories differ only in *which* catalog and *which* label —
+    The 8 catalog categories differ only in *which* catalog and *which* label -
     file extension and Part-10 wrapping are decided per payload by
     :func:`_save_corpus_file` (keyed off ``result.category``), so this one helper
     serves them all. ``note`` prints an optional caveat after the totals."""
@@ -645,7 +1197,7 @@ def _run_catalog(args, catalog, label: str, note: Optional[str] = None) -> int:
             print_result(result, args.verbose)
             results.append(result)
         except Exception as e:
-            print(f"✗ {result.name}: {e}")
+            print(f"FAIL {result.name}: {e}")
 
     print(f"\nTotal {label.lower()} tests: {len(results)}")
     if note:
@@ -673,6 +1225,11 @@ def run_protocol_attacks(args) -> int:
 def run_logic_attacks(args) -> int:
     """Run logic attack tests."""
     return _run_catalog(args, LogicAttacks, "Logic Attacks")
+
+
+def run_storage_scp_abuse_attacks(args) -> int:
+    """Run unauthenticated Storage SCP abuse tests."""
+    return _run_catalog(args, StorageSCPAbuseAttacks, "Storage SCP Abuse Attacks")
 
 
 def run_command_injection_attacks(args) -> int:
@@ -774,6 +1331,7 @@ def run_all_tests(args) -> int:
         ('Protocol Attacks', run_protocol_attacks),
         ('Memory Attacks', run_memory_attacks),
         ('Logic Attacks', run_logic_attacks),
+        ('Storage SCP Abuse Attacks', run_storage_scp_abuse_attacks),
         ('Command Injection Attacks', run_command_injection_attacks),
         ('Path Traversal Attacks', run_path_traversal_attacks),
         ('Fuzz Packets', run_fuzz_packets),
@@ -796,7 +1354,7 @@ def run_all_tests(args) -> int:
     print("SUMMARY")
     print('='*60)
     for name, status in results.items():
-        symbol = '✓' if status == 'PASS' else '✗'
+        symbol = 'OK' if status == 'PASS' else 'FAIL'
         print(f"{symbol} {name}: {status}")
     
     return 0
@@ -813,6 +1371,7 @@ def run_command(command: str, args) -> int:
         'parser_attacks': run_parser_attacks,
         'memory_attacks': run_memory_attacks,
         'logic_attacks': run_logic_attacks,
+        'storage_scp_abuse_attacks': run_storage_scp_abuse_attacks,
         'command_injection_attacks': run_command_injection_attacks,
         'path_traversal_attacks': run_path_traversal_attacks,
         'state_machine_attacks': run_state_machine_attacks,
@@ -1052,10 +1611,10 @@ def _cmd_workflow(argv: List[str]) -> int:
                       f"impl_uid={r.implementation_class_uid} "
                       f"impl_ver={r.implementation_version_name}")
             elif r.aet_recognized:
-                # Recognised AET that rejected for another reason (e.g. auth) —
+                # Recognised AET that rejected for another reason (e.g. auth) -
                 # the AET axis is solved; pursue the next axis (W2).
                 print(f"[~] {r.aet}: RECOGNIZED but rejected ({r.reason}) "
-                      f"— AET valid, another gate remains")
+                      f"- AET valid, another gate remains")
             else:
                 print(f"[-] {r.aet}: rejected ({r.reason})")
         return 0
@@ -1079,7 +1638,7 @@ def _cmd_workflow(argv: List[str]) -> int:
                 payload = r.server_response
                 print(f"[+] {r.username}: ACCEPTED  0x59={payload!r}")
             elif r.aet_problem:
-                print(f"[!] {r.username}: rejected ({r.reason}) — the Called AE "
+                print(f"[!] {r.username}: rejected ({r.reason}) - the Called AE "
                       f"Title is wrong, not the credential; fix --ae-title first")
             else:
                 print(f"[-] {r.username}: rejected ({r.reason})")
@@ -1188,6 +1747,11 @@ def _cmd_greybox(argv: List[str]) -> int:
                           'file targets: a SAND sanitizer worker (repeat for '
                           'several sanitizers). For --net: the instrumented '
                           'DICOM server.')
+    trp.add_argument('--auto', action='store_true',
+                     help='recover the replay command from AFL\'s own '
+                          'cmdline/fuzzer_setup metadata in the output tree, '
+                          'including any SAND worker the campaign used, '
+                          'instead of naming --binary/--arg by hand')
     trp.add_argument('--sand', metavar='BINNAME',
                      help='auto-discover SAND sanitizer-worker binaries named '
                           'BINNAME under fuzz/build-san-*/ and triage through '
@@ -1203,8 +1767,11 @@ def _cmd_greybox(argv: List[str]) -> int:
     trp.add_argument('--sarif', help='write a SARIF v2.1.0 report here')
     trp.add_argument('--timeout', type=float, default=10.0)
     trp.add_argument('--include-queue', action='store_true',
-                     help='also triage queue inputs — required to catch '
+                     help='also triage queue inputs - required to catch '
                           'leak-class bugs, which do not crash')
+    trp.add_argument('--include-hangs', action='store_true',
+                     help='also triage AFL/AFLNet saved hangs by replaying '
+                          'them with --timeout')
     a = p.parse_args(argv)
 
     if a.gbcmd == 'run':
@@ -1221,11 +1788,19 @@ def _cmd_greybox(argv: List[str]) -> int:
         cmds = [[b] for b in a.binaries]
     else:
         cmds = [[b] + a.args for b in a.binaries]
+        if a.auto:
+            discovered = greybox.discover_replay_commands(a.crashes)
+            if not discovered:
+                print(f"WARNING: no AFL cmdline/fuzzer_setup metadata under "
+                      f"{a.crashes} - pass --binary/--arg explicitly")
+            for cmd in discovered:
+                print(f"Discovered replay command: {' '.join(cmd)}")
+            cmds += [cmd for cmd in discovered if cmd not in cmds]
         if a.sand:
             workers = greybox.find_san_workers(a.sand)
             if not workers:
                 print(f"WARNING: no SAND workers named '{a.sand}' found under "
-                      f"fuzz/build-san-*/ — run scripts/build_dcmtk.sh "
+                      f"fuzz/build-san-*/ - run scripts/build_dcmtk.sh "
                       f"with SAND=1")
             for w in workers:
                 print(f"SAND worker: {w}")
@@ -1234,7 +1809,8 @@ def _cmd_greybox(argv: List[str]) -> int:
 
     results = greybox.triage_to_sarif(
         a.crashes, cmds=cmds, net_target=a.net, sarif_path=a.sarif,
-        timeout=a.timeout, include_queue=a.include_queue)
+        timeout=a.timeout, include_queue=a.include_queue,
+        include_hangs=a.include_hangs)
     detected = sum(1 for r in results if r.success)
     print(f"\nTriaged {len(results)} fuzz input(s); "
           f"{detected} reproduced a sanitizer/crash finding")
@@ -1293,13 +1869,20 @@ def main(argv: Optional[List[str]] = None):
         default='ANY-SCP',
         help='Called AE title (default: ANY-SCP)'
     )
+
+    parser.add_argument(
+        '--calling-ae',
+        dest='calling_ae',
+        default='ATTACKER',
+        help='Calling AE title for association-based delivery (default: ATTACKER)'
+    )
     
     # Test selection
     parser.add_argument(
         '--category',
-        choices=['parser', 'protocol', 'memory', 'logic', 'command_injection',
-                 'path_traversal', 'state_machine', 'cve', 'fuzz_packet',
-                 'live_fuzz', 'all'],
+        choices=['parser', 'protocol', 'memory', 'logic', 'storage_abuse',
+             'command_injection', 'path_traversal', 'state_machine', 'cve',
+             'fuzz_packet', 'live_fuzz', 'all'],
         help='Test category to run (if not specified, runs all)'
     )
     
@@ -1346,10 +1929,10 @@ def main(argv: Optional[List[str]] = None):
         choices=['auto', 'pdu', 'cstore'],
         default='auto',
         help='How to deliver a payload to the target (default: auto). '
-             '"pdu" sends raw bytes straight to the listening port — a '
+             '"pdu" sends raw bytes straight to the listening port - a '
              'PDU-level attack that never reaches the dataset parser. '
              '"cstore" wraps the payload in a valid C-STORE association so '
-             'dataset attacks (parser/memory/path_traversal) reach the SCP '
+             'dataset attacks (parser/memory/logic/storage_abuse/path_traversal) reach the SCP '
              'import/parse pass. "auto" routes by attack: payloads carrying a '
              'C-STORE SOP class (or in a dataset category) go via C-STORE, '
              'multi-step state-machine attacks go as a PDU sequence, and the '
@@ -1364,6 +1947,35 @@ def main(argv: Optional[List[str]] = None):
         help='Storage SOP Class UID to associate with for C-STORE delivery '
              'when an attack does not specify one (default: Secondary Capture).'
     )
+
+    parser.add_argument(
+        '--store-transfer-syntax',
+        dest='store_transfer_syntax',
+        metavar='UID',
+        default=None,
+        help='Transfer Syntax UID to request for C-STORE delivery when an attack '
+             'does not specify one (default: Implicit VR Little Endian).'
+    )
+
+    parser.add_argument(
+        '--cstore-smoke',
+        action='store_true',
+        help='Before malformed tests, send a known-good Secondary Capture '
+             'C-STORE using --ae-title, --calling-ae, --store-sop, and '
+             '--store-transfer-syntax. Abort the run if it is not accepted.'
+    )
+
+    parser.add_argument(
+        '--cstore-file',
+        metavar='FILE',
+        default=None,
+        help='Known-good Part-10 DICOM file to carry the catalog. Dataset-shaped '
+             'attacks are overlaid on a copy of this object instead of riding a '
+             'tiny synthetic dataset, so payloads survive an SCP that rejects '
+             'objects missing device-specific required elements. Each delivered '
+             'copy gets a fresh Study/Series/SOP Instance UID.'
+    )
+
 
     parser.add_argument(
         '--mutate',
@@ -1401,6 +2013,7 @@ def main(argv: Optional[List[str]] = None):
         'protocol': 'protocol_attacks',
         'memory': 'memory_attacks',
         'logic': 'logic_attacks',
+        'storage_abuse': 'storage_scp_abuse_attacks',
         'command_injection': 'command_injection_attacks',
         'path_traversal': 'path_traversal_attacks',
         'state_machine': 'state_machine_attacks',
@@ -1450,6 +2063,18 @@ def main(argv: Optional[List[str]] = None):
         print(f"Monitors: SanitizerMonitor, ProcessMonitor, ProtocolMonitor")
         print(f"Target: {args.target} (ASan-instrumented)")
         print()
+    else:
+        args._monitors = [ProtocolMonitor()]
+        print("Monitors: ProtocolMonitor (black-box)")
+        print(f"Target: {args.target}")
+        print()
+
+    if args.cstore_smoke:
+        host, port = args.target.rsplit(':', 1)
+        smoke_rc = _run_cstore_smoke(args, (host, int(port)))
+        print()
+        if smoke_rc != 0:
+            return smoke_rc
 
     try:
         ret = run_command(command, args)

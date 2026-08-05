@@ -41,7 +41,7 @@ Note on PS3.5 encoding:
 import logging
 import socket
 import struct
-from typing import Any, Dict, List, Optional, Tuple, Union, TYPE_CHECKING
+from typing import Any, Dict, Generator, List, Optional, Tuple, Union, TYPE_CHECKING
 
 # =============================================================================
 # SCAPY IPv6 FIX - Must run before any scapy.layers imports
@@ -126,6 +126,7 @@ __all__ = [
     "STUDY_ROOT_QR_FIND_SOP_CLASS_UID",
     "STUDY_ROOT_QR_MOVE_SOP_CLASS_UID",
     "STUDY_ROOT_QR_GET_SOP_CLASS_UID",
+    "MODALITY_WORKLIST_FIND_SOP_CLASS_UID",
     "MR_IMAGE_STORAGE_SOP_CLASS_UID",
     "SECONDARY_CAPTURE_SOP_CLASS_UID",
     "IMPLEMENTATION_CLASS_UID",
@@ -309,6 +310,7 @@ PATIENT_ROOT_QR_GET_SOP_CLASS_UID = "1.2.840.10008.5.1.4.1.2.1.3"
 STUDY_ROOT_QR_FIND_SOP_CLASS_UID = "1.2.840.10008.5.1.4.1.2.2.1"
 STUDY_ROOT_QR_MOVE_SOP_CLASS_UID = "1.2.840.10008.5.1.4.1.2.2.2"
 STUDY_ROOT_QR_GET_SOP_CLASS_UID = "1.2.840.10008.5.1.4.1.2.2.3"
+MODALITY_WORKLIST_FIND_SOP_CLASS_UID = "1.2.840.10008.5.1.4.31"
 MR_IMAGE_STORAGE_SOP_CLASS_UID = "1.2.840.10008.5.1.4.1.1.4"
 SECONDARY_CAPTURE_SOP_CLASS_UID = "1.2.840.10008.5.1.4.1.1.7"
 IMPLEMENTATION_CLASS_UID = "1.2.3.4.5.6.7.8.9"

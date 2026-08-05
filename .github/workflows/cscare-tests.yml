@@ -82,7 +82,7 @@ jobs:
         run: |
           echo "=== Parser Attacks ==="
           echo "Testing: invalid VR, length overflow/underflow, sequence bombs, duplicate tags, format strings, path traversal"
-          python -m c_scare.test_runner \
+          python -m c_scare.runner \
             --ip 127.0.0.1 \
             --port ${{ matrix.dicom_server.port }} \
             --ae-title ${{ matrix.dicom_server.aet }} \
@@ -94,7 +94,7 @@ jobs:
         run: |
           echo "=== Protocol Attacks ==="
           echo "Testing: bad protocol version, oversized PDU, invalid PDU type, truncated association, overlong AE, null AE"
-          python -m c_scare.test_runner \
+          python -m c_scare.runner \
             --ip 127.0.0.1 \
             --port ${{ matrix.dicom_server.port }} \
             --ae-title ${{ matrix.dicom_server.aet }} \
@@ -115,7 +115,7 @@ jobs:
         run: |
           echo "=== Memory Attacks ==="
           echo "Testing: pixel dimension overflow, fragment bomb, offset table bomb, oversized strings, OB/OW overflow, LUT overflow"
-          python -m c_scare.test_runner \
+          python -m c_scare.runner \
             --ip 127.0.0.1 \
             --port ${{ matrix.dicom_server.port }} \
             --ae-title ${{ matrix.dicom_server.aet }} \
@@ -127,7 +127,7 @@ jobs:
         run: |
           echo "=== Logic Attacks ==="
           echo "Testing: transfer syntax mismatch, SOP class mismatch, private creator missing, SSRF URIs, file:// injection, UNC paths"
-          python -m c_scare.test_runner \
+          python -m c_scare.runner \
             --ip 127.0.0.1 \
             --port ${{ matrix.dicom_server.port }} \
             --ae-title ${{ matrix.dicom_server.aet }} \
@@ -139,7 +139,7 @@ jobs:
         run: |
           echo "=== State Machine Attacks ==="
           echo "Testing: P-DATA before association, release before association, double association, incomplete fragments"
-          python -m c_scare.test_runner \
+          python -m c_scare.runner \
             --ip 127.0.0.1 \
             --port ${{ matrix.dicom_server.port }} \
             --ae-title ${{ matrix.dicom_server.aet }} \
@@ -165,7 +165,7 @@ jobs:
           echo "  - CVE-2024-24794 (Use-After-Free Sequences)"
           echo "  - CVE-2019-11687 (PEDICOM/ELFDICOM polyglot)"
           echo ""
-          python -m c_scare.test_runner \
+          python -m c_scare.runner \
             --ip 127.0.0.1 \
             --port ${{ matrix.dicom_server.port }} \
             --ae-title ${{ matrix.dicom_server.aet }} \
@@ -177,7 +177,7 @@ jobs:
         run: |
           echo "=== Fuzz Packet Tests ==="
           echo "Testing: C_ECHO_RQ / C_STORE_RQ with explicit group_length, odd-length UIDs, Scapy fuzz()"
-          python -m c_scare.test_runner \
+          python -m c_scare.runner \
             --ip 127.0.0.1 \
             --port ${{ matrix.dicom_server.port }} \
             --ae-title ${{ matrix.dicom_server.aet }} \
@@ -189,7 +189,7 @@ jobs:
         run: |
           echo "=== Live Protocol Fuzzing ==="
           echo "Running 10 fuzzed A-ASSOCIATE-RQ packets against server"
-          python -m c_scare.test_runner \
+          python -m c_scare.runner \
             --ip 127.0.0.1 \
             --port ${{ matrix.dicom_server.port }} \
             --ae-title ${{ matrix.dicom_server.aet }} \
@@ -206,7 +206,7 @@ jobs:
         id: test_all
         run: |
           echo "=== Complete Test Suite ==="
-          python -m c_scare.test_runner \
+          python -m c_scare.runner \
             --ip 127.0.0.1 \
             --port ${{ matrix.dicom_server.port }} \
             --ae-title ${{ matrix.dicom_server.aet }} \
@@ -222,7 +222,7 @@ jobs:
         run: |
           echo "=== Generating Fuzzing Corpus ==="
           mkdir -p corpus
-          python -m c_scare.test_runner \
+          python -m c_scare.runner \
             --ip 127.0.0.1 \
             --port ${{ matrix.dicom_server.port }} \
             --ae-title ${{ matrix.dicom_server.aet }} \

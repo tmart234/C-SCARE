@@ -295,6 +295,13 @@ class TestProtocolMonitor:
         report = self.monitor.post_test()
         assert report.detected is False
 
+    def test_cstore_status_normal(self):
+        self.monitor.pre_test(1)
+        self.monitor.set_response(b'\x00\x00', error='cstore_status')
+        report = self.monitor.post_test()
+        assert report.detected is False
+        assert '0x0000' in report.description
+
     def test_abort_normal(self):
         self.monitor.pre_test(1)
         self.monitor.set_response(b'\x07' + b'\x00' * 4)

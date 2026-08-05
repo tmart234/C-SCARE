@@ -102,7 +102,8 @@ def _make_afl_out(tmp_path, layout='afl'):
 
 def test_targets_match_campaign_script():
     assert set(greybox.TARGETS) == {
-        'file', 'parse', 'net-storescp', 'net-dcmrecv', 'net-dcmqrscp', 'scu',
+        'file', 'parse',
+        'net-storescp', 'net-dcmrecv', 'net-dcmqrscp', 'scu',
     }
 
 
@@ -180,6 +181,39 @@ def test_list_queue(tmp_path):
     inputs = greybox.list_queue(str(tmp_path))
     assert len(inputs) == 2
     assert all('.state' not in i for i in inputs)
+
+
+def test_list_hangs(tmp_path):
+    """list_hangs enumerates saved AFL hangs and skips README files."""
+    hangs = tmp_path / 'worker0' / 'hangs'
+    hangs.mkdir(parents=True)
+    (hangs / 'README.txt').write_text('afl metadata')
+    (hangs / 'id:000000,src:000001').write_bytes(b'hang-a')
+    (hangs / 'id:000001,src:000002').write_bytes(b'hang-b')
+    inputs = greybox.list_hangs(str(tmp_path))
+    assert len(inputs) == 2
+    assert all('README' not in i for i in inputs)
+
+
+def test_triage_to_sarif_include_hangs(tmp_path):
+    """include_hangs replays saved hangs and flags reproduced timeouts."""
+    fake = tmp_path / 'slow_target.py'
+    fake.write_text(textwrap.dedent('''\
+        import time
+        time.sleep(2)
+    '''))
+    hangs = tmp_path / 'default' / 'hangs'
+    hangs.mkdir(parents=True)
+    (hangs / 'id:000000,src:000001').write_bytes(b'slow-input')
+
+    results = greybox.triage_to_sarif(
+        str(tmp_path), cmd=[sys.executable, str(fake), '@@'],
+        timeout=0.1, include_hangs=True,
+    )
+    assert len(results) == 1
+    assert results[0].metadata['kind'] == 'hang'
+    assert results[0].success is True
+    assert results[0].monitor_reports[0].finding_type == 'timeout:replay'
 
 
 def test_triage_detects_memory_leak(tmp_path):
@@ -305,6 +339,47 @@ def _net_repo(tmp_path, replay_body=_FAKE_AFLNET_REPLAY):
     aflnet.mkdir(parents=True)
     _write_exec(aflnet / 'aflnet-replay', replay_body)
     return tmp_path
+
+
+def test_discover_replay_commands_from_afl_metadata(tmp_path):
+    """Triage should recover the target argv from AFL's own metadata.
+
+    Retyping the binary and its arguments is where triage most often goes
+    wrong: replay a crash through a different argv than the campaign used and
+    the finding does not reproduce.
+    """
+    node = tmp_path / 'default'
+    (node / 'crashes').mkdir(parents=True)
+    (node / 'cmdline').write_text('/fuzz/build-llvm/dcm2pnm\n@@\n/tmp/out.pnm\n')
+    (node / 'fuzzer_setup').write_text(
+        "# command line\n"
+        "'afl-fuzz' '-i' 'seeds' '-o' 'out' '-m' 'none' '--' "
+        "'/fuzz/build-llvm/dcm2pnm' '@@' '/tmp/out.pnm'\n")
+
+    assert greybox.discover_replay_commands(str(tmp_path)) == [
+        ['/fuzz/build-llvm/dcm2pnm', '@@', '/tmp/out.pnm'],
+    ]
+
+
+def test_discover_replay_commands_prefers_the_sand_worker(tmp_path):
+    """A SAND campaign's worker binary produces the sanitizer report the
+    native binary cannot, so it must be triaged first."""
+    node = tmp_path / 'default'
+    (node / 'crashes').mkdir(parents=True)
+    (node / 'fuzzer_setup').write_text(
+        "Command line: 'afl-fuzz' '-i' 'seeds' '-o' 'out' "
+        "'-w' '/fuzz/build-san-address/dcm2pnm' '--' "
+        "'/fuzz/build-llvm/dcm2pnm' '@@' '/tmp/out.pnm'\n")
+
+    assert greybox.discover_replay_commands(str(tmp_path)) == [
+        ['/fuzz/build-san-address/dcm2pnm', '@@', '/tmp/out.pnm'],
+        ['/fuzz/build-llvm/dcm2pnm', '@@', '/tmp/out.pnm'],
+    ]
+
+
+def test_discover_replay_commands_without_metadata(tmp_path):
+    (tmp_path / 'crashes').mkdir()
+    assert greybox.discover_replay_commands(str(tmp_path)) == []
 
 
 def test_triage_net_replays_crash(tmp_path):

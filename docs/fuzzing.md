@@ -68,6 +68,12 @@ command line is unchanged.
 c-scare greybox run file              # fuzz dcm2pnm via AFL++
 c-scare greybox run net-storescp      # fuzz storescp via AFLNet
 
+# A measured campaign with a stop rule and a run.json provenance record.
+# CAMPAIGN_WORKERS spreads an AFL++ file target across parallel workers
+# (-M main + -S secN); "auto" picks min(nproc/2, 12). AFLNet targets bind a
+# port per instance, so they stay single-worker.
+CAMPAIGN_HOURS=24 CAMPAIGN_WORKERS=auto scripts/campaign.sh file
+
 # Triage the crashes a campaign produced into a SARIF report
 c-scare greybox triage fuzz/out/file \
     --binary fuzz/build-llvm/bin/dcm2pnm --arg @@ --arg /tmp/out.pnm \
@@ -86,6 +92,12 @@ c-scare greybox triage fuzz/out/file \
 # with aflnet-replay and parses the server's own sanitizer output.
 c-scare greybox triage fuzz/out/net-storescp --net net-storescp \
     --binary fuzz/build-net/bin/storescp --include-queue --sarif net.sarif
+
+# --auto recovers the target argv from AFL's own cmdline/fuzzer_setup files in
+# the output tree, including any SAND worker the campaign ran with. Replaying
+# through a different argv than the campaign used is the most common reason a
+# saved crash "does not reproduce", so prefer --auto over retyping it.
+c-scare greybox triage fuzz/out/file --auto --include-queue --sarif findings.sarif
 ```
 
 ## Fuzzing a custom DICOM binary
@@ -113,6 +125,22 @@ DICOM binary:
     it with AFL++.
   - *Network path*: AFLNet's `-P DICOM` parser drives any DICOM listener —
     adapt `scripts/fuzz_net.sh` to your binary's launch command.
+
+Point a new target at the generic AFL++ file runner without writing a harness
+script: drop a profile in `fuzz/targets/<name>.yaml` (`engine: aflpp`,
+`kind: file`, `harness: fuzz_file.sh`) and select it by name.
+
+```bash
+CSCARE_TARGET_BINARY=/path/to/your_harness \
+CSCARE_CMPLOG_BINARY=/path/to/your_harness_cmplog \
+scripts/fuzz_file.sh <name>
+```
+
+`CSCARE_TARGET_BINARY` covers a binary built outside `fuzz/<build_subdir>/`;
+`CSCARE_CMPLOG_BINARY` adds AFL++ CmpLog (`-c`), which matters for DICOM
+because tag, VR, and UID comparisons are exactly the magic-value checks
+CmpLog is built to get past. `CSCARE_AUTO_DICT` merges an AFL-generated
+dictionary with `fuzz/dict/dicom.dict`.
 
 ## Device parity (READ THIS)
 
@@ -162,8 +190,8 @@ That builds the AFL++ file track three ways:
 | `fuzz/build-san-address/` | ASan worker | `AFL_SAN_NO_INST=1` — forkserver only |
 | `fuzz/build-san-undefined/` | UBSan worker | `AFL_SAN_NO_INST=1` — forkserver only |
 
-`scripts/fuzz_file.sh` / `fuzz_parse.sh` auto-detect the `fuzz/build-san-*/`
-worker trees and pass each to `afl-fuzz -w`; with no worker trees they run the
+`scripts/fuzz_file.sh` auto-detects the `fuzz/build-san-*/`
+worker trees for AFL++ file targets and passes each to `afl-fuzz -w`; with no worker trees they run the
 plain single-binary loop unchanged. The AFLNet network track has no `-w`
 support, so it always builds with the sanitizers inline regardless of `SAND`.
 
@@ -191,6 +219,12 @@ attributable to one input.
 ```bash
 c-scare greybox triage fuzz/out/net-storescp --net net-storescp \
     --binary fuzz/build-net/bin/storescp --include-queue --sarif net.sarif
+
+# --auto recovers the target argv from AFL's own cmdline/fuzzer_setup files in
+# the output tree, including any SAND worker the campaign ran with. Replaying
+# through a different argv than the campaign used is the most common reason a
+# saved crash "does not reproduce", so prefer --auto over retyping it.
+c-scare greybox triage fuzz/out/file --auto --include-queue --sarif findings.sarif
 ```
 
 Crashes triage reliably this way; a leak is reported only if the server runs

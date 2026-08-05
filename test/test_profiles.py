@@ -52,7 +52,7 @@ def test_load_all_profiles():
 def test_targets_derived_from_profiles():
     assert greybox.TARGETS == {
         'file': 'fuzz_file.sh',
-        'parse': 'fuzz_parse.sh',
+        'parse': 'fuzz_file.sh',
         'net-storescp': 'fuzz_net.sh',
         'net-dcmrecv': 'fuzz_dcmrecv.sh',
         'net-dcmqrscp': 'fuzz_dcmqrscp.sh',
@@ -149,6 +149,59 @@ def test_dimse_affected_sop_class_from_profile():
     assert pkt.affected_sop_instance_uid == '1.2.3.4.5.6.7.8.9.10'
 
 
+def test_cstore_flow_carries_dataset_pdv():
+    """A C-STORE seed must carry a data PDV, not just the command.
+
+    Command-only seeds never reach the SCP's dataset parser or storage path,
+    so every mutation of them stops at the DIMSE layer.
+    """
+    ser = _load_module('seed_serializer',
+                        os.path.join(HARNESS, 'seed_serializer.py'))
+    import random
+    prof = profiles.load_profile('net-storescp')
+    store = next(fl for fl in prof.flows if fl.name == 'store')
+    cmd = ser._build_dimse(store, random.Random(1))
+    dataset = ser._flow_dataset_bytes(prof, store)
+    pkt = c_scare.DICOM(ser._p_data_command_and_dataset(cmd, dataset))
+    pdvs = pkt[c_scare.P_DATA_TF].pdv_items
+
+    assert len(pdvs) == 2
+    assert pdvs[0].is_command == 1
+    assert pdvs[1].is_command == 0
+    assert b'\xe0\x7f\x10\x00' in pdvs[1].data  # Pixel Data tag, LE
+    # The dataset's SOP Instance UID matches the command's, as a real SCU sends.
+    assert b'1.2.3.4.5.6.7.8.9.10' in pdvs[1].data
+
+
+def test_qr_flows_carry_identifier_datasets():
+    """C-FIND/C-MOVE/C-GET seeds must carry the identifier dataset.
+
+    The SCP's matching-key parser sits behind the data PDV; a command-only
+    Q/R seed cannot reach it.
+    """
+    ser = _load_module('seed_serializer',
+                        os.path.join(HARNESS, 'seed_serializer.py'))
+    prof = profiles.load_profile('net-dcmqrscp')
+    for flow_name in ('find', 'move', 'get'):
+        flow = next(fl for fl in prof.flows if fl.name == flow_name)
+        dataset = ser._flow_dataset_bytes(prof, flow)
+        assert b'STUDY' in dataset
+        assert b'1.2.826.0.1.3680043.10.543.1' in dataset
+
+
+def test_dimse_dataset_spec_is_not_passed_to_the_command_packet():
+    """`dataset:` describes the data PDV, so it must not leak into the DIMSE
+    command's keyword arguments."""
+    ser = _load_module('seed_serializer',
+                        os.path.join(HARNESS, 'seed_serializer.py'))
+    import random
+    prof = profiles.load_profile('net-storescp')
+    store = next(fl for fl in prof.flows if fl.name == 'store')
+    assert 'dataset' in store.dimse_kwargs
+    cmd = ser._build_dimse(store, random.Random(1))  # must not raise
+    assert cmd.affected_sop_instance_uid == '1.2.3.4.5.6.7.8.9.10'
+
+
 def test_move_destination_resolves_to_calling_ae():
     prof = profiles.load_profile('net-dcmqrscp')
     move = next(fl for fl in prof.flows if fl.name == 'move')
@@ -197,7 +250,7 @@ def test_dcmqrscp_config_ae_coherence():
 
 
 @pytest.mark.parametrize('target,expected', [
-    ('net-storescp', ['S', '7777', '--eostudy-timeout', '1']),
+    ('net-storescp', ['S', '7777']),
     ('net-dcmrecv', ['S', '7777', '--output-directory', '/wd',
                      '--eostudy-timeout', '1']),
     ('net-dcmqrscp', ['S', '-c', '/cfg', '7777']),

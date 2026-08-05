@@ -23,7 +23,7 @@ declare -A want_sub=(
     [file]=build-llvm [parse]=build-llvm [net-storescp]=build-net
     [net-dcmrecv]=build-net [net-dcmqrscp]=build-net [scu]=build-llvm)
 declare -A want_script=(
-    [file]=fuzz_file.sh [parse]=fuzz_parse.sh [net-storescp]=fuzz_net.sh
+    [file]=fuzz_file.sh [parse]=fuzz_file.sh [net-storescp]=fuzz_net.sh
     [net-dcmrecv]=fuzz_dcmrecv.sh [net-dcmqrscp]=fuzz_dcmqrscp.sh
     [scu]=fuzz_scu.sh)
 
@@ -48,7 +48,8 @@ echo "[check_profiles] (2) env + argv OK"
 
 # --- (3) golden afl-fuzz argv: profile-driven == pre-refactor ----------------
 # AFL paths are placeholders in print mode; binaries need not exist.
-gold() { CSCARE_PRINT_ARGV=1 bash "${REPO_ROOT}/scripts/$1" 2>/dev/null | grep afl-fuzz; }
+gold() { env -u CSCARE_AUTO_DICT -u CSCARE_CMPLOG_BINARY CSCARE_PRINT_ARGV=1 bash "${REPO_ROOT}/scripts/$1" 2>/dev/null | grep afl-fuzz; }
+gold_profile() { env -u CSCARE_AUTO_DICT -u CSCARE_CMPLOG_BINARY CSCARE_PROFILE="$1" CSCARE_PRINT_ARGV=1 bash "${REPO_ROOT}/scripts/$2" 2>/dev/null | grep afl-fuzz; }
 check_gold() {
     local got want
     got="$(gold "$1")"
@@ -60,14 +61,17 @@ check_gold() {
 R="${REPO_ROOT}"
 check_gold fuzz_file.sh \
 "__AFLPP_PATH__/afl-fuzz -i ${R}/fuzz/seeds/file -o ${R}/fuzz/out/file -x ${R}/fuzz/dict/dicom.dict -m none -- ${R}/fuzz/build-llvm/dcm2pnm @@ /tmp/cscare-fuzz-out.pnm "
-check_gold fuzz_parse.sh \
-"__AFLPP_PATH__/afl-fuzz -i ${R}/fuzz/seeds/file -o ${R}/fuzz/out/parse -x ${R}/fuzz/dict/dicom.dict -m none -- ${R}/fuzz/build-llvm/dcmdump @@ "
+got="$(gold_profile parse fuzz_file.sh)"
+want="__AFLPP_PATH__/afl-fuzz -i ${R}/fuzz/seeds/file -o ${R}/fuzz/out/parse -x ${R}/fuzz/dict/dicom.dict -m none -- ${R}/fuzz/build-llvm/dcmdump @@ "
+[[ "${got}" == "${want}" ]] || fail "golden argv for parse:
+    got:  ${got}
+    want: ${want}"
 check_gold fuzz_net.sh \
-"__AFL_PATH__/afl-fuzz -i ${R}/fuzz/seeds/net-storescp -o ${R}/fuzz/out/net-storescp -N tcp://127.0.0.1/11112 -P DICOM -D 10000 -W 30 -m none -E -q 3 -- ${R}/fuzz/build-net/storescp 11112 --eostudy-timeout 1 "
+"__AFL_PATH__/afl-fuzz -i ${R}/fuzz/seeds/net-storescp -o ${R}/fuzz/out/net-storescp -N tcp://127.0.0.1/11112 -P DICOM -D 10000 -W 30 -m none -E -q 3 -K -- ${R}/fuzz/build-net/storescp 11112 "
 check_gold fuzz_dcmrecv.sh \
-"__AFL_PATH__/afl-fuzz -i ${R}/fuzz/seeds/net-dcmrecv -o ${R}/fuzz/out/net-dcmrecv -N tcp://127.0.0.1/11113 -P DICOM -D 10000 -W 30 -m none -E -q 3 -- ${R}/fuzz/build-net/dcmrecv 11113 --output-directory ${R}/fuzz/storage/dcmrecv --eostudy-timeout 1 "
+"__AFL_PATH__/afl-fuzz -i ${R}/fuzz/seeds/net-dcmrecv -o ${R}/fuzz/out/net-dcmrecv -N tcp://127.0.0.1/11113 -P DICOM -D 10000 -W 30 -m none -E -q 3 -K -- ${R}/fuzz/build-net/dcmrecv 11113 --output-directory ${R}/fuzz/storage/dcmrecv --eostudy-timeout 1 "
 check_gold fuzz_dcmqrscp.sh \
-"__AFL_PATH__/afl-fuzz -i ${R}/fuzz/seeds/net-dcmqrscp -o ${R}/fuzz/out/net-dcmqrscp -N tcp://127.0.0.1/11114 -P DICOM -D 10000 -W 30 -m none -E -q 3 -- ${R}/fuzz/build-net/dcmqrscp -c ${R}/fuzz/configs/dcmqrscp.cfg 11114 "
+"__AFL_PATH__/afl-fuzz -i ${R}/fuzz/seeds/net-dcmqrscp -o ${R}/fuzz/out/net-dcmqrscp -N tcp://127.0.0.1/11114 -P DICOM -D 10000 -W 30 -m none -E -q 3 -K -- ${R}/fuzz/build-net/dcmqrscp -c ${R}/fuzz/configs/dcmqrscp.cfg 11114 "
 check_gold fuzz_scu.sh \
 "__AFLPP_PATH__/afl-fuzz -i ${R}/fuzz/seeds/scu -o ${R}/fuzz/out/scu -m none -- ${R}/fuzz/build-llvm/storescu -aec ANY-SCP 127.0.0.1 11112 ${R}/fuzz/seeds/file/baseline_explicit_le.dcm "
 echo "[check_profiles] (3) golden afl-fuzz argv OK"

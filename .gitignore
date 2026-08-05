@@ -160,24 +160,20 @@ cython_debug/
 #.idea/
 .qodo
 
-# Fuzzing artifacts
-fuzz/build-llvm/
-fuzz/build-net/
-fuzz/build-cov/
-fuzz/build-san-*/
+# Fuzzing artifacts. Everything here is produced by a build or a campaign;
+# the checked-in inputs are fuzz/targets/, fuzz/harness/, fuzz/dict/, and
+# fuzz/configs/*.template. Patterns are per-kind rather than per-target so a
+# new fuzz/targets/<name>.yaml needs no edit here.
+fuzz/build-*/
 fuzz/out/
 fuzz/runs/
+fuzz/runtime/
 fuzz/coverage/
 fuzz/storage/
 fuzz/configs/dcmqrscp.cfg
 fuzz/configs/dcmqrscp.cfg.cov
-fuzz/seeds/file/*.dcm
-fuzz/seeds/file/PIXEL_SEED.txt
-fuzz/seeds/net/*.raw
-fuzz/seeds/net/SEED.txt
-fuzz/seeds/net-storescp/*.raw
-fuzz/seeds/net-storescp/SEED.txt
-fuzz/seeds/net-dcmrecv/*.raw
-fuzz/seeds/net-dcmrecv/SEED.txt
-fuzz/seeds/net-dcmqrscp/*.raw
-fuzz/seeds/net-dcmqrscp/SEED.txt
+fuzz/seeds/*/*.dcm
+fuzz/seeds/*/*.raw
+fuzz/seeds/*/*.bin
+fuzz/seeds/*/SEED.txt
+fuzz/seeds/*/PIXEL_SEED.txt

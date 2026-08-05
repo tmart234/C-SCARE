@@ -54,18 +54,24 @@ flows:
     dimse_kwargs:
       affected_sop_instance_uid: "1.2.3.4.5.6.7.8.9.10"
       priority: 0x0000
+      # A command-only C-STORE seed never reaches the SCP's dataset parser or
+      # its storage path. This attaches a real data PDV so AFLNet mutations
+      # land on the code that actually decodes and writes the object.
+      dataset:
+        kind: cstore-image
+        sop_instance_uid: "1.2.3.4.5.6.7.8.9.10"
 
+# No --eostudy-timeout here: AFLNet's -K terminates the server after every
+# execution, so an idle end-of-study timer only adds wall time per exec and
+# starves the campaign. The end-of-study path stays covered by net-dcmrecv,
+# which keeps its --eostudy-timeout.
 argv:
   - "{{PORT}}"
-  - "--eostudy-timeout"
-  - "1"
 
 triage:
   mode: net-replay
   server_argv:
     - "{{PORT}}"
-    - "--eostudy-timeout"
-    - "1"
 
 readiness:
   port_wait_s: 5.0

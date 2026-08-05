@@ -6,11 +6,11 @@ This allows running the package as:
     python -m c_scare <command>
 
 Which is equivalent to:
-    python -m c_scare.test_runner <command>
+    python -m c_scare.runner <command>
 """
 
 import sys
-from .test_runner import main
+from .runner import main
 
 if __name__ == '__main__':
     sys.exit(main())

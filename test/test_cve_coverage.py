@@ -30,6 +30,9 @@ EXPECTED_CVES = {
     # Orthanc (CERT/CC VU#536588)
     'CVE-2026-5437', 'CVE-2026-5441', 'CVE-2026-5442', 'CVE-2026-5443',
     'CVE-2026-5444', 'CVE-2026-5445',
+    # OFFIS DCMTK Toolkit 3.7.0 advisory, ICSMA-26-181-01
+    'CVE-2026-50003', 'CVE-2026-50254', 'CVE-2026-35505', 'CVE-2026-52868',
+    'CVE-2026-44628',
 }
 
 
@@ -73,3 +76,38 @@ def test_each_cve_payload_decodes_as_dicom_or_bytes(cve):
     for r in results:
         assert len(r.payload) > 0
         assert r.description and r.expected_behavior
+
+
+def test_readme_quantified_counts_match_the_catalog():
+    """The README's headline numbers must not drift from the shipped catalog.
+
+    These counts are how a reader sizes the framework before running it, so a
+    stale number is a correctness bug in the docs.
+    """
+    import os
+    import re
+    from c_scare import greybox
+    from c_scare.attacks import (
+        ParserAttacks, ProtocolAttacks, MemoryAttacks, LogicAttacks,
+        StorageSCPAbuseAttacks, CommandInjectionAttacks, PathTraversalAttacks,
+        StateMachineAttacks,
+    )
+
+    catalogs = (ParserAttacks, ProtocolAttacks, MemoryAttacks, LogicAttacks,
+                StorageSCPAbuseAttacks, CommandInjectionAttacks,
+                PathTraversalAttacks, StateMachineAttacks, CVEAttacks)
+    results = [r for cls in catalogs for r in cls.all()]
+    actual = {
+        'attack categories': len({r.category for r in results}),
+        'payloads': len(results),
+        'CVEs reproduced': len(EXPECTED_CVES),
+        'targets': len(greybox.TARGETS),
+    }
+
+    readme = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'README.md')
+    row = next(line for line in open(readme, encoding='utf-8')
+               if line.startswith('| **Quantified**'))
+    for label, count in actual.items():
+        assert re.search(rf'\*\*{count}\*\* {re.escape(label)}', row), (
+            f'README says something other than {count} {label}:\n{row.strip()}')

@@ -10,6 +10,10 @@ is the thin bridge between those engines and C-SCARE's reporting layer:
   * list_crashes() - enumerate an AFL/AFLNet crashes directory
   * list_queue()   - enumerate the queue (leak-class bugs land here, not in
                      crashes/, because a leak is not a crash)
+  * list_hangs()   - enumerate saved AFL/AFLNet hangs for timeout replay
+  * discover_replay_commands() - recover the target argv (and any SAND
+                     worker) from AFL's own cmdline/fuzzer_setup metadata,
+                     so triage does not need it retyped
   * triage()       - replay each input through one or more sanitizer
                      binaries and parse the output (ASan / UBSan / LSan /
                      MSan) into structured findings. File targets replay
@@ -47,6 +51,7 @@ path for leak-class bugs.
 """
 
 import os
+import shlex
 import shutil
 import signal
 import socket
@@ -63,7 +68,8 @@ from .monitor import (
 
 __all__ = [
     'TARGETS', 'NET_TARGETS', 'repo_root', 'run', 'list_crashes',
-    'list_queue', 'find_san_workers', 'triage', 'triage_to_sarif',
+    'list_queue', 'list_hangs', 'find_san_workers',
+    'discover_replay_commands', 'triage', 'triage_to_sarif',
 ]
 
 # Targets are declared by per-target YAML profiles under fuzz/targets/ (see
@@ -76,7 +82,7 @@ __all__ = [
 # profiles directory is ever absent.
 _LITERAL_TARGETS = {
     'file': 'fuzz_file.sh',
-    'parse': 'fuzz_parse.sh',
+    'parse': 'fuzz_file.sh',
     'net-storescp': 'fuzz_net.sh',
     'net-dcmrecv': 'fuzz_dcmrecv.sh',
     'net-dcmqrscp': 'fuzz_dcmqrscp.sh',
@@ -119,7 +125,9 @@ def run(target: str, repo: Optional[str] = None) -> int:
     script = os.path.join(repo, 'scripts', TARGETS[target])
     if not os.path.isfile(script):
         raise FileNotFoundError(f"fuzz harness not found: {script}")
-    return subprocess.call(['bash', script])
+    env = os.environ.copy()
+    env.setdefault('CSCARE_PROFILE', target)
+    return subprocess.call(['bash', script], env=env)
 
 
 def list_crashes(out_dir: str) -> List[str]:
@@ -159,6 +167,23 @@ def list_queue(out_dir: str) -> List[str]:
                 continue
             inputs.append(os.path.join(root, name))
     return inputs
+
+
+def list_hangs(out_dir: str) -> List[str]:
+    """Return saved hang input files under an AFL/AFLNet output directory.
+
+    Handles both AFL++ worker layouts (``<out>/<worker>/hangs``) and
+    single-output layouts (``<out>/hangs``). ``README.txt`` is skipped.
+    """
+    hangs: List[str] = []
+    for root, _dirs, files in os.walk(out_dir):
+        if os.path.basename(root) != 'hangs':
+            continue
+        for name in sorted(files):
+            if name == 'README.txt':
+                continue
+            hangs.append(os.path.join(root, name))
+    return hangs
 
 
 def _triage_env() -> dict:
@@ -221,6 +246,93 @@ def find_san_workers(bin_name: str, repo: Optional[str] = None) -> List[str]:
     return workers
 
 
+def discover_replay_commands(out_dir: str) -> List[List[str]]:
+    """Recover the replay command(s) from an AFL/AFLNet output tree's metadata.
+
+    AFL writes the target argv it was launched with into each worker's
+    ``cmdline`` and ``fuzzer_setup``, so triage does not need the operator to
+    retype the binary and its arguments. When the campaign ran in SAND mode
+    (``afl-fuzz -w <worker>``), the worker binary is recovered too and returned
+    first, because a sanitizer worker produces the report the native binary
+    cannot.
+
+    Returns a de-duplicated list of argv lists, each using AFL's ``@@``
+    input-placeholder convention. Empty when the tree carries no usable
+    metadata, in which case the caller must supply the command explicitly.
+    """
+    commands: List[List[str]] = []
+    for root, dirs, files in os.walk(out_dir):
+        dirs[:] = [d for d in dirs
+                   if d not in ('crashes', 'hangs', 'queue', '.synced', '.state')]
+        if not ({'cmdline', 'fuzzer_setup'} & set(files)):
+            continue
+        native, worker = _parse_afl_setup(os.path.join(root, 'fuzzer_setup'))
+        if native is None:
+            native = _parse_afl_cmdline(os.path.join(root, 'cmdline'))
+        for cmd in (worker, native):
+            if cmd and cmd not in commands:
+                commands.append(cmd)
+    return commands
+
+
+def _read_text(path: str) -> str:
+    try:
+        with open(path, 'r', errors='replace') as handle:
+            return handle.read()
+    except OSError:
+        return ''
+
+
+def _parse_afl_cmdline(path: str) -> Optional[List[str]]:
+    """AFL's ``cmdline``: the target argv, one token per line (or one line)."""
+    lines = [line.strip() for line in _read_text(path).splitlines() if line.strip()]
+    if not lines:
+        return None
+    if len(lines) > 1:
+        return lines
+    try:
+        return shlex.split(lines[0])
+    except ValueError:
+        return lines
+
+
+def _parse_afl_setup(path: str):
+    """AFL's ``fuzzer_setup``: the quoted afl-fuzz command line it was run with.
+
+    Returns ``(native_argv, worker_argv)`` -- everything after ``--`` and, if
+    the campaign used ``-w <worker>``, that worker with the same arguments.
+    """
+    command_line = None
+    for line in _read_text(path).splitlines():
+        stripped = line.strip()
+        if 'afl-fuzz' not in stripped or stripped.startswith('#'):
+            continue
+        # AFL++ writes each token individually quoted; some builds prefix the
+        # line with a label ("Command line: ..."). Start at the first quote
+        # when one precedes afl-fuzz, otherwise take the line as-is.
+        quote = min((i for i in (stripped.find("'"), stripped.find('"')) if i >= 0),
+                    default=-1)
+        if 0 <= quote < stripped.index('afl-fuzz'):
+            stripped = stripped[quote:]
+        command_line = stripped
+        break
+    if not command_line:
+        return None, None
+    try:
+        afl_argv = shlex.split(command_line)
+    except ValueError:
+        return None, None
+
+    native = afl_argv[afl_argv.index('--') + 1:] if '--' in afl_argv else None
+    worker = None
+    for index, token in enumerate(afl_argv[:-1]):
+        if token == '-w':
+            worker_bin = afl_argv[index + 1]
+            worker = [worker_bin] + (native[1:] if native and len(native) > 1 else ['@@'])
+            break
+    return (native or None), worker
+
+
 def _replay(cmd: List[str], crash_path: str, timeout: float):
     """Run ``cmd`` with ``@@`` replaced by ``crash_path``.
 
@@ -238,7 +350,8 @@ def _replay(cmd: List[str], crash_path: str, timeout: float):
         return proc.returncode, output.decode('utf-8', errors='replace')
     except subprocess.TimeoutExpired as e:
         output = (e.stdout or b'') + (e.stderr or b'')
-        return None, output.decode('utf-8', errors='replace')
+        decoded = output.decode('utf-8', errors='replace')
+        return None, f'c-scare replay timeout after {timeout:g}s\n{decoded}'
     except FileNotFoundError as e:
         return None, f'replay failed: {e}'
 
@@ -438,7 +551,12 @@ def triage(crashes: List[str],
         except OSError:
             payload = b''
 
-        kind = 'queue' if f'{os.sep}queue{os.sep}' in crash_path else 'crash'
+        if f'{os.sep}queue{os.sep}' in crash_path:
+            kind = 'queue'
+        elif f'{os.sep}hangs{os.sep}' in crash_path:
+            kind = 'hang'
+        else:
+            kind = 'crash'
         result = AttackResult(
             name=os.path.basename(crash_path),
             category='greybox',
@@ -464,6 +582,14 @@ def triage(crashes: List[str],
                 exit_finding = check_exit_code(returncode)
                 if exit_finding:
                     findings.append(exit_finding)
+                if (kind == 'hang' and returncode is None and
+                        output.startswith('c-scare replay timeout')):
+                    findings.append(SanitizerFinding(
+                        sanitizer='timeout',
+                        error_kind='replay',
+                        summary=f'Replay exceeded {timeout:g}s timeout',
+                        stack_trace=output,
+                    ))
                 for finding in findings:
                     detected = True
                     result.monitor_reports.append(MonitorReport(
@@ -472,7 +598,7 @@ def triage(crashes: List[str],
                         description=finding.summary,
                         evidence=finding.stack_trace or None,
                     ))
-            result.success = detected
+            result.success = True if detected else (None if kind == 'hang' else detected)
             result.metadata['exit_code'] = (
                 exit_codes[0] if len(exit_codes) == 1 else exit_codes)
 
@@ -487,6 +613,7 @@ def triage_to_sarif(crashes_or_dir,
                      sarif_path: Optional[str] = None,
                      timeout: float = 10.0,
                      include_queue: bool = False,
+                     include_hangs: bool = False,
                      repo: Optional[str] = None) -> List[AttackResult]:
     """Triage crashes and optionally write a SARIF v2.1.0 report.
 
@@ -505,11 +632,13 @@ def triage_to_sarif(crashes_or_dir,
         crashes = list_crashes(crashes_or_dir)
         if include_queue:
             crashes += list_queue(crashes_or_dir)
+        if include_hangs:
+            crashes += list_hangs(crashes_or_dir)
     else:
         crashes = list(crashes_or_dir)
     results = triage(crashes, cmd=cmd, cmds=cmds, net_target=net_target,
                      timeout=timeout, repo=repo)
     if sarif_path:
-        from .test_runner import write_sarif
+        from .runner import write_sarif
         write_sarif(results, sarif_path)
     return results

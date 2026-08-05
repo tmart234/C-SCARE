@@ -306,6 +306,16 @@ class ProtocolMonitor(BaseMonitor):
         self._error = error
 
     def post_test(self) -> MonitorReport:
+        if self._error == 'cstore_status':
+            status = None
+            if self._response and len(self._response) >= 2:
+                status = (self._response[0] << 8) | self._response[1]
+            status_text = f'0x{status:04x}' if status is not None else 'unknown'
+            return MonitorReport(
+                detected=False,
+                description=f'C-STORE completed with DIMSE status {status_text}',
+                evidence=status_text,
+            )
         if self._error == 'refused':
             return MonitorReport(
                 detected=True,

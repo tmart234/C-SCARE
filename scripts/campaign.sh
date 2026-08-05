@@ -7,7 +7,7 @@
 #
 # Usage:
 #   scripts/campaign.sh <target>
-#       target ∈ {file, parse, net-storescp, net-dcmrecv, net-dcmqrscp, scu}
+#       target ∈ any profile under fuzz/targets/*.yaml
 #
 # Env knobs:
 #   CAMPAIGN_HOURS   — wallclock cap (default 24, sample range 24–72)
@@ -15,6 +15,13 @@
 #                      (default 6). Effective stop = max(SATURATION_HOURS,
 #                      CAMPAIGN_HOURS/10) so deep parsers aren't cut short.
 #   POLL_SECONDS     — fuzzer_stats poll cadence (default 60)
+#   CAMPAIGN_WORKERS — AFL++ parallel workers for file-style targets
+#                      (default 1; use "auto" for min(nproc/2, 12)).
+#   CAMPAIGN_OUT_DIR — override the AFL output directory. In multicore mode,
+#                      the default is <profile-output>-multicore-<UTC>.
+#   AFL_TIMEOUT_MS   — optional AFL++ per-exec timeout passed as -t.
+#   AFL_TMPDIR_BASE  — base directory for per-worker AFL_TMPDIR directories
+#                      (default /dev/shm/c-scare-afl-$USER in multicore mode).
 #
 # Stop reasons (priority order):
 #   timeout        — wallclock ≥ CAMPAIGN_HOURS
@@ -26,7 +33,7 @@ set -euo pipefail
 
 if [[ $# -ne 1 ]]; then
     echo "Usage: $0 <target>"
-    echo "  target ∈ {file, parse, net-storescp, net-dcmrecv, net-dcmqrscp, scu}"
+    echo "  target ∈ any profile under fuzz/targets/*.yaml"
     exit 2
 fi
 
@@ -50,6 +57,34 @@ BUILD_DIR="${REPO_ROOT}/fuzz/${BUILD_SUBDIR}"
 CAMPAIGN_HOURS="${CAMPAIGN_HOURS:-24}"
 SATURATION_HOURS="${SATURATION_HOURS:-6}"
 POLL_SECONDS="${POLL_SECONDS:-60}"
+CAMPAIGN_WORKERS="${CAMPAIGN_WORKERS:-${WORKERS:-1}}"
+if [[ "${CAMPAIGN_WORKERS}" == "auto" ]]; then
+    cores="$(nproc 2>/dev/null || echo 1)"
+    CAMPAIGN_WORKERS=$(( cores / 2 ))
+    [[ "${CAMPAIGN_WORKERS}" -lt 1 ]] && CAMPAIGN_WORKERS=1
+    [[ "${CAMPAIGN_WORKERS}" -gt 12 ]] && CAMPAIGN_WORKERS=12
+fi
+if ! [[ "${CAMPAIGN_WORKERS}" =~ ^[0-9]+$ ]] || [[ "${CAMPAIGN_WORKERS}" -lt 1 ]]; then
+    echo "[campaign] CAMPAIGN_WORKERS must be a positive integer or 'auto'" >&2
+    exit 2
+fi
+CAMPAIGN_WORKER_COUNT="${CAMPAIGN_WORKERS}"
+if (( CAMPAIGN_WORKER_COUNT > 1 )); then
+    has_input_placeholder=false
+    for arg in "${ARGV[@]}"; do
+        [[ "${arg}" == "@@" ]] && has_input_placeholder=true
+    done
+    if [[ "${ENGINE}" != "aflpp" || "${has_input_placeholder}" != "true" ]]; then
+        echo "[campaign] CAMPAIGN_WORKERS>1 is supported for AFL++ file targets with @@ argv only" >&2
+        exit 2
+    fi
+    if [[ -z "${CAMPAIGN_OUT_DIR:-}" ]]; then
+        OUT_DIR="${OUT_DIR}-multicore-$(date -u +%Y%m%dT%H%M%SZ)"
+    fi
+fi
+if [[ -n "${CAMPAIGN_OUT_DIR:-}" ]]; then
+    OUT_DIR="${CAMPAIGN_OUT_DIR}"
+fi
 
 # Convert to seconds in floating-point-aware way (awk, not bash arith).
 CAMPAIGN_SECS=$(awk -v h="${CAMPAIGN_HOURS}" 'BEGIN{printf "%d", h*3600}')
@@ -63,9 +98,14 @@ RUN_DIR="${REPO_ROOT}/fuzz/runs/${TARGET}/$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "${RUN_DIR}"
 
 # Resolve binary + sha. Built before launching the fuzz script.
-BIN_PATH="$(find "${BUILD_DIR}" -type f -name "${BIN_NAME}" -executable | head -1 || true)"
+if [[ -n "${CSCARE_TARGET_BINARY:-}" ]]; then
+    BIN_PATH="${CSCARE_TARGET_BINARY}"
+else
+    BIN_PATH="$(find "${BUILD_DIR}" -type f -name "${BIN_NAME}" -executable | head -1 || true)"
+fi
 if [[ -z "${BIN_PATH}" ]]; then
-    echo "[campaign] ${BIN_NAME} not found under ${BUILD_DIR} — run scripts/build_dcmtk.sh"
+    echo "[campaign] ${BIN_NAME} not found under ${BUILD_DIR}"
+    echo "[campaign] set CSCARE_TARGET_BINARY=/path/to/${BIN_NAME} for external builds, or run the target build first"
     exit 1
 fi
 BIN_SHA=$(sha256sum "${BIN_PATH}" | awk '{print $1}')
@@ -111,6 +151,9 @@ write_run_json() {
   "dictionary_sha256": "${DICT_SHA}",
   "seed_corpus_sha256": "${SEEDS_SHA}",
   "fuzz_script": "${FUZZ_SCRIPT}",
+    "workers": ${CAMPAIGN_WORKER_COUNT},
+    "afl_timeout_ms": "${AFL_TIMEOUT_MS:-}",
+    "output_dir": "${OUT_DIR}",
   "stop_rule": {
     "campaign_hours": ${CAMPAIGN_HOURS},
     "saturation_hours": ${SATURATION_HOURS},
@@ -150,17 +193,81 @@ fi
 
 echo "[campaign] target=${TARGET} run_dir=${RUN_DIR}"
 echo "[campaign] stop rule: campaign=${CAMPAIGN_HOURS}h saturation=${SATURATION_HOURS}h (eff ${SATURATION_SECS}s)"
+export CSCARE_PROFILE="${TARGET}"
 
-if [[ -n "${TIME_BIN}" ]]; then
+FUZZ_PIDS=()
+launch_parallel_aflpp() {
+    source_afl
+    mkdir -p "${OUT_DIR}"
+    if [[ ! -d "${SEEDS_DIR}" || -z "$(find "${SEEDS_DIR}" -maxdepth 1 -type f -print -quit)" ]]; then
+        echo "[campaign] generating seed corpus"
+        run_seed_generators
+    fi
+    if [[ -n "${DICT_PATH}" && ! -f "${DICT_PATH}" && -n "${DICT_GENERATOR}" ]]; then
+        echo "[campaign] building dictionary"
+        bash -c "${DICT_GENERATOR}"
+    fi
+
+    local tmp_base="${AFL_TMPDIR_BASE:-/dev/shm/c-scare-afl-${USER:-user}}"
+    mkdir -p "${tmp_base}"
+    if [[ "${tmp_base}" == /dev/shm/c-scare-afl-* ]]; then
+        rm -rf "${tmp_base:?}/"*
+    fi
+
+    export TERM="${TERM:-xterm-256color}"
+    export AFL_FAST_CAL="${AFL_FAST_CAL:-1}"
+    export AFL_IMPORT_FIRST="${AFL_IMPORT_FIRST:-1}"
+    export AFL_SHUFFLE_QUEUE="${AFL_SHUFFLE_QUEUE:-1}"
+
+    local worker name mode tmp_dir log_file input_arg
+    for ((worker = 0; worker < CAMPAIGN_WORKER_COUNT; worker++)); do
+        if (( worker == 0 )); then
+            name="main"
+            mode="-M"
+        else
+            name="sec${worker}"
+            mode="-S"
+        fi
+        tmp_dir="${tmp_base}/${name}"
+        mkdir -p "${tmp_dir}"
+        log_file="${RUN_DIR}/fuzz-${name}.log"
+        input_arg="${SEEDS_DIR}"
+        if [[ -f "${OUT_DIR}/${name}/fuzzer_stats" ]]; then
+            input_arg="-"
+        fi
+        (
+            export AFL_TMPDIR="${tmp_dir}"
+            export TMPDIR="${tmp_dir}"
+            exec "${AFLPP_PATH}/afl-fuzz" \
+                "${mode}" "${name}" \
+                -i "${input_arg}" \
+                -o "${OUT_DIR}" \
+                ${DICT_PATH:+-x "${DICT_PATH}"} \
+                ${AFL_TIMEOUT_MS:+-t "${AFL_TIMEOUT_MS}"} \
+                -m none \
+                -- "${BIN_PATH}" "${ARGV[@]}"
+        ) >"${log_file}" 2>&1 &
+        FUZZ_PIDS+=("$!")
+    done
+}
+
+if (( CAMPAIGN_WORKER_COUNT > 1 )); then
+    launch_parallel_aflpp
+    FUZZ_PID="${FUZZ_PIDS[0]}"
+    printf '%s\n' "${FUZZ_PIDS[@]}" >"${RUN_DIR}/fuzz.pid"
+elif [[ -n "${TIME_BIN}" ]]; then
     setsid "${TIME_BIN}" -v -o "${TIME_OUT}" \
-        "${REPO_ROOT}/scripts/${FUZZ_SCRIPT}" \
+        bash "${REPO_ROOT}/scripts/${FUZZ_SCRIPT}" \
         >"${RUN_DIR}/fuzz.log" 2>&1 &
 else
-    setsid "${REPO_ROOT}/scripts/${FUZZ_SCRIPT}" \
+    setsid bash "${REPO_ROOT}/scripts/${FUZZ_SCRIPT}" \
         >"${RUN_DIR}/fuzz.log" 2>&1 &
 fi
-FUZZ_PID=$!
-echo "${FUZZ_PID}" >"${RUN_DIR}/fuzz.pid"
+if (( CAMPAIGN_WORKER_COUNT == 1 )); then
+    FUZZ_PID=$!
+    FUZZ_PIDS=("${FUZZ_PID}")
+    echo "${FUZZ_PID}" >"${RUN_DIR}/fuzz.pid"
+fi
 
 # stop_reason captured by the trap / poll loop.
 STOP_REASON=""
@@ -168,29 +275,69 @@ cleanup() {
     if [[ -z "${STOP_REASON}" ]]; then
         STOP_REASON=killed
     fi
-    if kill -0 "${FUZZ_PID}" 2>/dev/null; then
-        # Kill the whole process group started by setsid.
-        kill -TERM -"${FUZZ_PID}" 2>/dev/null || true
-        for _ in $(seq 1 30); do
-            kill -0 "${FUZZ_PID}" 2>/dev/null || break
-            sleep 1
+    local pid
+    for pid in "${FUZZ_PIDS[@]}"; do
+        if kill -0 "${pid}" 2>/dev/null; then
+            if (( CAMPAIGN_WORKER_COUNT > 1 )); then
+                kill -TERM "${pid}" 2>/dev/null || true
+            else
+                # Kill the whole process group started by setsid.
+                kill -TERM -"${pid}" 2>/dev/null || true
+            fi
+        fi
+    done
+    for _ in $(seq 1 30); do
+        local alive=0
+        for pid in "${FUZZ_PIDS[@]}"; do
+            kill -0 "${pid}" 2>/dev/null && alive=1
         done
-        kill -KILL -"${FUZZ_PID}" 2>/dev/null || true
-    fi
-    wait "${FUZZ_PID}" 2>/dev/null || true
+        (( alive == 0 )) && break
+        sleep 1
+    done
+    for pid in "${FUZZ_PIDS[@]}"; do
+        if kill -0 "${pid}" 2>/dev/null; then
+            if (( CAMPAIGN_WORKER_COUNT > 1 )); then
+                kill -KILL "${pid}" 2>/dev/null || true
+            else
+                kill -KILL -"${pid}" 2>/dev/null || true
+            fi
+        fi
+        wait "${pid}" 2>/dev/null || true
+    done
 }
 trap cleanup EXIT
 trap 'STOP_REASON=killed; exit 130' INT TERM
 
-# Locate the fuzzer_stats file (AFL++ uses default/, AFLNet uses root).
-find_stats() {
+# Locate the fuzzer_stats file(s) (AFL++ uses default/ or worker dirs;
+# AFLNet uses root).
+find_stats_files() {
     for fuzz_out in \
         "${REPO_ROOT}/fuzz/out/${TARGET}/default/fuzzer_stats" \
         "${REPO_ROOT}/fuzz/out/${TARGET}/fuzzer_stats" \
+        "${OUT_DIR}/default/fuzzer_stats" \
+        "${OUT_DIR}/fuzzer_stats" \
+        "${OUT_DIR}"/*/fuzzer_stats \
         "${REPO_ROOT}/fuzz/out/${TARGET}"/*/fuzzer_stats; do
-        [[ -f "${fuzz_out}" ]] && { echo "${fuzz_out}"; return 0; }
+        [[ -f "${fuzz_out}" ]] && echo "${fuzz_out}"
     done
-    return 1
+}
+
+sum_stats_field() {
+    local field="$1"
+    shift
+    awk -F': *' -v field="${field}" '
+        $1 == field {sum += $2 + 0}
+        END {printf "%.2f", sum + 0}
+    ' "$@"
+}
+
+max_stats_field() {
+    local field="$1"
+    shift
+    awk -F': *' -v field="${field}" '
+        $1 == field {if (!seen || $2 + 0 > max) max = $2 + 0; seen = 1}
+        END {if (seen) printf "%.0f", max; else printf ""}
+    ' "$@"
 }
 
 last_corpus=0
@@ -210,13 +357,17 @@ while true; do
     sleep "${POLL_SECONDS}"
     now=$(date +%s)
 
-    if ! kill -0 "${FUZZ_PID}" 2>/dev/null; then
+    alive=0
+    for pid in "${FUZZ_PIDS[@]}"; do
+        kill -0 "${pid}" 2>/dev/null && alive=1
+    done
+    if (( alive == 0 )); then
         STOP_REASON=error
         break
     fi
 
-    stats=$(find_stats || true)
-    if [[ -z "${stats}" ]]; then
+    mapfile -t stats_files < <(find_stats_files)
+    if (( ${#stats_files[@]} == 0 )); then
         # fuzzer hasn't created stats yet — keep waiting until wallclock runs out.
         if (( now - START_EPOCH >= CAMPAIGN_SECS )); then
             STOP_REASON=timeout
@@ -225,11 +376,14 @@ while true; do
         continue
     fi
 
-    corpus=$(awk -F': *' '/^(corpus_count|paths_total)/ {print $2; exit}' "${stats}")
-    eps=$(awk -F': *' '/^execs_per_sec/ {print $2; exit}' "${stats}")
-    execs=$(awk -F': *' '/^execs_done/ {print $2; exit}' "${stats}")
-    edges=$(awk -F': *' '/^edges_found/ {print $2; exit}' "${stats}")
-    last_find=$(awk -F': *' '/^last_find/ {print $2; exit}' "${stats}")
+    corpus=$(sum_stats_field corpus_count "${stats_files[@]}")
+    if [[ "${corpus%.*}" == "0" ]]; then
+        corpus=$(sum_stats_field paths_total "${stats_files[@]}")
+    fi
+    eps=$(sum_stats_field execs_per_sec "${stats_files[@]}")
+    execs=$(sum_stats_field execs_done "${stats_files[@]}")
+    edges=$(max_stats_field edges_found "${stats_files[@]}")
+    last_find=$(max_stats_field last_find "${stats_files[@]}")
     corpus="${corpus:-0}"
     eps="${eps:-0}"
     execs="${execs:-0}"
@@ -268,7 +422,7 @@ while true; do
     # crash_dominant heuristic: over a 1-hour window, crashes-found exceed
     # corpus-found. Only meaningful once we have both samples.
     if (( now - last_crash_ratio_check >= 3600 )); then
-        crash_dirs=$(find "${REPO_ROOT}/fuzz/out/${TARGET}" -path '*/crashes/id:*' 2>/dev/null | wc -l)
+        crash_dirs=$(find "${OUT_DIR}" -path '*/crashes/id:*' 2>/dev/null | wc -l)
         delta_crash=$((crash_dirs - crash_count_at_check))
         delta_corpus=$((${corpus%.*} - corpus_count_at_check))
         if (( delta_crash > 0 && delta_crash * 2 > delta_corpus )); then

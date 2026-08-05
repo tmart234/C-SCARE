@@ -30,4 +30,7 @@ AFLNET_FUZZ_OPTS=(
     -m none         # no memory cap — ASan needs a large virtual address space
     -E              # state-aware mode — MANDATORY, see header
     -q 3            # state selection: FAVOR (enum RANDOM=1 ROUND_ROBIN=2 FAVOR=3)
+    -K              # send SIGTERM to the SCP after each run — a DICOM server
+                    # does not exit on its own, so without this AFLNet leaves
+                    # a process per execution and the campaign starves
 )
