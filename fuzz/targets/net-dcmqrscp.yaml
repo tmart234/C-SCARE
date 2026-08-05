@@ -53,12 +53,16 @@ flows:
     dimse: C_ECHO_RQ
     abstract_syntax: VERIFICATION_SOP_CLASS_UID
     transfer_syntaxes: [DEFAULT_TRANSFER_SYNTAX_UID]
+  # Q/R commands are meaningless without an identifier dataset: the SCP's
+  # matching-key parser is behind the data PDV, not the command PDV.
   - name: find
     dimse: C_FIND_RQ
     abstract_syntax: PATIENT_ROOT_QR_FIND_SOP_CLASS_UID
     transfer_syntaxes: [DEFAULT_TRANSFER_SYNTAX_UID]
     dimse_kwargs:
       priority: 0x0000
+      dataset:
+        kind: qr-study-identifier
   - name: move
     dimse: C_MOVE_RQ
     abstract_syntax: PATIENT_ROOT_QR_MOVE_SOP_CLASS_UID
@@ -66,12 +70,16 @@ flows:
     dimse_kwargs:
       move_destination: "@calling_ae"
       priority: 0x0000
+      dataset:
+        kind: qr-study-identifier
   - name: get
     dimse: C_GET_RQ
     abstract_syntax: PATIENT_ROOT_QR_GET_SOP_CLASS_UID
     transfer_syntaxes: [DEFAULT_TRANSFER_SYNTAX_UID]
     dimse_kwargs:
       priority: 0x0000
+      dataset:
+        kind: qr-study-identifier
 
 argv:
   - "-c"

@@ -56,6 +56,7 @@ from c_scare.profiles import load_profile, load_profiles  # noqa: E402
 
 SEEDS_ROOT = REPO_ROOT / "fuzz" / "seeds"
 DEFAULT_SEED = 0xC5CA8E
+_SPECIAL_DIMSE_KWARGS = {"dataset"}
 
 
 def _associate_rq(profile, flow) -> bytes:
@@ -86,8 +87,133 @@ def _p_data_command(dimse_pkt) -> bytes:
     return bytes(raw(DICOM() / P_DATA_TF(pdv_items=[pdv])))
 
 
+def _p_data_command_and_dataset(dimse_pkt, dataset_bytes=None) -> bytes:
+    pdv_items = [
+        PresentationDataValueItem(
+            context_id=1,
+            data=bytes(dimse_pkt),
+            is_command=1,
+            is_last=1,
+        )
+    ]
+    if dataset_bytes is not None:
+        pdv_items.append(
+            PresentationDataValueItem(
+                context_id=1,
+                data=dataset_bytes,
+                is_command=0,
+                is_last=1,
+            )
+        )
+    return bytes(raw(DICOM() / P_DATA_TF(pdv_items=pdv_items)))
+
+
 def _release_rq() -> bytes:
     return bytes(raw(DICOM() / A_RELEASE_RQ()))
+
+
+def _dataset_encoding_flags(flow):
+    from pydicom.uid import UID
+
+    transfer_syntax = flow.transfer_syntaxes[0] if flow.transfer_syntaxes else c_scare.DEFAULT_TRANSFER_SYNTAX_UID
+    uid = UID(transfer_syntax)
+    implicit_vr = bool(uid.is_implicit_VR) if uid.is_implicit_VR is not None else (
+        transfer_syntax == c_scare.IMPLICIT_VR_LITTLE_ENDIAN_UID
+    )
+    little_endian = bool(uid.is_little_endian) if uid.is_little_endian is not None else (
+        transfer_syntax != c_scare.EXPLICIT_VR_BIG_ENDIAN_UID
+    )
+    return implicit_vr, little_endian
+
+
+def _encode_dataset(dataset, flow) -> bytes:
+    from pydicom.filebase import DicomBytesIO
+    from pydicom.filewriter import write_dataset
+
+    implicit_vr, little_endian = _dataset_encoding_flags(flow)
+    dataset.is_implicit_VR = implicit_vr
+    dataset.is_little_endian = little_endian
+    buffer = DicomBytesIO()
+    buffer.is_implicit_VR = implicit_vr
+    buffer.is_little_endian = little_endian
+    write_dataset(buffer, dataset)
+    return buffer.getvalue()
+
+
+def _cstore_dataset(profile, flow, spec):
+    from pydicom.dataset import Dataset
+
+    sop_instance_uid = str(
+        spec.get("sop_instance_uid")
+        or flow.dimse_kwargs.get("affected_sop_instance_uid")
+        or "1.2.826.0.1.3680043.10.543.1.1"
+    )
+    study_uid = str(spec.get("study_instance_uid", "1.2.826.0.1.3680043.10.543.1"))
+    series_uid = str(spec.get("series_instance_uid", "1.2.826.0.1.3680043.10.543.1.2"))
+    rows = int(spec.get("rows", 2))
+    columns = int(spec.get("columns", 2))
+    bits_allocated = int(spec.get("bits_allocated", 16))
+    samples_per_pixel = int(spec.get("samples_per_pixel", 1))
+    bytes_per_sample = max(1, (bits_allocated + 7) // 8)
+
+    dataset = Dataset()
+    dataset.SOPClassUID = flow.abstract_syntax
+    dataset.SOPInstanceUID = sop_instance_uid
+    dataset.StudyInstanceUID = study_uid
+    dataset.SeriesInstanceUID = series_uid
+    dataset.PatientName = spec.get("patient_name", "C-SCARE^Seed")
+    dataset.PatientID = spec.get("patient_id", "C-SCARE-0001")
+    dataset.StudyID = spec.get("study_id", "1")
+    dataset.StudyDate = spec.get("study_date", "20260722")
+    dataset.StudyTime = spec.get("study_time", "120000")
+    dataset.SeriesNumber = int(spec.get("series_number", 1))
+    dataset.InstanceNumber = int(spec.get("instance_number", 1))
+    dataset.Modality = spec.get("modality", "CT")
+    dataset.Manufacturer = spec.get("manufacturer", "C-SCARE")
+    dataset.ImageType = spec.get("image_type", ["ORIGINAL", "PRIMARY", "AXIAL"])
+    dataset.Rows = rows
+    dataset.Columns = columns
+    dataset.SamplesPerPixel = samples_per_pixel
+    dataset.PhotometricInterpretation = spec.get("photometric_interpretation", "MONOCHROME2")
+    dataset.BitsAllocated = bits_allocated
+    dataset.BitsStored = int(spec.get("bits_stored", bits_allocated))
+    dataset.HighBit = int(spec.get("high_bit", dataset.BitsStored - 1))
+    dataset.PixelRepresentation = int(spec.get("pixel_representation", 0))
+    dataset.PixelSpacing = spec.get("pixel_spacing", ["1", "1"])
+    dataset.SliceThickness = spec.get("slice_thickness", "1")
+    dataset.RescaleIntercept = spec.get("rescale_intercept", "0")
+    dataset.RescaleSlope = spec.get("rescale_slope", "1")
+    dataset.PixelData = bytes((rows * columns * samples_per_pixel * bytes_per_sample))
+    return dataset
+
+
+def _qr_identifier_dataset(profile, flow, spec):
+    from pydicom.dataset import Dataset
+
+    dataset = Dataset()
+    dataset.QueryRetrieveLevel = spec.get("query_retrieve_level", "STUDY")
+    dataset.PatientID = spec.get("patient_id", "C-SCARE-0001")
+    dataset.PatientName = spec.get("patient_name", "")
+    dataset.StudyInstanceUID = spec.get("study_instance_uid", "1.2.826.0.1.3680043.10.543.1")
+    dataset.StudyDate = spec.get("study_date", "")
+    dataset.AccessionNumber = spec.get("accession_number", "")
+    if dataset.QueryRetrieveLevel in ("SERIES", "IMAGE"):
+        dataset.SeriesInstanceUID = spec.get("series_instance_uid", "")
+    if dataset.QueryRetrieveLevel == "IMAGE":
+        dataset.SOPInstanceUID = spec.get("sop_instance_uid", "")
+    return dataset
+
+
+def _flow_dataset_bytes(profile, flow):
+    spec = flow.dimse_kwargs.get("dataset")
+    if not spec:
+        return None
+    kind = spec.get("kind")
+    if kind == "cstore-image":
+        return _encode_dataset(_cstore_dataset(profile, flow, spec), flow)
+    if kind in {"find-study", "move-study", "qr-study-identifier"}:
+        return _encode_dataset(_qr_identifier_dataset(profile, flow, spec), flow)
+    raise ValueError(f"unsupported dataset seed kind {kind!r} in flow {flow.name!r}")
 
 
 def _build_dimse(flow, rng: random.Random):
@@ -99,15 +225,19 @@ def _build_dimse(flow, rng: random.Random):
     """
     dimse_cls = getattr(c_scare, flow.dimse)
     kwargs = {"affected_sop_class_uid": flow.abstract_syntax}
-    kwargs.update(flow.dimse_kwargs)
+    kwargs.update({
+        key: value for key, value in flow.dimse_kwargs.items()
+        if key not in _SPECIAL_DIMSE_KWARGS
+    })
     kwargs["message_id"] = rng.randint(1, 0xFFFF)
     return dimse_cls(**kwargs)
 
 
 def _flow_bytes(profile, flow, rng: random.Random) -> bytes:
+    dimse_pkt = _build_dimse(flow, rng)
     return (
         _associate_rq(profile, flow)
-        + _p_data_command(_build_dimse(flow, rng))
+        + _p_data_command_and_dataset(dimse_pkt, _flow_dataset_bytes(profile, flow))
         + _release_rq()
     )
 

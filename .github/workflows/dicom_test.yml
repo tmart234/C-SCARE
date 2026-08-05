@@ -73,21 +73,50 @@ jobs:
         if: matrix.dicom_server.name == 'Orthanc'
         run: |
           echo "Starting Orthanc container..."
+          # Only ORTHANC__* env vars: the bare DICOM_AET / DICOM_PORT names were
+          # deprecated in April 2020 and the image refuses to start on them as
+          # of July 2026. Orthanc >= 1.13 also refuses to start with remote
+          # access and HTTP auth both on but no user declared; these tests only
+          # drive the DICOM port, and the container is ephemeral, so HTTP auth
+          # is turned off rather than given a credential.
+          # No --rm: a container that dies during startup must survive long
+          # enough for the "Show server logs" step to explain why.
           docker run \
             --detach \
-            --rm \
             --name dicom-scp-test \
             --publish ${{ matrix.dicom_server.port }}:${{ matrix.dicom_server.port }} \
             -e VERBOSE_ENABLED=true \
-            -e DICOM_AET=${{ matrix.dicom_server.aet }} \
-            -e DICOM_PORT=${{ matrix.dicom_server.port }} \
+            -e ORTHANC__AUTHENTICATION_ENABLED=false \
+            -e ORTHANC__REMOTE_ACCESS_ALLOWED=true \
             -e ORTHANC__DICOM_AET=${{ matrix.dicom_server.aet }} \
             -e ORTHANC__DICOM_PORT=${{ matrix.dicom_server.port }} \
             ${{ matrix.dicom_server.image }}
 
-          echo "Waiting for Orthanc to become available..."
-          timeout 60 bash -c 'until nc -z -w 1 127.0.0.1 ${{ matrix.dicom_server.port }}; do sleep 1; done'
-          sleep 5
+          # Readiness must be a completed DICOM association, not a TCP connect.
+          # docker-proxy binds the published port on the host as soon as
+          # `docker run` returns, so `nc -z` succeeds even when the container
+          # behind it is dead — the tests then fail later with a confusing
+          # ConnectionRefusedError instead of here, with the cause.
+          echo "Waiting for Orthanc to answer C-ECHO..."
+          ready=0
+          for _ in $(seq 1 60); do
+            if ! docker inspect -f '{{.State.Running}}' dicom-scp-test 2>/dev/null | grep -q true; then
+              echo "::error::Orthanc container exited during startup"
+              break
+            fi
+            if echoscu -aet READINESS -aec ${{ matrix.dicom_server.aet }} \
+                 127.0.0.1 ${{ matrix.dicom_server.port }} >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [[ "${ready}" -ne 1 ]]; then
+            echo "::error::Orthanc did not accept a DICOM association within 60s"
+            docker logs dicom-scp-test 2>&1 | tail -50 || true
+            exit 1
+          fi
+          echo "Orthanc ready (C-ECHO accepted)"
 
       - name: Start Pynetdicom DICOM SCP
         if: matrix.dicom_server.name == 'Pynetdicom'
@@ -174,6 +203,7 @@ jobs:
         run: |
           if [[ "${{ matrix.dicom_server.name }}" == "Orthanc" ]]; then
             docker stop dicom-scp-test 2>/dev/null || true
+            docker rm -f dicom-scp-test 2>/dev/null || true
           else
             # Kill pynetdicom processes
             pkill -f "pynetdicom storescp" 2>/dev/null || true

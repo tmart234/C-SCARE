@@ -123,7 +123,7 @@ class HostileObservation:
     """An observation from hostile/rogue mode, where the system under test is a
     CLIENT (SCU). Findings come from monitors watching the client process, so
     the ``monitor_reports`` are passed straight through to the SARIF detection
-    block (``test_runner.write_sarif``)."""
+    block (``runner.write_sarif``)."""
 
     name: str
     description: str

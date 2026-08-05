@@ -12,7 +12,7 @@
 # profile file makes yq exit non-zero, so load_profile checks the file first.
 #
 # load_profile <target> sets (in the caller's scope):
-#   PROFILE_FILE BIN_NAME BUILD_SUBDIR ENGINE HARNESS PORT
+#   PROFILE_FILE BIN_NAME BUILD_SUBDIR ENGINE KIND HARNESS PORT
 #   SEEDS_DIR SEEDS_GLOB OUT_DIR STORAGE_DIR DICT_PATH DICT_GENERATOR
 #   SAND_ENABLED CFG_TEMPLATE CFG_RUNTIME CALLING_AE CALLED_AE
 #   PEER_HOST PEER_PORT SEND_FILE
@@ -67,6 +67,7 @@ load_profile() {
     BUILD_SUBDIR="$(_pf_get '.build_subdir')"
     BUILD_DIR="${REPO_ROOT}/fuzz/${BUILD_SUBDIR}"
     ENGINE="$(_pf_get '.engine')"
+    KIND="$(_pf_get '.kind')"
     HARNESS="$(_pf_get '.harness')"
     PORT="$(_pf_get '.port')"
     SEEDS_DIR="$(_pf_subst "$(_pf_get '.seeds.dir')")"
@@ -130,6 +131,18 @@ source_afl() {
         : "${AFL_PATH:=__AFL_PATH__}"
         : "${AFLPP_PATH:=__AFLPP_PATH__}"
     else
+        # Fall back to the in-tree submodule builds when the caller has not
+        # exported AFL_PATH / AFLPP_PATH (see scripts/install_afl.sh).
+        if [[ ! -x "${AFL_PATH:-}/afl-fuzz" && -x "${REPO_ROOT}/fuzz/aflnet/afl-fuzz" ]]; then
+            AFL_PATH="${REPO_ROOT}/fuzz/aflnet"
+        fi
+        if [[ ! -x "${AFLPP_PATH:-}/afl-fuzz" && -x "${REPO_ROOT}/fuzz/aflplusplus/afl-fuzz" ]]; then
+            AFLPP_PATH="${REPO_ROOT}/fuzz/aflplusplus"
+        fi
+        if [[ -x "${AFL_PATH:-}/afl-fuzz" && -x "${AFLPP_PATH:-}/afl-fuzz" ]]; then
+            export AFL_PATH AFLPP_PATH
+            return 0
+        fi
         # shellcheck source=scripts/install_afl.sh
         source "${REPO_ROOT}/scripts/install_afl.sh"
     fi
@@ -139,7 +152,11 @@ source_afl() {
 # setting BIN_PATH. In print mode a placeholder path is used so the golden
 # argv can be emitted without a real build.
 find_binary() {
-    BIN_PATH="$(find "${BUILD_DIR}" -type f -name "${BIN_NAME}" -executable 2>/dev/null | head -1 || true)"
+    if [[ -n "${CSCARE_TARGET_BINARY:-}" ]]; then
+        BIN_PATH="${CSCARE_TARGET_BINARY}"
+    else
+        BIN_PATH="$(find "${BUILD_DIR}" -type f -name "${BIN_NAME}" -executable 2>/dev/null | head -1 || true)"
+    fi
     if [[ -z "${BIN_PATH}" ]]; then
         if [[ -n "${CSCARE_PRINT_ARGV:-}" ]]; then
             BIN_PATH="${BUILD_DIR}/${BIN_NAME}"
@@ -147,6 +164,9 @@ find_binary() {
             echo "[${1:-fuzz}] ${BIN_NAME} not built — run scripts/build_dcmtk.sh" >&2
             exit 1
         fi
+    elif [[ -z "${CSCARE_PRINT_ARGV:-}" && ! -x "${BIN_PATH}" ]]; then
+        echo "[${1:-fuzz}] ${BIN_NAME} is not executable: ${BIN_PATH}" >&2
+        exit 1
     fi
 }
 

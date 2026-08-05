@@ -98,6 +98,7 @@ from c_scare.scapy_dicom import (
     PATIENT_ROOT_QR_FIND_SOP_CLASS_UID,
     PATIENT_ROOT_QR_MOVE_SOP_CLASS_UID,
     PATIENT_ROOT_QR_GET_SOP_CLASS_UID,
+    MODALITY_WORKLIST_FIND_SOP_CLASS_UID,
     # Constants - Transfer Syntax UIDs (PS3.5 Annex A)
     IMPLICIT_VR_LITTLE_ENDIAN_UID,
     EXPLICIT_VR_LITTLE_ENDIAN_UID,
@@ -1499,6 +1500,9 @@ class TestConstants:
         assert PATIENT_ROOT_QR_FIND_SOP_CLASS_UID == "1.2.840.10008.5.1.4.1.2.1.1"
         assert PATIENT_ROOT_QR_MOVE_SOP_CLASS_UID == "1.2.840.10008.5.1.4.1.2.1.2"
         assert PATIENT_ROOT_QR_GET_SOP_CLASS_UID == "1.2.840.10008.5.1.4.1.2.1.3"
+        # PS3.4 Annex K: Modality Worklist Information Model - FIND. Not
+    # 1.2.840.10008.5.1.4.32.1, which is the retired General Purpose Worklist.
+    assert MODALITY_WORKLIST_FIND_SOP_CLASS_UID == "1.2.840.10008.5.1.4.31"
 
 
 # =============================================================================

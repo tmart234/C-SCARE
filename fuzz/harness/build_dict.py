@@ -71,13 +71,34 @@ def main() -> int:
         be = struct.pack(">H", code)
         _emit(seen, lines, f"dimse_{_slug(label)}", _esc_bytes(be))
 
-    # Common DICOM tags — 4 bytes little-endian (group, element)
+    # High-value DICOM tags — 4 bytes little-endian (group, element). This is
+    # a deliberate subset: tags that gate parser branches (file meta, pixel
+    # geometry, sequence-bearing elements), not the whole data dictionary,
+    # which would dilute AFL's token selection.
     common_tags = [
         ("patient_name", 0x0010, 0x0010),
         ("patient_id", 0x0010, 0x0020),
+        ("study_date", 0x0008, 0x0020),
+        ("modality", 0x0008, 0x0060),
         ("sop_class_uid", 0x0008, 0x0016),
         ("sop_instance_uid", 0x0008, 0x0018),
+        ("study_instance_uid", 0x0020, 0x000D),
+        ("series_instance_uid", 0x0020, 0x000E),
+        ("series_number", 0x0020, 0x0011),
+        ("instance_number", 0x0020, 0x0013),
         ("transfer_syntax_uid", 0x0002, 0x0010),
+        ("file_meta_group_length", 0x0002, 0x0000),
+        ("file_meta_version", 0x0002, 0x0001),
+        ("implementation_class_uid", 0x0002, 0x0012),
+        ("implementation_version_name", 0x0002, 0x0013),
+        ("referenced_image_sequence", 0x0008, 0x1140),
+        ("referenced_sop_class_uid", 0x0008, 0x1150),
+        ("referenced_sop_instance_uid", 0x0008, 0x1155),
+        ("content_sequence", 0x0040, 0xA730),
+        ("concept_name_code_sequence", 0x0040, 0xA043),
+        ("code_value", 0x0008, 0x0100),
+        ("coding_scheme_designator", 0x0008, 0x0102),
+        ("code_meaning", 0x0008, 0x0104),
         ("rows", 0x0028, 0x0010),
         ("columns", 0x0028, 0x0011),
         ("bits_allocated", 0x0028, 0x0100),
@@ -96,6 +117,23 @@ def main() -> int:
 
     # DICOM file preamble magic — Part 10 marker
     _emit(seen, lines, "magic_dicm", _esc_str("DICM"))
+
+    # Common VRs and sequence framing — helps mutations preserve element shape
+    # long enough to reach deeper dcmdata parser branches.
+    for vr in [
+        "AE", "AS", "AT", "CS", "DA", "DS", "DT", "FL", "FD", "IS", "LO",
+        "LT", "OB", "OD", "OF", "OL", "OW", "PN", "SH", "SL", "SQ", "SS",
+        "ST", "TM", "UC", "UI", "UL", "UN", "UR", "US", "UT",
+    ]:
+        _emit(seen, lines, f"vr_{vr.lower()}", _esc_str(vr))
+
+    for label, marker in [
+        ("item_tag_le", b"\xfe\xff\x00\xe0"),
+        ("item_delim_le", b"\xfe\xff\x0d\xe0"),
+        ("seq_delim_le", b"\xfe\xff\xdd\xe0"),
+        ("undef_len", b"\xff\xff\xff\xff"),
+    ]:
+        _emit(seen, lines, f"dicom_{label}", _esc_bytes(marker))
 
     # Encapsulated-pixel codec markers — the file/pixel campaign mutates
     # fragments inside JPEG / JPEG-LS / JPEG2000 / RLE wrappers, so the codec

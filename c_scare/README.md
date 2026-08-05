@@ -17,4 +17,4 @@ The `c_scare` package. See the [project README](../README.md) for an overview an
 | `deliver.py` | Black-box delivery — `send_pdu()`, `send_sequence()`, `send_cstore()` (optional `user_identity=` to authenticate first) |
 | `greybox.py` | Grey-box bridge — launches AFL++/AFLNet harnesses, triages crashes to SARIF |
 | `monitor.py` | Crash/anomaly detection — sanitizer, protocol and process-health monitors |
-| `test_runner.py` | CLI (`c-scare` / `python -m c_scare`) |
+| `runner.py` | CLI (`c-scare` / `python -m c_scare`) |

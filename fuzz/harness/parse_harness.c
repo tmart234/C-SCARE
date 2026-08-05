@@ -5,7 +5,7 @@
  * file mode.
  *
  * DCMTK itself ships dcmdump / dcmconv / dcm2pnm, which already serve as
- * parser entry points (see scripts/fuzz_parse.sh, campaign target "parse").
+ * parser entry points (see scripts/fuzz_file.sh, campaign target "parse").
  * Use THIS template only for a *custom* binary, so AFL exercises exactly
  * your code path.
  *

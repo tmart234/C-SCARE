@@ -33,9 +33,9 @@
 #                      speed, and one sanitizer-only worker tree per entry
 #                      in SANITIZERS is built under fuzz/build-san-<san>/
 #                      with AFL_SAN_NO_INST=1 (forkserver, no PC instr).
-#                      scripts/fuzz_file.sh / fuzz_parse.sh route suspicious
-#                      inputs to those workers via afl-fuzz -w; triage
-#                      replays through them (c-scare greybox triage --sand).
+#                      scripts/fuzz_file.sh routes suspicious inputs to
+#                      those workers via afl-fuzz -w; triage replays
+#                      through them (c-scare greybox triage --sand).
 #                      The AFLNet network track has no -w support, so it is
 #                      always built with the sanitizers inline.
 #

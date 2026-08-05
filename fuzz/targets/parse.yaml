@@ -4,7 +4,7 @@ schema: 1
 name: parse
 engine: aflpp
 kind: file
-harness: fuzz_parse.sh
+harness: fuzz_file.sh
 
 binary: dcmdump
 build_subdir: build-llvm
