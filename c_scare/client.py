@@ -98,6 +98,11 @@ class DICOMSession:
         self.peer_info = {}  # type: Dict[str, str]
         self.user_identity_response = None  # type: Optional[bytes]
         self.last_reject = None  # type: Optional[Dict[str, int]]
+        # Why the last associate() failed when no A-ASSOCIATE-RJ came back
+        # (connection refused, timeout, reset, malformed response). Callers
+        # need this to tell "the peer said no" from "the peer never answered";
+        # without it an unreachable host looks like a uniform rejection.
+        self.last_error = None  # type: Optional[str]
         # SOP-class -> (scu_role, scp_role) granted by the peer in the AC's
         # Type 0x54 sub-items. A SOP class absent here was not role-negotiated.
         self.negotiated_roles = {}  # type: Dict[str, Tuple[int, int]]
@@ -127,6 +132,7 @@ class DICOMSession:
             return True
         except (socket.error, socket.timeout, OSError) as e:
             log.error("Connection failed: %s", e)
+            self.last_error = "{}: {}".format(type(e).__name__, e)
             return False
 
     def send(self, pkt):
@@ -186,6 +192,7 @@ class DICOMSession:
         self.peer_info = {}
         self.user_identity_response = None
         self.last_reject = None
+        self.last_error = None
         self.negotiated_roles = {}
 
         variable_items = [
@@ -240,6 +247,13 @@ class DICOMSession:
                 )
                 return False
 
+        # Neither AC nor RJ: an abort, a truncated/unparseable PDU, or a
+        # closed socket. Record it so callers do not read silence as rejection.
+        if response is None:
+            self.last_error = "no response to A-ASSOCIATE-RQ (timeout or closed)"
+        else:
+            self.last_error = "unexpected response to A-ASSOCIATE-RQ: {}".format(
+                response.summary())
         log.error("Association failed: no valid response received")
         return False
 

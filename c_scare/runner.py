@@ -1634,7 +1634,11 @@ def _cmd_workflow(argv: List[str]) -> int:
         results = wf.ae_brute(a.ip, a.port, aets, calling_ae=a.calling_ae,
                               timeout=a.timeout)
         for r in results:
-            if r.accepted:
+            if r.error:
+                # No DICOM answer at all. Printing this as a rejection would
+                # let an unreachable host read as "no valid AE titles".
+                print(f"[?] {r.aet}: NO ANSWER ({r.error}) - inconclusive")
+            elif r.accepted:
                 print(f"[+] {r.aet}: ACCEPTED  "
                       f"appctx={r.application_context_uid} "
                       f"impl_uid={r.implementation_class_uid} "
@@ -1646,6 +1650,10 @@ def _cmd_workflow(argv: List[str]) -> int:
                       f"- AET valid, another gate remains")
             else:
                 print(f"[-] {r.aet}: rejected ({r.reason})")
+        if results and all(r.error for r in results):
+            print("\nNo AE title produced a DICOM response. Check host, port and "
+                  "reachability before reading anything into this run.")
+            return 1
         return 0
 
     if a.wfcmd == 'cred-brute':
@@ -1663,14 +1671,26 @@ def _cmd_workflow(argv: List[str]) -> int:
                                 calling_ae=a.calling_ae,
                                 stop_on_success=not a.no_stop, timeout=a.timeout)
         for r in results:
-            if r.accepted:
-                payload = r.server_response
-                print(f"[+] {r.username}: ACCEPTED  0x59={payload!r}")
+            label = 'baseline probe' if r.is_baseline else r.username
+            if r.error:
+                print(f"[?] {label}: NO ANSWER ({r.error}) - inconclusive")
+            elif r.credential_verified:
+                print(f"[+] {label}: VERIFIED  0x59={r.server_response!r}")
+            elif r.accepted and r.identity_enforced is False:
+                print(f"[~] {label}: association accepted, but the target "
+                      f"accepts any identity - proves nothing")
+            elif r.accepted:
+                print(f"[~] {label}: association accepted (identity enforcement "
+                      f"unconfirmed) 0x59={r.server_response!r}")
             elif r.aet_problem:
-                print(f"[!] {r.username}: rejected ({r.reason}) - the Called AE "
+                print(f"[!] {label}: rejected ({r.reason}) - the Called AE "
                       f"Title is wrong, not the credential; fix --ae-title first")
             else:
-                print(f"[-] {r.username}: rejected ({r.reason})")
+                print(f"[-] {label}: rejected ({r.reason})")
+        if any(r.identity_enforced is False for r in results):
+            print("\nThis target accepted a credential it cannot know, so it is "
+                  "not enforcing User Identity Negotiation. That is itself the "
+                  "finding; no credential below it is evidence of anything.")
         return 0
 
     # find / move / get share the query-building path.
