@@ -1335,9 +1335,19 @@ def run_memory_attacks(args) -> int:
 
 
 def run_all_tests(args) -> int:
-    """Run all tests."""
+    """Run every static attack category.
+
+    This must stay in sync with the ``--category`` choices: a category the CLI
+    accepts but ``all`` skips is silently missing coverage from every run that
+    does not name it explicitly. ``test_runner_all_covers_every_category``
+    enforces that.
+
+    ``live_fuzz`` is the one deliberate omission. It is a randomized loop sized
+    by ``--live-fuzz-count``, not a static catalog, so including it would make
+    ``all`` nondeterministic and unbounded. Run it by name.
+    """
     print_banner()
-    
+
     # Run each test suite
     commands = [
         ('CVE Attacks', run_cve_attacks),
@@ -1348,6 +1358,7 @@ def run_all_tests(args) -> int:
         ('Storage SCP Abuse Attacks', run_storage_scp_abuse_attacks),
         ('Command Injection Attacks', run_command_injection_attacks),
         ('Path Traversal Attacks', run_path_traversal_attacks),
+        ('State Machine Attacks', run_state_machine_attacks),
         ('Negotiation Attacks', run_negotiation_attacks),
         ('DIMSE-N Attacks', run_dimse_n_attacks),
         ('Fuzz Packets', run_fuzz_packets),
@@ -2039,6 +2050,7 @@ def main(argv: Optional[List[str]] = None):
         'state_machine': 'state_machine_attacks',
         'cve': 'cve_attacks',
         'fuzz_packet': 'fuzz_packets',
+        # Not in run_all_tests: a randomized loop, not a static catalog.
         'live_fuzz': 'protocol_fuzzing',
         'all': 'all',
     }

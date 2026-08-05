@@ -215,6 +215,14 @@ __all__ = [
     "_uid_to_bytes_raw",
     "build_presentation_context_rq",
     "build_user_information",
+    "raw_ae_title",
+    "raw_item",
+    "raw_presentation_context",
+    "raw_user_information",
+    "raw_associate_rq_with_items",
+    "raw_associate_rq",
+    "raw_release_rq",
+    "_uid_to_bytes_raw",
     "build_user_identity",
      # DIMSE Status Codes (PS3.7 Annex C)
      "STATUS_SUCCESS",
@@ -470,7 +478,13 @@ def _uid_to_bytes(uid):
 
 def _uid_to_bytes_raw(uid):
     # type: (Union[str, bytes]) -> bytes
-    """Convert UID to bytes without padding."""
+    """Convert a UID to bytes with no even-length padding.
+
+    PS3.5 9.1 pads UIDs to even length, and :func:`_uid_to_bytes` does that -
+    it is required inside a data set, where the element length must be even,
+    and permitted inside a PDU item. Real peers send PDU-item UIDs both ways
+    and accept both. Use this when a test needs the unpadded form specifically,
+    e.g. to check that a target's UID matching is padding-insensitive."""
     if isinstance(uid, bytes):
         return uid
     elif isinstance(uid, str):
@@ -1060,21 +1074,15 @@ class DICOMUserIdentity(Packet):
                       length_of="primary_field", fmt="!H"),
         StrLenField("primary_field", b"",
                     length_from=lambda pkt: pkt.primary_field_length),
-        ConditionalField(
-            FieldLenField("secondary_field_length", None,
-                          length_of="secondary_field", fmt="!H"),
-            lambda pkt: pkt.user_identity_type == 2
-        ),
-        ConditionalField(
-            StrLenField("secondary_field", b"",
-                        length_from=lambda pkt: (
-                            pkt.secondary_field_length
-                            if hasattr(pkt, 'secondary_field_length')
-                            and pkt.secondary_field_length is not None
-                            else 0
-                        )),
-            lambda pkt: pkt.user_identity_type == 2
-        ),
+        # Secondary-Field-Length is Type 1 in Table D.3-14: it is always on the
+        # wire and carries 0 when there is no passcode. Only the Secondary-Field
+        # *content* is specific to identity type 2 (username + passcode).
+        # Omitting the length for types 1/3/4/5 produces a sub-item a conformant
+        # peer rejects on framing, so the identity handler is never reached.
+        FieldLenField("secondary_field_length", None,
+                      length_of="secondary_field", fmt="!H"),
+        StrLenField("secondary_field", b"",
+                    length_from=lambda pkt: pkt.secondary_field_length or 0),
     ]
 
     def extract_padding(self, s):
@@ -2751,3 +2759,71 @@ def build_user_information(max_pdu_length=16384, implementation_class_uid=None,
             )
 
     return DICOMVariableItem() / DICOMUserInformation(sub_items=sub_items)
+
+
+# =============================================================================
+# Raw item builders - byte-level construction that bypasses field validation
+# =============================================================================
+#
+# The Packet classes above are the right tool for well-formed DICOM: scapy
+# computes item lengths, PDU lengths and DIMSE group lengths for you. That
+# auto-calculation is exactly what a malformation test often needs to defeat -
+# a payload whose declared length disagrees with its content cannot be built by
+# a layer that keeps the two in sync.
+#
+# These builders emit the same structures with every length passed through
+# verbatim, so a caller can state one thing and send another. Use the Packet
+# classes for anything that should be valid, and these only for the field under
+# test. They live here rather than in the attack catalog because wire format is
+# this module's job.
+
+def raw_ae_title(value: str) -> bytes:
+    return value.encode('ascii', 'replace')[:16].ljust(16, b' ')
+
+
+def raw_item(item_type: int, payload: bytes) -> bytes:
+    return bytes([item_type, 0]) + struct.pack('!H', len(payload)) + payload
+
+
+def raw_presentation_context(abstract_syntax_uid: str,
+                                transfer_syntax_uid: str = DEFAULT_TRANSFER_SYNTAX_UID,
+                                context_id: int = 1) -> bytes:
+    payload = bytes([context_id, 0, 0, 0])
+    payload += raw_item(0x30, abstract_syntax_uid.encode('ascii'))
+    payload += raw_item(0x40, transfer_syntax_uid.encode('ascii'))
+    return raw_item(0x20, payload)
+
+
+def raw_user_information(payload: Optional[bytes] = None) -> bytes:
+    if payload is None:
+        payload = raw_item(0x51, struct.pack('!I', 16384))
+        payload += raw_item(0x52, IMPLEMENTATION_CLASS_UID.encode('ascii'))
+    return raw_item(0x50, payload)
+
+
+def raw_associate_rq_with_items(called_ae: str,
+                             calling_ae: str,
+                             variable_items: bytes) -> bytes:
+    body = b'\x00\x01\x00\x00'
+    body += raw_ae_title(called_ae)
+    body += raw_ae_title(calling_ae)
+    body += b'\x00' * 32
+    body += variable_items
+    return b'\x01\x00' + struct.pack('!I', len(body)) + body
+
+
+def raw_associate_rq(called_ae: str,
+                        calling_ae: str,
+                        abstract_syntax_uid: str,
+                        user_info_payload: Optional[bytes] = None,
+                        context_id: int = 1) -> bytes:
+    variable_items = raw_item(
+        0x10, b'1.2.840.10008.3.1.1.1')
+    variable_items += raw_presentation_context(
+        abstract_syntax_uid, context_id=context_id)
+    variable_items += raw_user_information(user_info_payload)
+    return raw_associate_rq_with_items(called_ae, calling_ae, variable_items)
+
+
+def raw_release_rq() -> bytes:
+    return b'\x05\x00\x00\x00\x00\x04\x00\x00\x00\x00'

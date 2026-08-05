@@ -820,3 +820,81 @@ class TestSendCStore:
         assert calls["init"][0] == ("127.0.0.1", 104, "STORESCP", "C-SCARE")
         assert calls["c_store"][0] == b"DATASET"
         assert calls["associate"][1] == {"username": "u"}
+
+
+class TestCategoryCoverage:
+    """`--category all` must actually mean all.
+
+    A category the CLI accepts but `all` skips is silently missing from every
+    run that does not name it — which is how state_machine went unrun.
+    """
+
+    # live_fuzz is a randomized loop sized by --live-fuzz-count, not a static
+    # catalog, so `all` deliberately leaves it out. Any *other* omission is a bug.
+    DELIBERATE_OMISSIONS = {'live_fuzz'}
+
+    def _runner_source(self):
+        import inspect
+        import c_scare.runner as runner
+        return runner, inspect.getsource(runner)
+
+    def _category_map(self, source):
+        import re
+        block = re.search(r"category_map = \{(.*?)\n    \}", source, re.S).group(1)
+        return dict(re.findall(r"'([a-z_]+)': '([a-z_]+)',", block))
+
+    def test_runner_all_covers_every_category(self):
+        import re
+        _runner, source = self._runner_source()
+        category_map = self._category_map(source)
+
+        all_block = re.search(
+            r"def run_all_tests.*?commands = \[(.*?)\]", source, re.S).group(1)
+        run_by_all = set(re.findall(r"run_([a-z_]+)\)", all_block))
+
+        expected = {
+            command for category, command in category_map.items()
+            if category != 'all' and category not in self.DELIBERATE_OMISSIONS
+        }
+        missing = expected - run_by_all
+        assert not missing, (
+            f"--category all skips: {sorted(missing)}. Add them to "
+            f"run_all_tests or to DELIBERATE_OMISSIONS with a reason.")
+
+    def test_every_cli_category_resolves_to_a_runner(self):
+        import re
+        runner, source = self._runner_source()
+        category_map = self._category_map(source)
+
+        choices = set(re.findall(
+            r"'([a-z_]+)'",
+            re.search(r"choices=\[('parser'.*?)\],", source, re.S).group(1)))
+        unmapped = choices - set(category_map) - {'all'}
+        assert not unmapped, f"--category accepts but cannot dispatch: {sorted(unmapped)}"
+
+        commands_block = re.search(
+            r"def run_command.*?commands = \{(.*?)\n    \}", source, re.S).group(1)
+        dispatchable = set(re.findall(r"'([a-z_]+)':", commands_block))
+        dangling = {c for c in category_map.values() if c not in dispatchable}
+        assert not dangling, f"category_map points at missing runners: {sorted(dangling)}"
+
+    def test_all_categories_reach_a_nonempty_catalog(self):
+        """Every category must actually produce payloads."""
+        from c_scare.attacks import (
+            ParserAttacks, ProtocolAttacks, MemoryAttacks, LogicAttacks,
+            StorageSCPAbuseAttacks, CommandInjectionAttacks, PathTraversalAttacks,
+            StateMachineAttacks, CVEAttacks, NegotiationAttacks, DimseNAttacks,
+        )
+        catalogs = {
+            'parser': ParserAttacks, 'protocol': ProtocolAttacks,
+            'memory': MemoryAttacks, 'logic': LogicAttacks,
+            'storage_abuse': StorageSCPAbuseAttacks,
+            'command_injection': CommandInjectionAttacks,
+            'path_traversal': PathTraversalAttacks,
+            'state_machine': StateMachineAttacks, 'cve': CVEAttacks,
+            'negotiation': NegotiationAttacks, 'dimse_n': DimseNAttacks,
+        }
+        for category, cls in catalogs.items():
+            results = list(cls.all())
+            assert results, f'{category} yields no payloads'
+            assert all(r.category for r in results), category
