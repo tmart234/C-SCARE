@@ -172,8 +172,8 @@ fuzz/coverage/
 fuzz/storage/
 fuzz/configs/dcmqrscp.cfg
 fuzz/configs/dcmqrscp.cfg.cov
-fuzz/seeds/*/*.dcm
-fuzz/seeds/*/*.raw
-fuzz/seeds/*/*.bin
-fuzz/seeds/*/SEED.txt
-fuzz/seeds/*/PIXEL_SEED.txt
+fuzz/seeds/**/*.dcm
+fuzz/seeds/**/*.raw
+fuzz/seeds/**/*.bin
+fuzz/seeds/**/SEED.txt
+fuzz/seeds/**/PIXEL_SEED.txt
