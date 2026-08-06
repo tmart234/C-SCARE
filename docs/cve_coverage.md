@@ -112,12 +112,32 @@ against a `pynetdicom` SCP under DAST.
 
 | CVE | Component / function | Class | Vector |
 |-----|----------------------|-------|--------|
-| CVE-2019-11687 | DICOM Part-10 128-byte preamble | executable polyglot (CWE-20) | **catalog** `cve_2019_11687_polyglot` (PE/ELF/shell/batch/TIFF) + **file-seed** polyglot family |
+| CVE-2019-11687 | DICOM Part-10 preamble + private Data Elements | executable polyglot (CWE-20) | **catalog** `cve_2019_11687_polyglot` (PE32/PE32+/ELF/Mach-O/shell/batch/TIFF across five safe zones) + **file-seed** polyglot family |
 
 CVE-2019-11687 is a property of the file format, so it applies to dcm4che,
 pydicom, and DCMTK alike. The library-agnostic catalog (Parser / Protocol /
 Path-Traversal / etc.) also delivers against a `dcm4chee-arc-light` SCP under
 DAST.
+
+The catalog varies two things independently. *Which second format* the file
+also claims to be decides whether a scanner's magic table fires at all.
+*Which safe zone* carries the foreign bytes decides whether the scanner ever
+reads them — `metadata['zone']` names the region, and `c_scare.polyglot`
+enumerates all five in any Part-10 file:
+
+| Zone | Capacity | Reached by |
+|------|----------|------------|
+| Preamble DOS header (0x00–0x3F) | 58 bytes after the MZ magic and `e_lfanew` | every reader — it is the first thing on disk |
+| Preamble DOS stub (0x40–0x7F) | 64 bytes | nothing: never executed in protected mode, never parsed as DICOM |
+| Private (odd-group) `OB` element | 2³²−2 bytes | traversed, not inspected (PS3.5) |
+| Padding tail of a Data Element | value-specific | covered by the declared length, past where the value ends |
+| Space after the final Data Element | unbounded | never — Part-10 has no end marker, readers stop at the Data Set |
+
+The PE-carrying payloads are structurally complete on both sides —
+`polyglot.validate_polyglot` confirms a loader can walk every header while
+pydicom reads the same bytes as a Secondary Capture — and deliberately inert:
+zero-filled read-only section, no entry point. What they test is whether an
+importer or scanner *looks*, not whether a payload runs.
 
 ## Logic / URI
 

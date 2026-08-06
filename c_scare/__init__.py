@@ -152,6 +152,13 @@ from .scapy_dicom import (
 from .element import Tag, VR, Element, Dataset, Sequence, hexdump
 from .file import FileMetaInformation, DicomFile, make_secondary_capture
 
+# DICOM/PE polyglots (CVE-2019-11687): PE synthesis, safe-zone enumeration,
+# and dual-pipeline validation
+from .polyglot import (
+    SafeZone, dos_header, pe_image, dataset_offset, enumerate_safe_zones,
+    validate_pe, validate_dicom, validate_polyglot,
+)
+
 # pydicom-bridged surgical corruption (parse with pydicom, emit invalid bytes)
 from .corruptor import (
     Corruptor, InjectionPoint, Override, Injection, SequencePath,
@@ -333,6 +340,10 @@ __all__ = [
     # DICOM dataset & file construction
     "Tag", "VR", "Element", "Dataset", "Sequence", "hexdump",
     "FileMetaInformation", "DicomFile", "make_secondary_capture",
+    # DICOM/PE polyglots (CVE-2019-11687)
+    "SafeZone", "dos_header", "pe_image", "dataset_offset",
+    "enumerate_safe_zones", "validate_pe", "validate_dicom",
+    "validate_polyglot",
     # Surgical corruption
     "Corruptor", "InjectionPoint", "Override", "Injection", "SequencePath",
     "corrupt_vr", "corrupt_length", "duplicate_tag",

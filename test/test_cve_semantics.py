@@ -21,6 +21,7 @@ pytest.importorskip("pydicom")
 from pydicom.filebase import DicomBytesIO  # noqa: E402
 from pydicom.filereader import read_dataset  # noqa: E402
 
+from c_scare import polyglot  # noqa: E402
 from c_scare.attacks import CVEAttacks  # noqa: E402
 
 ALL = list(CVEAttacks.all())
@@ -32,7 +33,12 @@ POLYGLOT_MAGIC = {
     "shell": (b"#!",),
     "batch": (b"@", b"\xEF\xBB\xBF"),
     "TIFF": (b"II", b"MM"),
+    "MachO": (b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe"),
 }
+
+# Zones that hold the second format's *body* somewhere a conforming DICOM
+# reader traverses without inspecting, rather than in the preamble.
+BURIED_ZONES = {"private_element", "element_padding", "trailing"}
 
 
 def by_cve(cve):
@@ -41,6 +47,12 @@ def by_cve(cve):
 
 def with_meta(key):
     return [r for r in ALL if r.metadata.get(key) is not None]
+
+
+def buried():
+    """Polyglots whose second-format body lives past the preamble."""
+    return [r for r in by_cve("CVE-2019-11687")
+            if r.metadata.get("zone") in BURIED_ZONES]
 
 
 class TestPolyglotsAreActuallyDualFormat:
@@ -73,19 +85,53 @@ class TestPolyglotsAreActuallyDualFormat:
         """Executable content must fit the preamble, not push DICM along."""
         assert result.payload.index(b"DICM") == 128
 
-    def test_pe_header_offset_points_past_the_preamble(self):
-        """e_lfanew must jump out of the preamble, or the PE half is inert.
+    @pytest.mark.parametrize("result", buried(), ids=lambda r: r.name)
+    def test_e_lfanew_lands_on_a_real_pe_signature(self, result):
+        """e_lfanew must jump out of the preamble *and hit something*.
 
-        A scanner that only matches 'MZ' at offset 0 flags it; one that follows
-        e_lfanew reaches whatever the preamble points at. That divergence is
-        the test.
+        A scanner that only matches 'MZ' at offset 0 flags the file; one that
+        follows e_lfanew reaches the PE image. That divergence is the whole
+        attack, and it only exists if there is a PE image at the other end —
+        an e_lfanew pointing at DICM makes the payload a magic-byte probe
+        wearing a PEDICOM label.
         """
-        [pe] = [r for r in by_cve("CVE-2019-11687")
-                if r.metadata.get("polyglot") == "PE"]
-        e_lfanew = struct.unpack("<I", pe.payload[60:64])[0]
-        assert e_lfanew >= 128, (
-            f"e_lfanew={e_lfanew} still inside the preamble; "
-            "the PE offset is not being followed anywhere interesting")
+        e_lfanew = struct.unpack("<I", result.payload[60:64])[0]
+        assert e_lfanew >= 132, (
+            f"e_lfanew={e_lfanew} still inside the preamble or the DICM magic")
+        assert result.payload[e_lfanew:e_lfanew + 4] == b"PE\x00\x00", (
+            f"e_lfanew={e_lfanew} points at "
+            f"{result.payload[e_lfanew:e_lfanew + 4]!r}, not a PE signature")
+        assert e_lfanew % 4 == 0, (
+            f"e_lfanew={e_lfanew} is not 4-byte aligned; the ARM64 emulation "
+            "loader rejects the image")
+
+    @pytest.mark.parametrize("result", buried(), ids=lambda r: r.name)
+    def test_both_halves_validate(self, result):
+        """The dual-pipeline check: valid PE *and* valid DICOM, same bytes.
+
+        Either half failing collapses the test case. A broken PE half is a
+        DICOM file no scanner cares about; a broken DICOM half is an
+        executable no PACS accepts, and the storage path under test is never
+        exercised.
+        """
+        assert polyglot.validate_polyglot(result.payload) == {
+            "pe": [], "dicom": []}
+
+    @pytest.mark.parametrize("result", buried(), ids=lambda r: r.name)
+    def test_the_pe_body_sits_past_everything_dicom_parses(self, result):
+        """Each buried payload must really use a region no reader inspects.
+
+        The preamble and File Meta group are what every reader — and every
+        scanner worth the name — parses. These payloads exist to test what
+        comes after: regions a conforming parser traverses on its way past,
+        which is only interesting if the PE image is genuinely out there.
+        """
+        e_lfanew = struct.unpack("<I", result.payload[60:64])[0]
+        start = polyglot.dataset_offset(result.payload)
+        assert start is not None, "File Meta group is not parseable"
+        assert e_lfanew >= start, (
+            f"e_lfanew={e_lfanew} lands inside the File Meta group "
+            f"(Data Set starts at {start}); nothing is hidden")
 
 
 class TestTraversalPayloadsCarryTheirTraversal:
