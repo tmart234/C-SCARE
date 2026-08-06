@@ -271,3 +271,110 @@ class TestCatalogWideInvariants:
                 unexplained.append(result.name)
         assert not unexplained, (
             f"unparseable with no bug_class to explain it: {unexplained}")
+
+
+class TestPart10Conformance:
+    """PS3.10 §7.1 is a precondition, not decoration.
+
+    A reader that cannot find (0002,0000) Group Length and (0002,0010)
+    Transfer Syntax UID does not know how to decode the Data Set and is
+    entitled to stop at the header. A payload that skips the File Meta group
+    therefore never reaches the parser it is aimed at, and the run records a
+    rejection that proves nothing about the bug under test.
+
+    Payloads whose *malformation is the header* are exempt, named one by one
+    below rather than waved through by ``bug_class`` — most payloads carry a
+    ``bug_class`` for a Data Set defect and still need a header a reader will
+    accept, or the Data Set is never reached.
+    """
+
+    # CVE-2026-3650 drives an allocation from a lying (0002,0000) Group
+    # Length; CVE-2026-5437 drives an out-of-bounds read from one. For these
+    # the malformed header is the reproduction, so conformance would remove
+    # the attack. Anything else added here needs the same justification.
+    HEADER_IS_THE_ATTACK = frozenset({
+        "cve_2026_3650_01_nonstandard_vr_huge_length",
+        "cve_2026_3650_02_unknown_vr_private_info",
+        "cve_2026_3650_03_un_vr_oversized_length",
+        "cve_2026_5437_01_grouplen_overdeclared",
+        "cve_2026_5437_02_element_length_past_eof",
+        "cve_2026_5437_03_length_arithmetic_overflow",
+        "cve_2026_5437_04_grouplen_underdeclared",
+    })
+
+    TYPE1 = [(0x0002, 0x0001), (0x0002, 0x0002), (0x0002, 0x0003),
+             (0x0002, 0x0010), (0x0002, 0x0012)]
+
+    PART10 = [r for r in ALL if len(r.payload) > 132
+              and r.payload[128:132] == b"DICM"]
+
+    def _meta(self, blob):
+        """(group_length_declared, {tag: value}, offset_after_group)."""
+        assert blob[132:138] == b"\x02\x00\x00\x00UL", "no (0002,0000) UL first"
+        declared = struct.unpack("<I", blob[140:144])[0]
+        pos, found = 144, {}
+        while pos + 8 <= len(blob):
+            group, element = struct.unpack("<HH", blob[pos:pos + 4])
+            if group != 0x0002:
+                break
+            vr = blob[pos + 4:pos + 6]
+            if vr in (b"OB", b"OW", b"UN", b"SQ", b"UT", b"UC", b"UR"):
+                length = struct.unpack("<I", blob[pos + 8:pos + 12])[0]
+                voff = pos + 12
+            else:
+                length = struct.unpack("<H", blob[pos + 6:pos + 8])[0]
+                voff = pos + 8
+            found[(group, element)] = blob[voff:voff + length]
+            pos = voff + length
+        return declared, found, pos
+
+    @pytest.mark.parametrize("result", PART10, ids=lambda r: r.name)
+    def test_file_meta_group_is_present_and_complete(self, result):
+        if result.name in self.HEADER_IS_THE_ATTACK:
+            pytest.skip("the malformed File Meta header is the reproduction")
+        _declared, found, _end = self._meta(result.payload)
+        missing = [f"({t[0]:04X},{t[1]:04X})" for t in self.TYPE1
+                   if t not in found]
+        assert not missing, f"missing Type 1 File Meta elements: {missing}"
+
+    @pytest.mark.parametrize("result", PART10, ids=lambda r: r.name)
+    def test_group_length_matches_the_group(self, result):
+        if result.name in self.HEADER_IS_THE_ATTACK:
+            pytest.skip("the malformed File Meta header is the reproduction")
+        declared, _found, end = self._meta(result.payload)
+        assert declared == end - 144, (
+            f"(0002,0000) declares {declared}, group is {end - 144} bytes")
+
+    @pytest.mark.parametrize("result", PART10, ids=lambda r: r.name)
+    def test_data_set_is_in_ascending_tag_order(self, result):
+        """PS3.5 §7.1. Descending order is grounds for rejection, and a
+        rejection at the header is a result that concludes nothing."""
+        if result.name in self.HEADER_IS_THE_ATTACK:
+            pytest.skip("the malformed File Meta header is the reproduction")
+        _declared, found, end = self._meta(result.payload)
+        ts = found.get((0x0002, 0x0010), b"").rstrip(b"\x00 ").decode()
+        if ts != "1.2.840.10008.1.2.1":
+            pytest.skip(f"data set is not Explicit VR LE ({ts})")
+
+        blob, pos, last = result.payload, end, None
+        while pos + 8 <= len(blob):
+            tag = struct.unpack("<HH", blob[pos:pos + 4])
+            vr = blob[pos + 4:pos + 6]
+            if not (vr.isalpha() and vr.isupper()):
+                break
+            if vr in (b"OB", b"OW", b"UN", b"SQ", b"UT", b"UC", b"UR", b"OF",
+                      b"OD", b"OL", b"OV"):
+                if pos + 12 > len(blob):
+                    break
+                length = struct.unpack("<I", blob[pos + 8:pos + 12])[0]
+                voff = pos + 12
+            else:
+                length = struct.unpack("<H", blob[pos + 6:pos + 8])[0]
+                voff = pos + 8
+            if length == 0xFFFFFFFF or voff + length > len(blob):
+                break
+            assert last is None or tag >= last, (
+                f"({tag[0]:04X},{tag[1]:04X}) follows "
+                f"({last[0]:04X},{last[1]:04X}) — Data Set descends")
+            last = tag
+            pos = voff + length

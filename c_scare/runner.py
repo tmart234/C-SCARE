@@ -44,7 +44,9 @@ try:
         StorageSCPAbuseAttacks, CommandInjectionAttacks,
         PathTraversalAttacks, StateMachineAttacks, CVEAttacks,
         NegotiationAttacks, DimseNAttacks,
-        ProtocolFuzzer, AttackResult, SCAPY_AVAILABLE
+        ProtocolFuzzer, AttackResult, SCAPY_AVAILABLE,
+        DICM_PREFIX, EXPLICIT_VR_LE_UID, PART10_PREAMBLE_LEN,
+        part10_file, standard_file_meta,
     )
     from . import deliver
     from .monitor import (
@@ -58,7 +60,9 @@ except ImportError:
         StorageSCPAbuseAttacks, CommandInjectionAttacks,
         PathTraversalAttacks, StateMachineAttacks, CVEAttacks,
         NegotiationAttacks, DimseNAttacks,
-        ProtocolFuzzer, AttackResult, SCAPY_AVAILABLE
+        ProtocolFuzzer, AttackResult, SCAPY_AVAILABLE,
+        DICM_PREFIX, EXPLICIT_VR_LE_UID, PART10_PREAMBLE_LEN,
+        part10_file, standard_file_meta,
     )
     import deliver
     from monitor import (
@@ -645,10 +649,10 @@ def _dataset_from_part10(payload: bytes) -> Tuple[bytes, Dict[str, str]]:
     and group-0002 file meta header while preserving the malformed data set.
     """
     meta: Dict[str, str] = {}
-    if len(payload) < 132 or payload[128:132] != b'DICM':
+    if not is_part10(payload):
         return payload, meta
 
-    pos = 132
+    pos = PART10_PREAMBLE_LEN + len(DICM_PREFIX)
     end = len(payload)
     while pos + 8 <= end:
         group, elem = struct.unpack_from('<HH', payload, pos)
@@ -684,16 +688,40 @@ def _dataset_from_part10(payload: bytes) -> Tuple[bytes, Dict[str, str]]:
     return payload, meta
 
 
+def is_part10(payload: bytes) -> bool:
+    """True if ``payload`` is a complete Part-10 file.
+
+    PS3.10 §7.1 fixes the shape: a 128-byte File Preamble followed by the
+    four-byte ``DICM`` prefix. Nothing else the catalog produces looks like
+    that, so it is a reliable structural answer to "is this a dataset to be
+    stored, or bytes to be framed as a PDU?"
+    """
+    return (len(payload) > PART10_PREAMBLE_LEN + len(DICM_PREFIX)
+            and payload[PART10_PREAMBLE_LEN:
+                        PART10_PREAMBLE_LEN + len(DICM_PREFIX)] == DICM_PREFIX)
+
+
 def _delivery_kind(args, result: AttackResult) -> str:
     """Decide how to put ``result.payload`` on the wire: 'sequence' (multi-PDU
     state-machine attack), 'cstore' (dataset wrapped in a C-STORE association),
     or 'pdu' (single raw PDU). Honors ``--delivery``; 'auto' routes by the
-    catalog's own metadata convention (``steps`` / ``sop_class_uid``) and the
-    dataset categories."""
+    payload's own shape first, then by the catalog's metadata convention
+    (``steps`` / ``delivery_hint`` / ``sop_class_uid``) and the dataset
+    categories.
+
+    Shape comes first because metadata is a convention and conventions get
+    forgotten. A Part-10 file sent as a raw PDU puts its first byte where the
+    PDU type belongs — ``M`` from an ``MZ`` preamble, ``\\x7f`` from an ELF
+    one — so the peer's DUL provider rejects an unrecognised PDU type and the
+    file parser under test never runs. The abort that comes back is a normal
+    response, so the result reads clean for an attack that never happened.
+    """
     has_steps = bool(result.metadata.get('steps'))
     has_sop = bool(result.metadata.get('sop_class_uid'))
     mode = getattr(args, 'delivery', 'auto')
     if mode == 'pdu':
+        # An explicit operator override: send the bytes raw even when they are
+        # a file. That is a legitimate thing to ask for against a DUL.
         return 'sequence' if has_steps else 'pdu'
     if mode == 'cstore':
         # Force C-STORE for anything dataset-shaped; multi-PDU sequences can't
@@ -705,6 +733,8 @@ def _delivery_kind(args, result: AttackResult) -> str:
     if has_steps:
         return 'sequence'
     if result.metadata.get('delivery_hint') == 'cstore':
+        return 'cstore'
+    if is_part10(result.payload):
         return 'cstore'
     if has_sop or result.category in DATASET_CATEGORIES:
         return 'cstore'
@@ -1277,10 +1307,24 @@ def _save_corpus_file(result: AttackResult, output_dir: str) -> str:
         # offset 128, e.g. the CVE-2019-11687 polyglots) - must be written
         # verbatim. Re-wrapping a polyglot buries its executable preamble at
         # offset 132 and destroys the seed.
-        if payload.startswith(b'DICM') or payload[128:132] == b'DICM':
+        if payload.startswith(DICM_PREFIX) or is_part10(payload):
             file_data = payload
         else:
-            file_data = b'\x00' * 128 + b'DICM' + payload
+            # A bare Data Set needs a File Meta group, not just the magic.
+            # Preamble + DICM + data set is not a Part-10 file: PS3.10 §7.1
+            # requires group 0002, and without (0002,0010) Transfer Syntax UID
+            # a reader does not know how to decode what follows. dcmtk stops
+            # at the header, so the malformation inside the seed never reaches
+            # the parser it was written for.
+            file_data = part10_file(
+                standard_file_meta(
+                    sop_class_uid=(result.metadata.get('sop_class_uid')
+                                   or _DEFAULT_STORE_SOP),
+                    sop_instance_uid=(result.metadata.get('sop_instance_uid')
+                                      or '1.2.3.4.5'),
+                    transfer_syntax=(result.metadata.get('transfer_syntax')
+                                     or EXPLICIT_VR_LE_UID)),
+                dataset=payload)
 
     filepath = os.path.join(output_dir, f"{result.name}{ext}")
     with open(filepath, 'wb') as f:

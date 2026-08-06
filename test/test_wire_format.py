@@ -12,6 +12,8 @@ Secondary-Field-Length for every identity type except 2, so the whole
 authentication surface was being probed with a sub-item a conformant peer
 would reject on framing.
 """
+import struct
+
 import pytest
 
 pytest.importorskip("pynetdicom")
@@ -19,6 +21,7 @@ pytest.importorskip("pynetdicom")
 from scapy.packet import raw  # noqa: E402
 
 import c_scare.scapy_dicom as sd  # noqa: E402
+from c_scare.element import Dataset, Element  # noqa: E402
 from c_scare.scapy_dicom import (  # noqa: E402
     DICOM, DICOMVariableItem, DICOMApplicationContext,
     CT_IMAGE_STORAGE_SOP_CLASS_UID, DEFAULT_TRANSFER_SYNTAX_UID,
@@ -308,3 +311,59 @@ class TestDimseCommandSets:
                     seen.add(command_field)
         # The catalog must actually reach the normalized services it claims.
         assert {0x0100, 0x0110, 0x0120, 0x0130, 0x0140, 0x0150} & seen
+
+
+class TestForceAppendKeepsWhatWasThere:
+    """Switching a Dataset to raw mode must not empty it.
+
+    ``encode`` returns ``_raw_list`` alone once it exists, so seeding it empty
+    silently dropped every element added with ``/`` beforehand. A payload
+    meant to hide a malformed element inside a plausible object shipped as the
+    malformed element and nothing else — and a receiver rejects that long
+    before reaching the behaviour under test.
+    """
+
+    def _tags(self, blob):
+        tags, pos = [], 0
+        while pos + 8 <= len(blob):
+            group, element = struct.unpack_from('<HH', blob, pos)
+            length = struct.unpack_from('<H', blob, pos + 6)[0]
+            tags.append((group, element))
+            pos += 8 + length
+        return tags
+
+    def test_prior_elements_survive(self):
+        ds = Dataset() / Element(0x0008, 0x0016, 'UI', '1.2.840.10008.5.1.4.1.1.7')
+        ds = ds / Element(0x0010, 0x0010, 'PN', 'Doe^John')
+        before = ds.encode()
+        ds._force_append(Element(0x0002, 0x0003, 'UI', '1.2.3'))
+        after = ds.encode()
+
+        assert len(after) > len(before), 'force-append shrank the dataset'
+        assert self._tags(after) == [(0x0008, 0x0016), (0x0010, 0x0010),
+                                     (0x0002, 0x0003)]
+
+    def test_insertion_order_is_preserved(self):
+        ds = Dataset() / Element(0x0010, 0x0010, 'PN', 'A')
+        ds = ds / Element(0x0008, 0x0016, 'UI', '1.2.3')
+        ds._force_append(Element(0x0010, 0x0010, 'PN', 'B'))
+        # Added out of tag order on purpose: raw mode is for crafting exactly
+        # the byte order the caller asked for, including duplicates.
+        assert self._tags(ds.encode()) == [(0x0010, 0x0010), (0x0008, 0x0016),
+                                           (0x0010, 0x0010)]
+
+    def test_a_fresh_dataset_is_unaffected(self):
+        ds = Dataset()
+        ds._force_append(Element(0x0010, 0x0010, 'PN', 'A'))
+        ds._force_append(Element(0x0010, 0x0010, 'PN', 'B'))
+        assert self._tags(ds.encode()) == [(0x0010, 0x0010), (0x0010, 0x0010)]
+
+    def test_the_affected_payload_carries_a_storable_object(self):
+        """The traversal has to ride inside something a receiver will store."""
+        from c_scare.attacks import PathTraversalAttacks
+        result = next(r for r in PathTraversalAttacks.all()
+                      if 'file_meta_sop_uid' in r.name)
+        tags = self._tags(result.payload)
+        assert (0x0008, 0x0016) in tags, 'no SOP Class UID — not a storable object'
+        assert (0x0002, 0x0003) in tags, 'the file-meta element under test is gone'
+        assert result.metadata['traversal_payload'].encode() in result.payload

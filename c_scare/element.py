@@ -424,9 +424,18 @@ class Dataset:
             self._order.append(tag_int)
 
     def _force_append(self, elem: Element) -> None:
-        """Append element without dedup — for crafting malformed datasets."""
+        """Append element without dedup — for crafting malformed datasets.
+
+        Switching to raw mode carries the elements added so far across, in the
+        order they were added. ``encode`` returns ``_raw_list`` alone once it
+        exists, so seeding it empty silently dropped everything built with
+        ``/`` beforehand — a dataset meant to carry a malformed element inside
+        a plausible object shipped as the malformed element and nothing else,
+        and a receiver rejected it long before reaching the behaviour under
+        test.
+        """
         if self._raw_list is None:
-            self._raw_list = []
+            self._raw_list = [self._elements[tag] for tag in self._order]
         self._raw_list.append(elem)
 
     def __truediv__(self, other: Element) -> 'Dataset':
