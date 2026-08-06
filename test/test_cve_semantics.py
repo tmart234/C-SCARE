@@ -38,7 +38,7 @@ POLYGLOT_MAGIC = {
 
 # Zones that hold the second format's *body* somewhere a conforming DICOM
 # reader traverses without inspecting, rather than in the preamble.
-BURIED_ZONES = {"private_element", "element_padding", "trailing"}
+BURIED_ZONES = {"private_element", "element_padding", "trailing", "fragmented"}
 
 
 def by_cve(cve):
@@ -53,6 +53,36 @@ def buried():
     """Polyglots whose second-format body lives past the preamble."""
     return [r for r in by_cve("CVE-2019-11687")
             if r.metadata.get("zone") in BURIED_ZONES]
+
+
+def buried_pe():
+    """The buried polyglots that are specifically PE."""
+    return [r for r in buried() if r.metadata.get("polyglot") == "PE"]
+
+
+def foreign_body_offset(payload):
+    """Where the executable half says the rest of itself lives.
+
+    Each format answers with a different field, and that is the point: a
+    scanner has to know all three to follow any of them. PE hands over
+    ``e_lfanew``, ELF ``e_phoff``, Mach-O the ``fileoff`` of its first
+    ``LC_SEGMENT_64`` — which is buried behind the load-command walk rather
+    than at a fixed offset.
+    """
+    fmt = polyglot.executable_format(payload)
+    if fmt == "pe":
+        return struct.unpack("<I", payload[60:64])[0]
+    if fmt == "elf":
+        return struct.unpack("<Q", payload[32:40])[0]
+    if fmt == "macho":
+        pos = polyglot.MACHO_HEADER_LEN[64]
+        ncmds = struct.unpack("<I", payload[16:20])[0]
+        for _ in range(ncmds):
+            cmd, cmdsize = struct.unpack("<II", payload[pos:pos + 8])
+            if cmd == 0x19:  # LC_SEGMENT_64
+                return struct.unpack("<Q", payload[pos + 40:pos + 48])[0]
+            pos += cmdsize
+    return None
 
 
 class TestPolyglotsAreActuallyDualFormat:
@@ -85,7 +115,7 @@ class TestPolyglotsAreActuallyDualFormat:
         """Executable content must fit the preamble, not push DICM along."""
         assert result.payload.index(b"DICM") == 128
 
-    @pytest.mark.parametrize("result", buried(), ids=lambda r: r.name)
+    @pytest.mark.parametrize("result", buried_pe(), ids=lambda r: r.name)
     def test_e_lfanew_lands_on_a_real_pe_signature(self, result):
         """e_lfanew must jump out of the preamble *and hit something*.
 
@@ -107,30 +137,36 @@ class TestPolyglotsAreActuallyDualFormat:
 
     @pytest.mark.parametrize("result", buried(), ids=lambda r: r.name)
     def test_both_halves_validate(self, result):
-        """The dual-pipeline check: valid PE *and* valid DICOM, same bytes.
+        """The dual-pipeline check: valid executable *and* valid DICOM.
 
-        Either half failing collapses the test case. A broken PE half is a
-        DICOM file no scanner cares about; a broken DICOM half is an
+        Either half failing collapses the test case. A broken executable half
+        is a DICOM file no scanner cares about; a broken DICOM half is an
         executable no PACS accepts, and the storage path under test is never
-        exercised.
+        exercised. The executable half is dispatched on the magic at offset 0,
+        so an ELF payload is held to ELF's rules rather than to PE's.
         """
+        fmt = polyglot.executable_format(result.payload)
+        assert fmt is not None, "no executable magic at offset 0"
         assert polyglot.validate_polyglot(result.payload) == {
-            "pe": [], "dicom": []}
+            fmt: [], "dicom": []}
 
     @pytest.mark.parametrize("result", buried(), ids=lambda r: r.name)
-    def test_the_pe_body_sits_past_everything_dicom_parses(self, result):
+    def test_the_foreign_body_sits_past_everything_dicom_parses(self, result):
         """Each buried payload must really use a region no reader inspects.
 
         The preamble and File Meta group are what every reader — and every
         scanner worth the name — parses. These payloads exist to test what
         comes after: regions a conforming parser traverses on its way past,
-        which is only interesting if the PE image is genuinely out there.
+        which is only interesting if the second format's body is genuinely
+        out there. Each format points at its body with a different field, so
+        the check follows whichever one applies.
         """
-        e_lfanew = struct.unpack("<I", result.payload[60:64])[0]
+        body = foreign_body_offset(result.payload)
+        assert body is not None, "no relocation pointer found in the header"
         start = polyglot.dataset_offset(result.payload)
         assert start is not None, "File Meta group is not parseable"
-        assert e_lfanew >= start, (
-            f"e_lfanew={e_lfanew} lands inside the File Meta group "
+        assert body >= start, (
+            f"the body pointer {body} lands inside the File Meta group "
             f"(Data Set starts at {start}); nothing is hidden")
 
 
@@ -235,3 +271,110 @@ class TestCatalogWideInvariants:
                 unexplained.append(result.name)
         assert not unexplained, (
             f"unparseable with no bug_class to explain it: {unexplained}")
+
+
+class TestPart10Conformance:
+    """PS3.10 §7.1 is a precondition, not decoration.
+
+    A reader that cannot find (0002,0000) Group Length and (0002,0010)
+    Transfer Syntax UID does not know how to decode the Data Set and is
+    entitled to stop at the header. A payload that skips the File Meta group
+    therefore never reaches the parser it is aimed at, and the run records a
+    rejection that proves nothing about the bug under test.
+
+    Payloads whose *malformation is the header* are exempt, named one by one
+    below rather than waved through by ``bug_class`` — most payloads carry a
+    ``bug_class`` for a Data Set defect and still need a header a reader will
+    accept, or the Data Set is never reached.
+    """
+
+    # CVE-2026-3650 drives an allocation from a lying (0002,0000) Group
+    # Length; CVE-2026-5437 drives an out-of-bounds read from one. For these
+    # the malformed header is the reproduction, so conformance would remove
+    # the attack. Anything else added here needs the same justification.
+    HEADER_IS_THE_ATTACK = frozenset({
+        "cve_2026_3650_01_nonstandard_vr_huge_length",
+        "cve_2026_3650_02_unknown_vr_private_info",
+        "cve_2026_3650_03_un_vr_oversized_length",
+        "cve_2026_5437_01_grouplen_overdeclared",
+        "cve_2026_5437_02_element_length_past_eof",
+        "cve_2026_5437_03_length_arithmetic_overflow",
+        "cve_2026_5437_04_grouplen_underdeclared",
+    })
+
+    TYPE1 = [(0x0002, 0x0001), (0x0002, 0x0002), (0x0002, 0x0003),
+             (0x0002, 0x0010), (0x0002, 0x0012)]
+
+    PART10 = [r for r in ALL if len(r.payload) > 132
+              and r.payload[128:132] == b"DICM"]
+
+    def _meta(self, blob):
+        """(group_length_declared, {tag: value}, offset_after_group)."""
+        assert blob[132:138] == b"\x02\x00\x00\x00UL", "no (0002,0000) UL first"
+        declared = struct.unpack("<I", blob[140:144])[0]
+        pos, found = 144, {}
+        while pos + 8 <= len(blob):
+            group, element = struct.unpack("<HH", blob[pos:pos + 4])
+            if group != 0x0002:
+                break
+            vr = blob[pos + 4:pos + 6]
+            if vr in (b"OB", b"OW", b"UN", b"SQ", b"UT", b"UC", b"UR"):
+                length = struct.unpack("<I", blob[pos + 8:pos + 12])[0]
+                voff = pos + 12
+            else:
+                length = struct.unpack("<H", blob[pos + 6:pos + 8])[0]
+                voff = pos + 8
+            found[(group, element)] = blob[voff:voff + length]
+            pos = voff + length
+        return declared, found, pos
+
+    @pytest.mark.parametrize("result", PART10, ids=lambda r: r.name)
+    def test_file_meta_group_is_present_and_complete(self, result):
+        if result.name in self.HEADER_IS_THE_ATTACK:
+            pytest.skip("the malformed File Meta header is the reproduction")
+        _declared, found, _end = self._meta(result.payload)
+        missing = [f"({t[0]:04X},{t[1]:04X})" for t in self.TYPE1
+                   if t not in found]
+        assert not missing, f"missing Type 1 File Meta elements: {missing}"
+
+    @pytest.mark.parametrize("result", PART10, ids=lambda r: r.name)
+    def test_group_length_matches_the_group(self, result):
+        if result.name in self.HEADER_IS_THE_ATTACK:
+            pytest.skip("the malformed File Meta header is the reproduction")
+        declared, _found, end = self._meta(result.payload)
+        assert declared == end - 144, (
+            f"(0002,0000) declares {declared}, group is {end - 144} bytes")
+
+    @pytest.mark.parametrize("result", PART10, ids=lambda r: r.name)
+    def test_data_set_is_in_ascending_tag_order(self, result):
+        """PS3.5 §7.1. Descending order is grounds for rejection, and a
+        rejection at the header is a result that concludes nothing."""
+        if result.name in self.HEADER_IS_THE_ATTACK:
+            pytest.skip("the malformed File Meta header is the reproduction")
+        _declared, found, end = self._meta(result.payload)
+        ts = found.get((0x0002, 0x0010), b"").rstrip(b"\x00 ").decode()
+        if ts != "1.2.840.10008.1.2.1":
+            pytest.skip(f"data set is not Explicit VR LE ({ts})")
+
+        blob, pos, last = result.payload, end, None
+        while pos + 8 <= len(blob):
+            tag = struct.unpack("<HH", blob[pos:pos + 4])
+            vr = blob[pos + 4:pos + 6]
+            if not (vr.isalpha() and vr.isupper()):
+                break
+            if vr in (b"OB", b"OW", b"UN", b"SQ", b"UT", b"UC", b"UR", b"OF",
+                      b"OD", b"OL", b"OV"):
+                if pos + 12 > len(blob):
+                    break
+                length = struct.unpack("<I", blob[pos + 8:pos + 12])[0]
+                voff = pos + 12
+            else:
+                length = struct.unpack("<H", blob[pos + 6:pos + 8])[0]
+                voff = pos + 8
+            if length == 0xFFFFFFFF or voff + length > len(blob):
+                break
+            assert last is None or tag >= last, (
+                f"({tag[0]:04X},{tag[1]:04X}) follows "
+                f"({last[0]:04X},{last[1]:04X}) — Data Set descends")
+            last = tag
+            pos = voff + length

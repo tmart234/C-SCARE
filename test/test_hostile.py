@@ -413,14 +413,16 @@ class TestDeliveryRouting:
         )
         sent = {}
 
-        def fake_send_cstore(target, payload, sop_class, sop_inst,
-                             transfer_syntax=None, timeout=5.0,
-                             called_ae='TARGET', calling_ae='ATTACKER'):
+        def fake_send_cstore_outcome(target, payload, sop_class, sop_inst,
+                                     transfer_syntax=None, timeout=5.0,
+                                     called_ae='TARGET',
+                                     calling_ae='ATTACKER'):
             sent['args'] = (target, payload, sop_class, sop_inst,
                             transfer_syntax, timeout, called_ae, calling_ae)
-            return 0x0000
+            return runner.deliver.CStoreOutcome(0x0000, None)
 
-        monkeypatch.setattr(runner.deliver, 'send_cstore', fake_send_cstore)
+        monkeypatch.setattr(runner.deliver, 'send_cstore_outcome',
+                            fake_send_cstore_outcome)
         args = argparse.Namespace(delivery='auto', store_sop=None,
                                   store_transfer_syntax=None, mutate=None,
                                   ae_title='STORESCP', calling_ae='C-SCARE')
@@ -445,14 +447,16 @@ class TestDeliveryRouting:
 
         sent = {}
 
-        def fake_send_cstore(target, payload, sop_class, sop_inst,
-                             transfer_syntax=None, timeout=5.0,
-                             called_ae='TARGET', calling_ae='ATTACKER'):
+        def fake_send_cstore_outcome(target, payload, sop_class, sop_inst,
+                                     transfer_syntax=None, timeout=5.0,
+                                     called_ae='TARGET',
+                                     calling_ae='ATTACKER'):
             sent['args'] = (target, payload, sop_class, sop_inst,
                             transfer_syntax, timeout, called_ae, calling_ae)
-            return 0x0000
+            return runner.deliver.CStoreOutcome(0x0000, None)
 
-        monkeypatch.setattr(runner.deliver, 'send_cstore', fake_send_cstore)
+        monkeypatch.setattr(runner.deliver, 'send_cstore_outcome',
+                            fake_send_cstore_outcome)
         args = argparse.Namespace(
             delivery='auto', store_sop='1.2.840.10008.5.1.4.1.1.7',
             store_transfer_syntax='1.2.840.10008.1.2.1', mutate=None,
@@ -533,14 +537,16 @@ class TestDeliveryRouting:
 
         sent = {}
 
-        def fake_send_cstore(target, payload, sop_class, sop_inst,
-                             transfer_syntax=None, timeout=5.0,
-                             called_ae='TARGET', calling_ae='ATTACKER'):
+        def fake_send_cstore_outcome(target, payload, sop_class, sop_inst,
+                                     transfer_syntax=None, timeout=5.0,
+                                     called_ae='TARGET',
+                                     calling_ae='ATTACKER'):
             sent['args'] = (target, payload, sop_class, sop_inst,
                             transfer_syntax, timeout, called_ae, calling_ae)
-            return 0x0000
+            return runner.deliver.CStoreOutcome(0x0000, None)
 
-        monkeypatch.setattr(runner.deliver, 'send_cstore', fake_send_cstore)
+        monkeypatch.setattr(runner.deliver, 'send_cstore_outcome',
+                            fake_send_cstore_outcome)
         args = argparse.Namespace(
             store_sop='1.2.840.10008.5.1.4.1.1.7',
             store_transfer_syntax='1.2.840.10008.1.2.1',
@@ -563,14 +569,16 @@ class TestDeliveryRouting:
         cstore_file = self._write_cstore_file(tmp_path)
         sent = {}
 
-        def fake_send_cstore(target, payload, sop_class, sop_inst,
-                             transfer_syntax=None, timeout=5.0,
-                             called_ae='TARGET', calling_ae='ATTACKER'):
+        def fake_send_cstore_outcome(target, payload, sop_class, sop_inst,
+                                     transfer_syntax=None, timeout=5.0,
+                                     called_ae='TARGET',
+                                     calling_ae='ATTACKER'):
             sent['args'] = (target, payload, sop_class, sop_inst,
                             transfer_syntax, timeout, called_ae, calling_ae)
-            return 0x0000
+            return runner.deliver.CStoreOutcome(0x0000, None)
 
-        monkeypatch.setattr(runner.deliver, 'send_cstore', fake_send_cstore)
+        monkeypatch.setattr(runner.deliver, 'send_cstore_outcome',
+                            fake_send_cstore_outcome)
         args = argparse.Namespace(
             cstore_file=str(cstore_file), store_sop=None,
             store_transfer_syntax=None, ae_title='PACS',
@@ -594,14 +602,16 @@ class TestDeliveryRouting:
         cstore_file = self._write_cstore_file(tmp_path)
         sent = {}
 
-        def fake_send_cstore(target, payload, sop_class, sop_inst,
-                             transfer_syntax=None, timeout=5.0,
-                             called_ae='TARGET', calling_ae='ATTACKER'):
+        def fake_send_cstore_outcome(target, payload, sop_class, sop_inst,
+                                     transfer_syntax=None, timeout=5.0,
+                                     called_ae='TARGET',
+                                     calling_ae='ATTACKER'):
             sent['args'] = (target, payload, sop_class, sop_inst,
                             transfer_syntax, timeout, called_ae, calling_ae)
-            return 0xC000
+            return runner.deliver.CStoreOutcome(0xC000, None)
 
-        monkeypatch.setattr(runner.deliver, 'send_cstore', fake_send_cstore)
+        monkeypatch.setattr(runner.deliver, 'send_cstore_outcome',
+                            fake_send_cstore_outcome)
         args = argparse.Namespace(
             delivery='auto', cstore_file=str(cstore_file), store_sop=None,
             store_transfer_syntax=None, mutate=None, ae_title='PACS',
@@ -627,14 +637,16 @@ class TestDeliveryRouting:
         cstore_file = self._write_cstore_file(tmp_path)
         sent = {}
 
-        def fake_send_cstore(target, payload, sop_class, sop_inst,
-                             transfer_syntax=None, timeout=5.0,
-                             called_ae='TARGET', calling_ae='ATTACKER'):
+        def fake_send_cstore_outcome(target, payload, sop_class, sop_inst,
+                                     transfer_syntax=None, timeout=5.0,
+                                     called_ae='TARGET',
+                                     calling_ae='ATTACKER'):
             sent['args'] = (target, payload, sop_class, sop_inst,
                             transfer_syntax, timeout, called_ae, calling_ae)
-            return 0xC000
+            return runner.deliver.CStoreOutcome(0xC000, None)
 
-        monkeypatch.setattr(runner.deliver, 'send_cstore', fake_send_cstore)
+        monkeypatch.setattr(runner.deliver, 'send_cstore_outcome',
+                            fake_send_cstore_outcome)
         args = argparse.Namespace(
             delivery='auto', cstore_file=str(cstore_file), store_sop=None,
             store_transfer_syntax=None, mutate=None, ae_title='PACS',
@@ -663,14 +675,16 @@ class TestDeliveryRouting:
         cstore_file = self._write_cstore_file(tmp_path)
         sent = {}
 
-        def fake_send_cstore(target, payload, sop_class, sop_inst,
-                             transfer_syntax=None, timeout=5.0,
-                             called_ae='TARGET', calling_ae='ATTACKER'):
+        def fake_send_cstore_outcome(target, payload, sop_class, sop_inst,
+                                     transfer_syntax=None, timeout=5.0,
+                                     called_ae='TARGET',
+                                     calling_ae='ATTACKER'):
             sent['args'] = (target, payload, sop_class, sop_inst,
                             transfer_syntax, timeout, called_ae, calling_ae)
-            return 0xC000
+            return runner.deliver.CStoreOutcome(0xC000, None)
 
-        monkeypatch.setattr(runner.deliver, 'send_cstore', fake_send_cstore)
+        monkeypatch.setattr(runner.deliver, 'send_cstore_outcome',
+                            fake_send_cstore_outcome)
         args = argparse.Namespace(
             delivery='auto', cstore_file=str(cstore_file), store_sop=None,
             store_transfer_syntax=None, mutate=None, ae_title='PACS',
@@ -696,14 +710,16 @@ class TestDeliveryRouting:
         cstore_file = self._write_cstore_file(tmp_path)
         sent = {}
 
-        def fake_send_cstore(target, payload, sop_class, sop_inst,
-                             transfer_syntax=None, timeout=5.0,
-                             called_ae='TARGET', calling_ae='ATTACKER'):
+        def fake_send_cstore_outcome(target, payload, sop_class, sop_inst,
+                                     transfer_syntax=None, timeout=5.0,
+                                     called_ae='TARGET',
+                                     calling_ae='ATTACKER'):
             sent['args'] = (target, payload, sop_class, sop_inst,
                             transfer_syntax, timeout, called_ae, calling_ae)
-            return 0x0000
+            return runner.deliver.CStoreOutcome(0x0000, None)
 
-        monkeypatch.setattr(runner.deliver, 'send_cstore', fake_send_cstore)
+        monkeypatch.setattr(runner.deliver, 'send_cstore_outcome',
+                            fake_send_cstore_outcome)
         args = argparse.Namespace(
             delivery='auto', cstore_file=str(cstore_file), store_sop=None,
             store_transfer_syntax=None, mutate=None, ae_title='PACS',
@@ -733,14 +749,16 @@ class TestDeliveryRouting:
         cstore_file = self._write_cstore_file(tmp_path)
         sent = []
 
-        def fake_send_cstore(target, payload, sop_class, sop_inst,
-                             transfer_syntax=None, timeout=5.0,
-                             called_ae='TARGET', calling_ae='ATTACKER'):
+        def fake_send_cstore_outcome(target, payload, sop_class, sop_inst,
+                                     transfer_syntax=None, timeout=5.0,
+                                     called_ae='TARGET',
+                                     calling_ae='ATTACKER'):
             sent.append((target, payload, sop_class, sop_inst,
                          transfer_syntax, timeout, called_ae, calling_ae))
-            return 0x0000
+            return runner.deliver.CStoreOutcome(0x0000, None)
 
-        monkeypatch.setattr(runner.deliver, 'send_cstore', fake_send_cstore)
+        monkeypatch.setattr(runner.deliver, 'send_cstore_outcome',
+                            fake_send_cstore_outcome)
         args = argparse.Namespace(
             delivery='auto', cstore_file=str(cstore_file), store_sop=None,
             store_transfer_syntax=None, mutate=None, ae_title='PACS',
@@ -770,14 +788,16 @@ class TestDeliveryRouting:
         cstore_file = self._write_cstore_file(tmp_path)
         sent = {}
 
-        def fake_send_cstore(target, payload, sop_class, sop_inst,
-                             transfer_syntax=None, timeout=5.0,
-                             called_ae='TARGET', calling_ae='ATTACKER'):
+        def fake_send_cstore_outcome(target, payload, sop_class, sop_inst,
+                                     transfer_syntax=None, timeout=5.0,
+                                     called_ae='TARGET',
+                                     calling_ae='ATTACKER'):
             sent['args'] = (target, payload, sop_class, sop_inst,
                             transfer_syntax, timeout, called_ae, calling_ae)
-            return 0xC000
+            return runner.deliver.CStoreOutcome(0xC000, None)
 
-        monkeypatch.setattr(runner.deliver, 'send_cstore', fake_send_cstore)
+        monkeypatch.setattr(runner.deliver, 'send_cstore_outcome',
+                            fake_send_cstore_outcome)
         args = argparse.Namespace(
             delivery='auto', cstore_file=str(cstore_file), store_sop=None,
             store_transfer_syntax=None, mutate=None, ae_title='PACS',

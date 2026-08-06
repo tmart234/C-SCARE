@@ -112,14 +112,14 @@ against a `pynetdicom` SCP under DAST.
 
 | CVE | Component / function | Class | Vector |
 |-----|----------------------|-------|--------|
-| CVE-2019-11687 | DICOM Part-10 preamble + private Data Elements | executable polyglot (CWE-20) | **catalog** `cve_2019_11687_polyglot` (PE32/PE32+/ELF/Mach-O/shell/batch/TIFF across five safe zones) + **file-seed** polyglot family |
+| CVE-2019-11687 | DICOM Part-10 preamble + private Data Elements | executable polyglot (CWE-20) | **catalog** `cve_2019_11687_polyglot` (PE32/PE32+/ELF/Mach-O/shell/batch/TIFF across five safe zones, plus a fragmented and two entropy-shaped variants) + **file-seed** polyglot family |
 
 CVE-2019-11687 is a property of the file format, so it applies to dcm4che,
 pydicom, and DCMTK alike. The library-agnostic catalog (Parser / Protocol /
 Path-Traversal / etc.) also delivers against a `dcm4chee-arc-light` SCP under
 DAST.
 
-The catalog varies two things independently. *Which second format* the file
+The catalog varies four things independently. *Which second format* the file
 also claims to be decides whether a scanner's magic table fires at all.
 *Which safe zone* carries the foreign bytes decides whether the scanner ever
 reads them — `metadata['zone']` names the region, and `c_scare.polyglot`
@@ -133,11 +133,52 @@ enumerates all five in any Part-10 file:
 | Padding tail of a Data Element | value-specific | covered by the declared length, past where the value ends |
 | Space after the final Data Element | unbounded | never — Part-10 has no end marker, readers stop at the Data Set |
 
-The PE-carrying payloads are structurally complete on both sides —
-`polyglot.validate_polyglot` confirms a loader can walk every header while
-pydicom reads the same bytes as a Secondary Capture — and deliberately inert:
-zero-filled read-only section, no entry point. What they test is whether an
-importer or scanner *looks*, not whether a payload runs.
+*Whether the payload is contiguous* decides whether a signature written over
+a whole image can match it. `cve_2019_11687_11_fragmented_zones` cuts one PE
+along its own structural seams and puts the headers in a private element,
+section `.vend`'s data in an element's padding tail, and section `.tail`'s
+data past the final Data Element, with the patient elements in between.
+`PointerToRawData` was never required to point anywhere in particular, so the
+loader reassembles the image while no contiguous run of the file contains it.
+`metadata['fragments']` maps where each piece landed. The DOS stub is not one
+of them, and that is a finding rather than an omission: a PE section must
+start on a 512-byte `FileAlignment` boundary at or past `SizeOfHeaders`, and
+preamble bytes 0x40–0x7F satisfy neither.
+
+*What the bytes look like statistically* decides whether an entropy or
+histogram triage step separates the file from a benign one before anything
+parses it. Zero-filled sections are structurally correct and statistically
+unmistakable, so `metadata['fill']` selects a content profile —
+`polyglot.filler` offers `zeros` (0 bits/byte), `tabular` (~3), `strings`
+(~4.9) and `packed` (~7.9). Payloads 14 and 15 are the same construction as
+payload 1 with the low and high ends of that range, plus a conventional DOS
+stub message in place of 64 NULs.
+
+The three executable formats are built to their own rules rather than by
+transposing the PE construction, because they do not relocate the same things:
+
+| Format | Relocates | Pinned at offset 0 | Placement rule for the moved part |
+|--------|-----------|--------------------|-----------------------------------|
+| PE | headers, section table and all section data | 2-byte `MZ` magic, `e_lfanew` at 0x3C | `PointerToRawData` aligned to `FileAlignment` and at or past `SizeOfHeaders` |
+| ELF | program header table and segment contents (`e_phoff`) | the whole 64-byte `Elf64_Ehdr` — there is no `e_lfanew` equivalent | `p_offset ≡ p_vaddr (mod p_align)`: a congruence, not a boundary |
+| Mach-O | segment contents only (`fileoff`) | `mach_header_64` **and** all load commands, which must be contiguous behind it | segment `vmaddr`/`vmsize` aligned to the architecture page: 16 KiB on arm64, 4 KiB on x86-64 |
+
+Two consequences are worth stating because they bound what the payloads prove.
+A preamble-resident Mach-O gets `128 − 32 = 96` bytes of load-command room —
+exactly one section-less `LC_SEGMENT_64` at 72 bytes, since a single
+`section_64` adds 80 — so the Mach-O payload carries all the structure the
+format permits there and no more. And arm64 macOS requires a valid code
+signature before `execve` will touch an image, which cannot be synthesised
+inertly; that payload therefore tests whether a scanner *recognises* an
+embedded Mach-O, not whether the host would load one.
+
+The payloads are structurally complete on both sides — `validate_polyglot`
+dispatches on the magic at offset 0 and confirms a loader can walk every
+header (`validate_pe`, `validate_elf`, `validate_macho`) while pydicom reads
+the same bytes as a Secondary Capture — and deliberately inert: read-only
+sections carrying data rather than code, no entry point, no `PF_X`, no
+`VM_PROT_EXECUTE`. What they test is whether an importer or scanner *looks*,
+not whether a payload runs.
 
 ## Logic / URI
 
