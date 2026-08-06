@@ -38,7 +38,7 @@ POLYGLOT_MAGIC = {
 
 # Zones that hold the second format's *body* somewhere a conforming DICOM
 # reader traverses without inspecting, rather than in the preamble.
-BURIED_ZONES = {"private_element", "element_padding", "trailing"}
+BURIED_ZONES = {"private_element", "element_padding", "trailing", "fragmented"}
 
 
 def by_cve(cve):
@@ -53,6 +53,36 @@ def buried():
     """Polyglots whose second-format body lives past the preamble."""
     return [r for r in by_cve("CVE-2019-11687")
             if r.metadata.get("zone") in BURIED_ZONES]
+
+
+def buried_pe():
+    """The buried polyglots that are specifically PE."""
+    return [r for r in buried() if r.metadata.get("polyglot") == "PE"]
+
+
+def foreign_body_offset(payload):
+    """Where the executable half says the rest of itself lives.
+
+    Each format answers with a different field, and that is the point: a
+    scanner has to know all three to follow any of them. PE hands over
+    ``e_lfanew``, ELF ``e_phoff``, Mach-O the ``fileoff`` of its first
+    ``LC_SEGMENT_64`` — which is buried behind the load-command walk rather
+    than at a fixed offset.
+    """
+    fmt = polyglot.executable_format(payload)
+    if fmt == "pe":
+        return struct.unpack("<I", payload[60:64])[0]
+    if fmt == "elf":
+        return struct.unpack("<Q", payload[32:40])[0]
+    if fmt == "macho":
+        pos = polyglot.MACHO_HEADER_LEN[64]
+        ncmds = struct.unpack("<I", payload[16:20])[0]
+        for _ in range(ncmds):
+            cmd, cmdsize = struct.unpack("<II", payload[pos:pos + 8])
+            if cmd == 0x19:  # LC_SEGMENT_64
+                return struct.unpack("<Q", payload[pos + 40:pos + 48])[0]
+            pos += cmdsize
+    return None
 
 
 class TestPolyglotsAreActuallyDualFormat:
@@ -85,7 +115,7 @@ class TestPolyglotsAreActuallyDualFormat:
         """Executable content must fit the preamble, not push DICM along."""
         assert result.payload.index(b"DICM") == 128
 
-    @pytest.mark.parametrize("result", buried(), ids=lambda r: r.name)
+    @pytest.mark.parametrize("result", buried_pe(), ids=lambda r: r.name)
     def test_e_lfanew_lands_on_a_real_pe_signature(self, result):
         """e_lfanew must jump out of the preamble *and hit something*.
 
@@ -107,30 +137,36 @@ class TestPolyglotsAreActuallyDualFormat:
 
     @pytest.mark.parametrize("result", buried(), ids=lambda r: r.name)
     def test_both_halves_validate(self, result):
-        """The dual-pipeline check: valid PE *and* valid DICOM, same bytes.
+        """The dual-pipeline check: valid executable *and* valid DICOM.
 
-        Either half failing collapses the test case. A broken PE half is a
-        DICOM file no scanner cares about; a broken DICOM half is an
+        Either half failing collapses the test case. A broken executable half
+        is a DICOM file no scanner cares about; a broken DICOM half is an
         executable no PACS accepts, and the storage path under test is never
-        exercised.
+        exercised. The executable half is dispatched on the magic at offset 0,
+        so an ELF payload is held to ELF's rules rather than to PE's.
         """
+        fmt = polyglot.executable_format(result.payload)
+        assert fmt is not None, "no executable magic at offset 0"
         assert polyglot.validate_polyglot(result.payload) == {
-            "pe": [], "dicom": []}
+            fmt: [], "dicom": []}
 
     @pytest.mark.parametrize("result", buried(), ids=lambda r: r.name)
-    def test_the_pe_body_sits_past_everything_dicom_parses(self, result):
+    def test_the_foreign_body_sits_past_everything_dicom_parses(self, result):
         """Each buried payload must really use a region no reader inspects.
 
         The preamble and File Meta group are what every reader — and every
         scanner worth the name — parses. These payloads exist to test what
         comes after: regions a conforming parser traverses on its way past,
-        which is only interesting if the PE image is genuinely out there.
+        which is only interesting if the second format's body is genuinely
+        out there. Each format points at its body with a different field, so
+        the check follows whichever one applies.
         """
-        e_lfanew = struct.unpack("<I", result.payload[60:64])[0]
+        body = foreign_body_offset(result.payload)
+        assert body is not None, "no relocation pointer found in the header"
         start = polyglot.dataset_offset(result.payload)
         assert start is not None, "File Meta group is not parseable"
-        assert e_lfanew >= start, (
-            f"e_lfanew={e_lfanew} lands inside the File Meta group "
+        assert body >= start, (
+            f"the body pointer {body} lands inside the File Meta group "
             f"(Data Set starts at {start}); nothing is hidden")
 
 

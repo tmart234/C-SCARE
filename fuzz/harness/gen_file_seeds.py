@@ -52,6 +52,7 @@ from c_scare.corruptor import Corruptor  # noqa: E402
 from c_scare.element import Dataset as WireDataset  # noqa: E402
 from c_scare.element import Element, Sequence as WireSequence  # noqa: E402
 from c_scare.file import DicomFile  # noqa: E402
+from c_scare.polyglot import elf_header  # noqa: E402
 from c_scare.profiles import load_profile, resolve_pydicom_uid  # noqa: E402
 
 DEFAULT_OUT_DIR = REPO_ROOT / "fuzz" / "seeds" / "file"
@@ -132,8 +133,15 @@ def _dos_preamble(e_lfanew: int) -> bytes:
 
 
 def _elf_preamble() -> bytes:
-    """An ELF64 identification header padded into the preamble (ELFDICOM)."""
-    return _fit_preamble(b"\x7fELF" + b"\x02\x01\x01\x00")  # 64-bit, LE, v1
+    """A complete Elf64_Ehdr occupying the preamble (ELFDICOM).
+
+    The header is 64 bytes and fits the preamble's first half exactly, so the
+    seed can carry the whole thing rather than an e_ident prefix — an ELF
+    reader gets past the magic and into e_phoff, e_shoff and the size fields,
+    which is where the parsing a fuzzer wants to reach actually starts. Inert:
+    entry point 0, no program headers, no section headers.
+    """
+    return _fit_preamble(elf_header(ph_offset=0, ph_count=0, bits=64))
 
 
 def _script_preamble() -> bytes:
