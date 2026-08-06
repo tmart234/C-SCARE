@@ -314,6 +314,20 @@ class ProtocolMonitor(BaseMonitor):
                 detected=False,
                 description='Dry run — payload written to disk, not sent',
             )
+        if self._error and self._error.startswith('undelivered:'):
+            # The payload never reached the target's parser — a rejected
+            # association, an unnegotiated SOP class, a missing dependency.
+            # Reporting the absent response as a timeout would turn every
+            # payload in a misconfigured run into a finding against a target
+            # that was never touched.
+            reason = self._error.split(':', 1)[1]
+            return MonitorReport(
+                detected=False,
+                finding_type='delivery:not_delivered',
+                description=f'Not delivered ({reason}) — no conclusion about '
+                            'the target',
+                evidence=reason,
+            )
         if self._error == 'cstore_status':
             status = None
             if self._response and len(self._response) >= 2:

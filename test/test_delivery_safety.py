@@ -367,3 +367,166 @@ class TestNegotiatedTransferSyntaxMismatch:
         names = [r.name for r in LogicAttacks.all()]
         assert 'transfer_syntax_mismatch' in names
         assert 'negotiated_transfer_syntax_mismatch' in names
+
+
+class TestUndeliveredIsNotAFinding:
+    """A payload that never reached the target concludes nothing about it.
+
+    Every one of these used to return a bare ``None`` status, which the runner
+    reported as ``network:timeout`` — a detection. So pointing the tool at an
+    SCP that declines the association, or running it on a host without scapy,
+    produced a page of findings against a target that was never touched. The
+    inverse is just as bad: a genuine silence after the object was sent has to
+    stay a finding.
+    """
+
+    def _outcome_result(self, reason, status=None):
+        """Run one C-STORE delivery whose outcome is fixed, and monitor it."""
+        from c_scare import deliver as deliver_mod
+        from c_scare.monitor import ProtocolMonitor
+
+        result = AttackResult(
+            name='probe', category='cve', payload=b'\x00' * 8,
+            description='d', expected_behavior='e',
+            metadata={'delivery_hint': 'cstore'})
+        args = argparse.Namespace(
+            delivery='cstore', mutate=None, ae_title='PACS', calling_ae='SCU',
+            dry_run=None, max_associations=None, cstore_file=None,
+            store_sop=None, store_transfer_syntax=None)
+
+        original = runner.deliver.send_cstore_outcome
+        runner.deliver.send_cstore_outcome = (
+            lambda *a, **k: deliver_mod.CStoreOutcome(status, reason))
+        try:
+            _response, error = runner._deliver(
+                args, result, ('127.0.0.1', 11112), 1.0)
+        finally:
+            runner.deliver.send_cstore_outcome = original
+
+        monitor = ProtocolMonitor()
+        monitor.pre_test(0)
+        monitor.set_response(None, error=error)
+        return result, error, monitor.post_test()
+
+    @pytest.mark.parametrize('reason', ['rejected', 'no_context',
+                                        'unavailable:scapy', 'error:ValueError'])
+    def test_undelivered_reasons_are_not_detections(self, reason):
+        result, error, report = self._outcome_result(reason)
+        assert error == f'undelivered:{reason}'
+        assert report.detected is False, (
+            f'{reason} reported as a finding against a target it never reached')
+        assert report.finding_type == 'delivery:not_delivered'
+        assert result.metadata['delivery_error'] == reason
+
+    @pytest.mark.parametrize('reason,expected', [
+        ('refused', 'network:connection_refused'),
+        ('reset', 'network:connection_reset'),
+        ('timeout', 'network:timeout'),
+        ('no_status', 'network:timeout'),
+    ])
+    def test_target_behaviour_stays_a_finding(self, reason, expected):
+        """The fix must not silence the failures that are the target's doing."""
+        _result, _error, report = self._outcome_result(reason)
+        assert report.detected is True
+        assert report.finding_type == expected
+
+    def test_a_real_status_still_reports_the_status(self):
+        result, error, report = self._outcome_result(None, status=0x0000)
+        assert error == 'cstore_status'
+        assert result.metadata['cstore_status'] == 0x0000
+        assert 'delivery_error' not in result.metadata
+
+    def test_undelivered_payloads_are_counted_in_the_summary(self, capsys):
+        """Silence is the failure mode: an undelivered run must say so.
+
+        Without this the run prints a clean report — no detections is exactly
+        what a target that handled everything correctly looks like.
+        """
+        from c_scare.monitor import MonitorReport
+
+        results = []
+        for i in range(3):
+            r = AttackResult(name=f'p{i}', category='cve', payload=b'x',
+                             description='d', expected_behavior='e',
+                             metadata={'delivery_error': 'rejected'})
+            r.monitor_reports.append(MonitorReport(
+                detected=False, finding_type='delivery:not_delivered',
+                description='Not delivered (rejected)'))
+            results.append(r)
+        results.append(AttackResult(name='ok', category='cve', payload=b'x',
+                                    description='d', expected_behavior='e'))
+
+        runner._print_undelivered(results)
+        out = capsys.readouterr().out
+        assert '3 of 4 payloads were never delivered' in out
+        assert 'rejected ×3' in out
+
+    def test_a_fully_delivered_run_prints_no_warning(self, capsys):
+        runner._print_undelivered([
+            AttackResult(name='ok', category='cve', payload=b'x',
+                         description='d', expected_behavior='e')])
+        assert capsys.readouterr().out == ''
+
+
+class TestCStoreOutcomeReasons:
+    """``send_cstore_outcome`` has to name the cause, not just the symptom."""
+
+    def test_missing_scapy_is_reported_as_unavailable(self, monkeypatch):
+        import builtins
+        real_import = builtins.__import__
+
+        def no_client(name, *a, **k):
+            if 'client' in name:
+                raise ImportError('boom', name='scapy')
+            return real_import(name, *a, **k)
+
+        monkeypatch.setattr(builtins, '__import__', no_client)
+        outcome = deliver.send_cstore_outcome(
+            ('127.0.0.1', 1), b'x', '1.2.840.10008.5.1.4.1.1.7')
+        assert outcome.status is None
+        assert outcome.reason.startswith('unavailable')
+        assert outcome.delivered is False
+
+    def test_connection_refused_is_not_read_as_an_association_rejection(self):
+        """Nothing listens on port 1, so this drives the real transport path.
+
+        associate() catches the ConnectionRefusedError and returns False, the
+        same as an A-ASSOCIATE-RJ. Reporting a dead port as "the SCP refused
+        the association" sends an operator hunting for an AE title problem.
+        """
+        outcome = deliver.send_cstore_outcome(
+            ('127.0.0.1', 1), b'x', '1.2.840.10008.5.1.4.1.1.7', timeout=1.0)
+        assert outcome.status is None
+        assert outcome.reason == 'refused'
+
+    @pytest.mark.parametrize('last_reject,last_error,expected', [
+        ({'result': 1, 'source': 1, 'reason': 7}, None, 'rejected'),
+        (None, 'ConnectionRefusedError: [Errno 111]', 'refused'),
+        (None, 'ConnectionResetError: [Errno 104]', 'reset'),
+        (None, 'no response to A-ASSOCIATE-RQ (timeout or closed)', 'timeout'),
+        (None, 'TimeoutError: timed out', 'timeout'),
+        (None, 'OSError: [Errno 113] No route to host', 'unreachable:OSError'),
+        (None, None, 'rejected'),
+    ])
+    def test_associate_failure_is_attributed_to_its_cause(
+            self, last_reject, last_error, expected):
+        """associate() returns one False for four outcomes; recover which."""
+        session = argparse.Namespace(last_reject=last_reject,
+                                     last_error=last_error)
+        assert deliver._associate_failure_reason(session) == expected
+
+    def test_send_cstore_keeps_its_status_only_contract(self, monkeypatch):
+        """The published signature must not change under callers."""
+        monkeypatch.setattr(
+            deliver, 'send_cstore_outcome',
+            lambda *a, **k: deliver.CStoreOutcome(0xA700, None))
+        assert deliver.send_cstore(
+            ('127.0.0.1', 11112), b'x', '1.2.3') == 0xA700
+
+    def test_delivered_flag_splits_the_reasons(self):
+        for reason in ('refused', 'reset', 'timeout', 'no_status'):
+            assert deliver.CStoreOutcome(None, reason).delivered is True
+        for reason in ('rejected', 'no_context', 'unavailable:scapy',
+                       'error:ValueError'):
+            assert deliver.CStoreOutcome(None, reason).delivered is False
+        assert deliver.CStoreOutcome(0x0000, None).delivered is True

@@ -804,23 +804,66 @@ def _walk_explicit_vr_le(data: bytes, start: int):
     an element. A DICOM reader stops there too, which is precisely why the
     region past that point is a safe zone.
     """
+    for element in _scan_dataset(data, start).elements:
+        yield element
+
+
+# Why a Data Set walk stopped. The distinction the trailing zone depends on is
+# whether the walker ran out of *Data Set* or ran out of *ability to follow
+# it*: bytes that stop decoding as elements are past the end of the Data Set
+# and are a safe zone, while a sequence or an undefined length is a real
+# element whose contents a reader parses and an analyzer must not claim.
+_STOP_EXHAUSTED = 'exhausted'            # consumed every byte in the file
+_STOP_END_OF_DATASET = 'end_of_dataset'  # the next bytes are not an element
+_STOP_UNFOLLOWABLE = 'unfollowable'      # an element this walker cannot traverse
+
+
+@dataclass
+class _Scan:
+    """Result of walking a Data Set: what was read, where it stopped, and why."""
+    elements: List[tuple]
+    end: int
+    stop: str
+
+
+def _scan_dataset(data: bytes, start: int) -> _Scan:
+    """Walk top-level Explicit VR LE elements from ``start``.
+
+    Records the stop reason rather than just stopping, because the caller
+    cannot otherwise tell the two failure modes apart - and they mean opposite
+    things about the bytes that follow.
+    """
+    elements: List[tuple] = []
     pos = start
-    while pos + 8 <= len(data):
+    while True:
+        if pos >= len(data):
+            return _Scan(elements, pos, _STOP_EXHAUSTED)
+        if pos + 8 > len(data):
+            return _Scan(elements, pos, _STOP_END_OF_DATASET)
         group, element = struct.unpack('<HH', data[pos:pos + 4])
         vr = data[pos + 4:pos + 6].decode('ascii', errors='replace')
-        if vr == 'SQ' or vr not in _KNOWN_VRS:
-            return
+        if vr not in _KNOWN_VRS:
+            return _Scan(elements, pos, _STOP_END_OF_DATASET)
+        if vr == 'SQ':
+            # A sequence decodes cleanly; this walker just does not descend
+            # into it. Its items are Data Set either way.
+            return _Scan(elements, pos, _STOP_UNFOLLOWABLE)
         if VR.uses_long_length(vr):
             if pos + 12 > len(data):
-                return
+                return _Scan(elements, pos, _STOP_END_OF_DATASET)
             length = struct.unpack('<I', data[pos + 8:pos + 12])[0]
             value_offset = pos + 12
         else:
             length = struct.unpack('<H', data[pos + 6:pos + 8])[0]
             value_offset = pos + 8
-        if length == 0xFFFFFFFF or value_offset + length > len(data):
-            return
-        yield (group, element), vr, value_offset, length
+        if length == 0xFFFFFFFF:
+            # Undefined length: encapsulated Pixel Data or a nested sequence.
+            # The element is real and its value is parsed, so everything from
+            # here on belongs to the Data Set.
+            return _Scan(elements, pos, _STOP_UNFOLLOWABLE)
+        if value_offset + length > len(data):
+            return _Scan(elements, pos, _STOP_END_OF_DATASET)
+        elements.append(((group, element), vr, value_offset, length))
         pos = value_offset + length
 
 
@@ -836,6 +879,14 @@ def enumerate_safe_zones(data: bytes) -> List[SafeZone]:
     any other transfer syntax, or once a sequence or undefined length is
     reached, only the zones established up to that point are returned - the
     preamble zones always are, since they precede any encoding choice.
+
+    The trailing zone in particular is only reported when the Data Set really
+    ended. A walk that stops on a sequence or on encapsulated Pixel Data has
+    stopped on a *parsed* element, and everything after it is Data Set the
+    walker cannot follow rather than slack no reader reaches. Claiming it
+    would tell a defender sizing the embedding surface that parsed content is
+    unreachable - and since a clinical image almost always carries a sequence
+    or compressed pixel data, it would say so on nearly every real file.
     """
     zones: List[SafeZone] = []
     if len(data) < PREAMBLE_LEN + 4 or data[PREAMBLE_LEN:PREAMBLE_LEN + 4] != b'DICM':
@@ -867,9 +918,8 @@ def enumerate_safe_zones(data: bytes) -> List[SafeZone]:
     if _transfer_syntax(data) != EXPLICIT_VR_LE:
         return zones
 
-    end_of_dataset = start
-    for tag, vr, value_offset, length in _walk_explicit_vr_le(data, start):
-        end_of_dataset = value_offset + length
+    scan = _scan_dataset(data, start)
+    for tag, vr, value_offset, length in scan.elements:
         value = data[value_offset:value_offset + length]
         content = value.rstrip(b'\x00 ')
         pad = length - len(content)
@@ -881,10 +931,16 @@ def enumerate_safe_zones(data: bytes) -> List[SafeZone]:
                      'the declared length covers it but the value ends before '
                      'it, so a reader consumes it without looking at it'))
 
+    if scan.stop == _STOP_UNFOLLOWABLE:
+        # Stopped on a real element - a sequence or an undefined length. The
+        # rest of the file is Data Set this walker cannot follow, not slack
+        # past the end of it, so there is no trailing zone to report here.
+        return zones
+
     zones.append(SafeZone(
-        kind='trailing', offset=end_of_dataset,
-        length=len(data) - end_of_dataset,
-        usable=len(data) - end_of_dataset,
+        kind='trailing', offset=scan.end,
+        length=len(data) - scan.end,
+        usable=len(data) - scan.end,
         note='bytes after the final Data Element; readers stop at the end of '
              'the Data Set and never reach them'))
     return zones

@@ -71,6 +71,22 @@ __all__ = ['main', 'run_command', 'write_sarif']
 
 SANITIZER_FLUSH_DELAY = 0.3
 
+# What each C-STORE failure reason means for an operator staring at a red
+# smoke test. Every one of these used to print as "association/C-STORE
+# failed", which names the symptom and not one of the causes.
+_CSTORE_SMOKE_HINTS = {
+    'unavailable': 'scapy is not installed — no payload was sent',
+    'rejected': 'the SCP sent an A-ASSOCIATE-RJ (AE title? auth?)',
+    'unreachable': 'the TCP connection could not be made — wrong host/port?',
+    'no_context': 'the SCP accepted the association but not the SOP class / '
+                  'transfer syntax (try --store-sop / --store-transfer-syntax)',
+    'refused': 'connection refused — is the SCP listening?',
+    'reset': 'the SCP reset the connection mid-exchange',
+    'timeout': 'the SCP did not answer within the timeout',
+    'no_status': 'the object was sent but no C-STORE-RSP came back',
+    'error': 'an unexpected error in the delivery path',
+}
+
 
 def _timestamp_from_ns(value: int) -> str:
     return dt.datetime.fromtimestamp(value / 1_000_000_000).astimezone().isoformat(
@@ -592,20 +608,26 @@ def _run_cstore_smoke(args, target) -> int:
     print(f"  Transfer Syntax: {transfer_syntax}")
     print(f"  Called AE: {getattr(args, 'ae_title', 'TARGET')}")
     print(f"  Calling AE: {getattr(args, 'calling_ae', 'ATTACKER')}")
-    status = deliver.send_cstore(
+    outcome = deliver.send_cstore_outcome(
         target, payload, sop_class, sop_instance,
         transfer_syntax=transfer_syntax,
         called_ae=getattr(args, 'ae_title', 'TARGET'),
         calling_ae=getattr(args, 'calling_ae', 'ATTACKER'),
         timeout=getattr(args, 'timeout', 5.0),
     )
-    if status == 0x0000:
+    if outcome.status == 0x0000:
         print("C-STORE smoke: PASS status=0x0000")
         return 0
-    if status is None:
-        print("C-STORE smoke: FAIL association/C-STORE failed")
-    else:
-        print(f"C-STORE smoke: FAIL status=0x{status:04X}")
+    if outcome.status is not None:
+        print(f"C-STORE smoke: FAIL status=0x{outcome.status:04X}")
+        return 1
+    # This check exists to tell "the SCP rejected an attack" from "the SCP
+    # stopped accepting anything", so naming the reason is the whole job — a
+    # bare "association/C-STORE failed" leaves the operator with the same
+    # question they ran the smoke test to answer.
+    hint = _CSTORE_SMOKE_HINTS.get(str(outcome.reason).split(':')[0],
+                                   f'({outcome.reason})')
+    print(f"C-STORE smoke: FAIL {hint}")
     return 1
 
 
@@ -793,17 +815,25 @@ def _deliver(args, result: AttackResult, target, timeout: float):
             if getattr(args, 'dry_run', None):
                 _dry_run_write(args, result, kind, [cstore_payload])
                 return None, 'dry_run'
-            status = deliver.send_cstore(
+            outcome = deliver.send_cstore_outcome(
                 target, cstore_payload, sop_class, sop_inst,
                 transfer_syntax=transfer_syntax,
                 called_ae=getattr(args, 'ae_title', 'TARGET'),
                 calling_ae=getattr(args, 'calling_ae', 'ATTACKER'),
                 timeout=timeout)
+            status = outcome.status
             result.metadata['cstore_status'] = status
-            # A None status means association/C-STORE failed (no parse reached
-            # OR the server died); surface it to ProtocolMonitor as a timeout.
             if status is None:
-                return None, 'timeout'
+                result.metadata['delivery_error'] = outcome.reason
+                # A payload that never reached the target's parser supports no
+                # conclusion about the target, so it is reported as undelivered
+                # rather than as an absent response. Reasons that *are* target
+                # behaviour (refused, reset, silence after the object was sent)
+                # keep their existing ProtocolMonitor signals.
+                if not outcome.delivered:
+                    return None, f'undelivered:{outcome.reason}'
+                reason = str(outcome.reason).split(':')[0]
+                return None, reason if reason in ('refused', 'reset') else 'timeout'
             return bytes([(status >> 8) & 0xFF, status & 0xFF]), 'cstore_status'
         payload = _render_association_ae_titles(payload, args, result)
         if getattr(args, 'dry_run', None):
@@ -1334,6 +1364,30 @@ def _maybe_deliver(args, result: AttackResult, index: int):
     _run_monitored_test(args, result, target, args.timeout)
 
 
+def _print_undelivered(results: list) -> None:
+    """Warn when payloads never reached the target.
+
+    An undelivered payload produces no detection, which is shaped exactly like
+    a payload the target handled correctly. Without this line a run against a
+    misconfigured AE title, an unsupported SOP class or a host with no scapy
+    prints a clean report for work it never did.
+    """
+    reasons = {}
+    for result in results:
+        if any(report.finding_type == 'delivery:not_delivered'
+               for report in result.monitor_reports):
+            reason = result.metadata.get('delivery_error') or 'unknown'
+            reasons[reason] = reasons.get(reason, 0) + 1
+    if not reasons:
+        return
+    total = sum(reasons.values())
+    detail = ', '.join(f'{reason} ×{count}'
+                       for reason, count in sorted(reasons.items()))
+    print(f"WARNING: {total} of {len(results)} payloads were never delivered "
+          f"({detail}).")
+    print("         Those tests concluded nothing about the target.")
+
+
 def _run_catalog(args, catalog, label: str, note: Optional[str] = None) -> int:
     """Run one static attack catalog: deliver each payload to a monitored live
     target, print results, collect findings, and optionally write the payloads
@@ -1358,6 +1412,7 @@ def _run_catalog(args, catalog, label: str, note: Optional[str] = None) -> int:
             print(f"FAIL {result.name}: {e}")
 
     print(f"\nTotal {label.lower()} tests: {len(results)}")
+    _print_undelivered(results)
     if note:
         print(note)
     _collect_results(args, results)

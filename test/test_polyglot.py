@@ -261,6 +261,99 @@ class TestSafeZoneEnumeration:
         assert enumerate_safe_zones(b"not a dicom file" * 20) == []
 
 
+class TestTrailingZoneIsNotClaimedOverParsedContent:
+    """The trailing zone must mean "past the Data Set", not "past the walker".
+
+    The walk stops at a sequence or an undefined length because it does not
+    descend into them, not because the Data Set ended. Reporting the remainder
+    as trailing slack told a defender that parsed content was unreachable —
+    and since a clinical image nearly always carries a sequence or compressed
+    pixel data, it said so on nearly every real file.
+    """
+
+    def _file_ending_with(self, element_bytes):
+        from c_scare.attacks import CVEAttacks
+        part10 = CVEAttacks._polyglot_file(b"\x00" * PREAMBLE_LEN)
+        part10.dataset = CVEAttacks._polyglot_body() + element_bytes
+        return part10.encode()
+
+    @pytest.fixture
+    def with_encapsulated_pixel_data(self):
+        from c_scare.element import Element
+        from c_scare.pixel import EncapsulatedPixelData
+        epd = EncapsulatedPixelData()
+        epd.add_fragment(b"\xff\xd8\xff\xe0JFIF\xff\xd9")
+        return self._file_ending_with(Element.raw(
+            tag=0x7FE00010, vr="OB", value=epd.encode(),
+            length=0xFFFFFFFF).encode(implicit_vr=False, little_endian=True))
+
+    @pytest.fixture
+    def with_sequence(self):
+        from c_scare.element import Dataset, Element, Sequence
+        seq = Sequence([Dataset([Element(0x0008, 0x0100, "SH", "CODE1")])])
+        return self._file_ending_with(Element.raw(
+            tag=0x00081110, vr="SQ", value=seq.encode(),
+            length=0xFFFFFFFF).encode(implicit_vr=False, little_endian=True))
+
+    def test_encapsulated_pixel_data_is_not_reported_as_trailing(
+            self, with_encapsulated_pixel_data):
+        kinds = [z.kind for z in
+                 enumerate_safe_zones(with_encapsulated_pixel_data)]
+        assert "trailing" not in kinds, (
+            "encapsulated Pixel Data reported as bytes readers never reach")
+
+    def test_a_sequence_is_not_reported_as_trailing(self, with_sequence):
+        kinds = [z.kind for z in enumerate_safe_zones(with_sequence)]
+        assert "trailing" not in kinds, (
+            "a sequence reported as bytes readers never reach")
+
+    @pytest.mark.parametrize("fixture_name",
+                             ["with_encapsulated_pixel_data", "with_sequence"])
+    def test_no_zone_overlaps_the_unfollowable_element(self, fixture_name,
+                                                       request):
+        """Nothing reported may start at or past where the walk gave up.
+
+        Stronger than the two checks above: it fails for any zone kind that
+        starts claiming bytes the walker never classified, not just trailing.
+        """
+        data = request.getfixturevalue(fixture_name)
+        scan = polyglot._scan_dataset(data, polyglot.dataset_offset(data))
+        assert scan.stop == polyglot._STOP_UNFOLLOWABLE
+        for zone in enumerate_safe_zones(data):
+            assert zone.offset < scan.end or zone.length == 0, (
+                f"{zone.kind} at {zone.offset} claims bytes past the point the "
+                f"walk stopped ({scan.end})")
+
+    def test_genuinely_appended_bytes_are_still_reported(self):
+        """The fix must not cost the real case: junk after a flat Data Set."""
+        from c_scare.attacks import CVEAttacks
+        base = CVEAttacks._polyglot_part10(b"\x00" * PREAMBLE_LEN)
+        appended = base + b"\xde\xad\xbe\xef" * 8
+        [zone] = [z for z in enumerate_safe_zones(appended)
+                  if z.kind == "trailing"]
+        assert (zone.offset, zone.length) == (len(base), 32)
+
+    def test_a_data_set_ending_at_eof_reports_an_empty_trailing_zone(self):
+        """Exhausting the file is a real answer: zero bytes of slack."""
+        from c_scare.attacks import CVEAttacks
+        base = CVEAttacks._polyglot_part10(b"\x00" * PREAMBLE_LEN)
+        [zone] = [z for z in enumerate_safe_zones(base) if z.kind == "trailing"]
+        assert (zone.offset, zone.length) == (len(base), 0)
+
+    def test_scan_distinguishes_its_two_stop_reasons(self, with_sequence):
+        """The distinction the whole fix rests on, asserted directly."""
+        from c_scare.attacks import CVEAttacks
+        flat = CVEAttacks._polyglot_part10(b"\x00" * PREAMBLE_LEN)
+        assert polyglot._scan_dataset(
+            flat, polyglot.dataset_offset(flat)).stop == polyglot._STOP_EXHAUSTED
+        assert polyglot._scan_dataset(
+            flat + b"\xde\xad\xbe\xef",
+            polyglot.dataset_offset(flat)).stop == polyglot._STOP_END_OF_DATASET
+        assert polyglot._scan_dataset(
+            with_sequence, polyglot.dataset_offset(with_sequence)
+        ).stop == polyglot._STOP_UNFOLLOWABLE
+
+
 class TestValidation:
     def test_dicom_validation_rejects_a_bare_pe(self):
         assert validate_dicom(_standalone(0x100)) != []

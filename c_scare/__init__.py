@@ -177,7 +177,9 @@ from .client import DICOMSession
 
 # Rogue SCP (SCU / client fuzzing) and raw network delivery
 from .server import RawSCP, ConnectionState, Connection
-from .deliver import send_pdu, send_sequence, send_cstore
+from .deliver import (
+    CStoreOutcome, send_pdu, send_sequence, send_cstore, send_cstore_outcome,
+)
 
 # SCU-side attack workflows (issuer drivers): AE brute, credential brute,
 # sculpted query builder. Query/retrieve flows (c_find/c_get/c_move) live on
@@ -352,7 +354,8 @@ __all__ = [
     "extract_frames", "extract_frames_from_file",
     # Rogue server & network delivery
     "RawSCP", "ConnectionState", "Connection",
-    "send_pdu", "send_sequence", "send_cstore",
+    "send_pdu", "send_sequence", "send_cstore", "send_cstore_outcome",
+    "CStoreOutcome",
     # SCU-side attack workflows
     "RoleNegotiationResult", "HostileObservation",
     "AETResult", "CredResult", "QR_MODELS",
