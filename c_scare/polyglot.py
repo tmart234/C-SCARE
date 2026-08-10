@@ -89,10 +89,20 @@ __all__ = [
     'pe_headers_len',
     'elf_header',
     'elf_image',
+    'elf_fragments',
+    'ELF_TYPE_EXEC',
+    'ELF_TYPE_DYN',
+    'ELF_HEADER_LEN',
+    'ELF_PHDR_LEN',
     'macho_header',
     'macho_image',
     'dataset_offset',
     'enumerate_safe_zones',
+    'Carrier',
+    'inspect_carrier',
+    'embed_in_carrier',
+    'PipelineVerdict',
+    'compare_after_pipeline',
     'executable_format',
     'validate_pe',
     'validate_elf',
@@ -139,8 +149,10 @@ ELF_IMAGE_BASE = 0x00400000
 _ELFCLASS = {32: 1, 64: 2}                   # EI_CLASS
 _ELFDATA2LSB = 1                             # EI_DATA: two's complement, LE
 _EV_CURRENT = 1
-_ET_EXEC = 2
-_ET_DYN = 3
+ELF_TYPE_EXEC = 2
+ELF_TYPE_DYN = 3
+_ET_EXEC = ELF_TYPE_EXEC
+_ET_DYN = ELF_TYPE_DYN
 _EM = {32: 0x03, 64: 0x3E}                   # EM_386, EM_X86_64
 _PT_LOAD = 1
 _PF_R = 4                                    # deliberately not PF_X (1)
@@ -550,7 +562,7 @@ def pe_image(pe_offset: int, bits: int = 64, section_size: int = 0x200,
 # ---------------------------------------------------------------------------
 
 def elf_header(ph_offset: int = 0, ph_count: int = 0, bits: int = 64,
-               entry: int = 0) -> bytes:
+               entry: int = 0, elf_type: int = _ET_EXEC) -> bytes:
     """A complete ``Elf64_Ehdr`` (64 bytes) or ``Elf32_Ehdr`` (52 bytes).
 
     Unlike PE, this cannot be relocated: ``readelf``, the kernel's ``binfmt_elf``
@@ -566,7 +578,9 @@ def elf_header(ph_offset: int = 0, ph_count: int = 0, bits: int = 64,
 
     ``entry`` defaults to 0, which makes the image inert - execution would
     transfer to an unmapped address 0 rather than to anything this module
-    emitted.
+    emitted. ``elf_type`` selects ``ET_EXEC`` or ``ET_DYN``; modern Linux
+    toolchains emit PIE executables as ``ET_DYN``, and a scanner whose ELF
+    check keys on ``ET_EXEC`` alone misses every one of them.
     """
     if bits not in ELF_HEADER_LEN:
         raise ValueError(f'bits must be 32 or 64, got {bits}')
@@ -576,10 +590,14 @@ def elf_header(ph_offset: int = 0, ph_count: int = 0, bits: int = 64,
                b'\x00' * 7)               # EI_OSABI/ABIVERSION 0, EI_PAD
     assert len(e_ident) == 16, len(e_ident)
 
+    if elf_type not in (_ET_EXEC, _ET_DYN):
+        raise ValueError(f'elf_type must be ET_EXEC ({_ET_EXEC}) or '
+                         f'ET_DYN ({_ET_DYN}), got {elf_type}')
+
     if bits == 64:
         rest = struct.pack(
             '<HHIQQQIHHHHHH',
-            _ET_EXEC, _EM[64], _EV_CURRENT,
+            elf_type, _EM[64], _EV_CURRENT,
             entry,                        # e_entry - no entry point
             ph_offset,                    # e_phoff - the relocatable pointer
             0,                            # e_shoff - no section headers
@@ -589,7 +607,7 @@ def elf_header(ph_offset: int = 0, ph_count: int = 0, bits: int = 64,
     else:
         rest = struct.pack(
             '<HHIIIIIHHHHHH',
-            _ET_EXEC, _EM[32], _EV_CURRENT,
+            elf_type, _EM[32], _EV_CURRENT,
             entry, ph_offset, 0, 0,
             ELF_HEADER_LEN[32], ELF_PHDR_LEN[32], ph_count,
             0, 0, 0)
@@ -597,6 +615,67 @@ def elf_header(ph_offset: int = 0, ph_count: int = 0, bits: int = 64,
     header = e_ident + rest
     assert len(header) == ELF_HEADER_LEN[bits], len(header)
     return header
+
+
+def elf_fragments(ph_offset: int, placements: Sequence[Tuple[int, int]],
+                  bits: int = 64, fill: str = 'zeros', seed: int = 0,
+                  image_base: int = ELF_IMAGE_BASE
+                  ) -> Tuple[bytes, List[bytes]]:
+    """Build an ELF whose ``PT_LOAD`` segments live at chosen file offsets.
+
+    ``placements`` is a sequence of ``(file_offset, size)``, one per segment.
+    Returns ``(program_header_table, [segment_data, ...])``: the table goes at
+    ``ph_offset`` and segment *i* at ``placements[i][0]``.
+
+    The ELF counterpart of :func:`pe_fragments`, and markedly *less*
+    constrained - which is the point worth knowing before assuming the two
+    fragment alike. A ``PT_LOAD`` may begin at any file offset at all, so long
+    as ``p_vaddr`` agrees with it modulo ``p_align``; PE demands an absolute
+    ``FileAlignment`` boundary at or past ``SizeOfHeaders``. An ELF payload
+    can therefore be scattered into whatever gaps a Data Set happens to leave,
+    including ones too small or too badly aligned to hold a PE section - the
+    64-byte DOS-stub zone being the example that defeated the PE version.
+
+    Virtual addresses are assigned ascending and non-overlapping, because the
+    kernel requires ``PT_LOAD`` entries sorted by ``p_vaddr`` and rejects
+    images whose mappings collide. Each is chosen to satisfy the congruence
+    for whatever file offset the caller picked.
+    """
+    if bits not in ELF_PHDR_LEN:
+        raise ValueError(f'bits must be 32 or 64, got {bits}')
+    if not placements:
+        raise ValueError('an ELF image needs at least one PT_LOAD segment')
+    if image_base % ELF_PAGE_SIZE:
+        raise ValueError(f'image_base 0x{image_base:X} is not page-aligned')
+
+    table = b''
+    payloads: List[bytes] = []
+    cursor = image_base
+    for index, (file_offset, size) in enumerate(placements):
+        if file_offset < 0 or size < 0:
+            raise ValueError(f'segment {index} has a negative offset or size')
+        # The congruence, solved for p_vaddr: a page-aligned base plus the
+        # segment's offset within its page.
+        p_vaddr = cursor + (file_offset % ELF_PAGE_SIZE)
+        if bits == 64:
+            table += struct.pack('<IIQQQQQQ',
+                                 _PT_LOAD, _PF_R,
+                                 file_offset, p_vaddr, p_vaddr,
+                                 size, size, ELF_PAGE_SIZE)
+        else:
+            table += struct.pack('<IIIIIIII',
+                                 _PT_LOAD,
+                                 file_offset, p_vaddr, p_vaddr,
+                                 size, size,
+                                 _PF_R,          # p_flags is last in Elf32
+                                 ELF_PAGE_SIZE)
+        payloads.append(filler(fill, size, seed + index))
+        # Advance past this mapping and leave a page of slack, so the next
+        # segment's address cannot collide however its offset falls.
+        cursor = align_up(p_vaddr + max(size, 1), ELF_PAGE_SIZE) + ELF_PAGE_SIZE
+
+    assert len(table) == len(placements) * ELF_PHDR_LEN[bits], len(table)
+    return table, payloads
 
 
 def elf_image(ph_offset: int, bits: int = 64, segment_size: int = 0x200,
@@ -630,32 +709,13 @@ def elf_image(ph_offset: int, bits: int = 64, segment_size: int = 0x200,
     """
     if bits not in ELF_PHDR_LEN:
         raise ValueError(f'bits must be 32 or 64, got {bits}')
-    if image_base % ELF_PAGE_SIZE:
-        raise ValueError(f'image_base 0x{image_base:X} is not page-aligned')
 
-    phdr_len = ELF_PHDR_LEN[bits]
-    p_offset = ph_offset + phdr_len
-    # The congruence, solved for p_vaddr: any page-aligned base plus the
-    # segment's offset within its page.
-    p_vaddr = image_base + (p_offset % ELF_PAGE_SIZE)
-
-    if bits == 64:
-        phdr = struct.pack('<IIQQQQQQ',
-                           _PT_LOAD, _PF_R,
-                           p_offset, p_vaddr, p_vaddr,
-                           segment_size,          # p_filesz
-                           segment_size,          # p_memsz
-                           ELF_PAGE_SIZE)         # p_align
-    else:
-        phdr = struct.pack('<IIIIIIII',
-                           _PT_LOAD,
-                           p_offset, p_vaddr, p_vaddr,
-                           segment_size, segment_size,
-                           _PF_R,                 # p_flags is last in Elf32
-                           ELF_PAGE_SIZE)
-    assert len(phdr) == phdr_len, (len(phdr), phdr_len)
-
-    return phdr + filler(fill, segment_size, seed)
+    # The contiguous, single-segment case of elf_fragments: the segment
+    # immediately follows the one-entry program header table.
+    table, (segment,) = elf_fragments(
+        ph_offset, [(ph_offset + ELF_PHDR_LEN[bits], segment_size)],
+        bits=bits, fill=fill, seed=seed, image_base=image_base)
+    return table + segment
 
 
 # ---------------------------------------------------------------------------
@@ -896,7 +956,11 @@ def enumerate_safe_zones(data: bytes) -> List[SafeZone]:
         kind='preamble_dos_header', offset=0, length=DOS_HEADER_LEN,
         usable=DOS_HEADER_LEN - 2 - 4,
         note='preamble bytes 0x00-0x3F; the MZ magic (2) and e_lfanew (4) are '
-             'spoken for, the rest is free'))
+             'spoken for, the rest is free. Aguilar & Palmer report '
+             '"approximately 46" for this zone, 12 fewer: that reserves the '
+             'legacy 12-byte block header PS3.10 cites as the reason the '
+             'preamble exists. 58 is the figure a PE loader actually imposes, '
+             'since it reads only e_magic and e_lfanew'))
     zones.append(SafeZone(
         kind='preamble_dos_stub', offset=DOS_HEADER_LEN,
         length=PREAMBLE_LEN - DOS_HEADER_LEN,
@@ -944,6 +1008,296 @@ def enumerate_safe_zones(data: bytes) -> List[SafeZone]:
         note='bytes after the final Data Element; readers stop at the end of '
              'the Data Set and never reach them'))
     return zones
+
+
+# ---------------------------------------------------------------------------
+# Embedding into a real carrier object
+# ---------------------------------------------------------------------------
+#
+# Synthesising a minimal Part-10 file is enough to prove the *structure* of a
+# polyglot, and not enough to get one stored. A PACS validates against the IOD:
+# a Secondary Capture with no Pixel Data, no Study/Series UIDs and no image
+# geometry is rejected as an incomplete object long before anything looks at a
+# private element. The payload then proves nothing about whether a real archive
+# accepts an executable, which is the question.
+#
+# These take an existing conformant object and add to it, so everything a PACS
+# checks - the SOP Class, the UID chain, the image module, the pixel data -
+# comes from a file that was already acceptable.
+
+@dataclass
+class Carrier:
+    """What a host object is, and where the parts that must not move are.
+
+    ``pixel_data_offset`` is the pipeline's "identify pixel data location"
+    step: the embedded payload has to land *before* it, both because group
+    0009 sorts ahead of (7FE0,0010) and because a payload that displaced the
+    image would change what the object renders as.
+    """
+    transfer_syntax: str
+    sop_class_uid: str
+    sop_instance_uid: str
+    study_instance_uid: Optional[str]
+    series_instance_uid: Optional[str]
+    pixel_data_offset: Optional[int]
+    pixel_data_length: Optional[int]
+    dataset_offset: Optional[int]
+
+
+def inspect_carrier(data: bytes) -> Carrier:
+    """Parse a Part-10 carrier and locate the parts an embed must not disturb.
+
+    Raises ``ValueError`` if ``data`` is not a readable Part-10 file, because
+    everything downstream assumes the host object is already one - embedding
+    into a broken carrier produces a broken polyglot and hides the reason.
+    """
+    from io import BytesIO
+    try:
+        dataset = pydicom.dcmread(BytesIO(data), force=False)
+    except Exception as exc:
+        raise ValueError(f'carrier is not a readable Part-10 file: {exc}')
+
+    for required in ('TransferSyntaxUID', 'MediaStorageSOPClassUID',
+                     'MediaStorageSOPInstanceUID'):
+        if required not in dataset.file_meta:
+            raise ValueError(f'carrier File Meta group has no {required}')
+
+    pixel_offset = pixel_length = None
+    # (7FE0,0010) is located in the raw bytes rather than through pydicom,
+    # because what matters here is the file offset, not the decoded value.
+    marker = struct.pack('<HH', 0x7FE0, 0x0010)
+    found = data.find(marker, PREAMBLE_LEN)
+    if found != -1:
+        pixel_offset = found
+        vr = data[found + 4:found + 6]
+        if vr in (b'OB', b'OW', b'UN'):
+            pixel_length = struct.unpack('<I', data[found + 8:found + 12])[0]
+        else:
+            pixel_length = struct.unpack('<H', data[found + 6:found + 8])[0]
+
+    return Carrier(
+        transfer_syntax=str(dataset.file_meta.TransferSyntaxUID),
+        sop_class_uid=str(dataset.file_meta.MediaStorageSOPClassUID),
+        sop_instance_uid=str(dataset.file_meta.MediaStorageSOPInstanceUID),
+        # WADO-RS addresses an instance by its full Study/Series/SOP path, so
+        # a carrier that cannot name its place in the hierarchy cannot be
+        # fetched back over DICOMweb.
+        study_instance_uid=str(getattr(dataset, 'StudyInstanceUID', '')) or None,
+        series_instance_uid=str(getattr(dataset, 'SeriesInstanceUID', '')) or None,
+        pixel_data_offset=pixel_offset,
+        pixel_data_length=pixel_length,
+        dataset_offset=dataset_offset(data),
+    )
+
+
+_EMBED_NONCE = b'\xc5\x3c\xa2\xe7C-SCARE-EMBED-SLOT\xe7\xa2\x3c\xc5'
+
+
+def embed_in_carrier(carrier: bytes, build_value, *,
+                     group: int = 0x0009,
+                     creator: str = 'C-SCARE POLYGLOT',
+                     block_element: int = 0x01,
+                     vr: str = 'OB',
+                     align: int = 4,
+                     preamble=None) -> Tuple[bytes, int]:
+    """Add a private element to ``carrier`` whose value knows its own offset.
+
+    ``build_value(offset)`` is called with the file offset its bytes will
+    occupy and returns them; ``preamble(offset)``, if given, is called with the
+    same offset and returns the 128 bytes to put in front of the file. That is
+    what lets a DOS header's ``e_lfanew`` point at a PE image which does not
+    exist until the offset is known.
+
+    Returns ``(file_bytes, payload_offset)``.
+
+    The offset is found rather than calculated. A private element's *value*
+    offset depends only on what precedes it, never on its own length, so a
+    first write with a short placeholder locates the slot exactly, and the
+    real value can be any size without moving it. Calculating instead would
+    mean re-deriving pydicom's encoder - element ordering, VR selection,
+    group-length recomputation, the odd-length pad - and being wrong silently.
+
+    Everything the carrier already had is preserved: the File Meta group, the
+    UID chain, the image module and the pixel data are written back by the
+    same encoder that read them. Only the preamble, which PS3.10 §7.1 leaves
+    without semantics, is replaced.
+    """
+    from io import BytesIO
+
+    info = inspect_carrier(carrier)
+    if group % 2 == 0:
+        raise ValueError(f'group 0x{group:04X} is not private (must be odd)')
+
+    def _write(value: bytes) -> bytes:
+        dataset = pydicom.dcmread(BytesIO(carrier), force=False)
+        block = dataset.private_block(group, creator, create=True)
+        block.add_new(block_element, vr, value)
+        if preamble is not None:
+            dataset.preamble = b'\x00' * PREAMBLE_LEN
+        buffer = BytesIO()
+        dataset.save_as(buffer, enforce_file_format=True)
+        return buffer.getvalue()
+
+    # Pass 1: locate the slot.
+    probe = _write(_EMBED_NONCE)
+    hits = probe.count(_EMBED_NONCE)
+    if hits != 1:
+        raise ValueError(f'embed slot marker found {hits} times, expected 1')
+    slot = probe.index(_EMBED_NONCE)
+
+    pad = -slot % align
+    payload_offset = slot + pad
+    payload = build_value(payload_offset)
+
+    # Pass 2: the real value. The slot cannot have moved - the element header
+    # is a fixed width for this VR - but that is checked rather than assumed.
+    final = _write(b'\x00' * pad + payload)
+    if final[payload_offset:payload_offset + len(payload)] != payload:
+        raise ValueError(
+            f'payload did not land at offset {payload_offset}; the encoder '
+            'moved the private element between passes')
+
+    if preamble is not None:
+        head = preamble(payload_offset)
+        if len(head) != PREAMBLE_LEN:
+            raise ValueError(f'preamble is {len(head)} bytes, must be '
+                             f'{PREAMBLE_LEN}')
+        final = head + final[PREAMBLE_LEN:]
+
+    after = inspect_carrier(final)
+    if after.pixel_data_offset is not None:
+        if payload_offset > after.pixel_data_offset:
+            raise ValueError('payload landed past the Pixel Data element; '
+                             'the private group must sort ahead of (7FE0,0010)')
+        if after.pixel_data_length != info.pixel_data_length:
+            raise ValueError('Pixel Data length changed during the embed')
+    return final, payload_offset
+
+
+# ---------------------------------------------------------------------------
+# Did the embedding survive the pipeline?
+# ---------------------------------------------------------------------------
+#
+# Acceptance is not the whole question. An archive that stores a polyglot and
+# an archive that stores it *and hands it back unchanged* are different
+# findings: the second is a distribution channel for the artifact, the first
+# might have neutralised it on ingest. Only a round trip separates them.
+#
+# What this does not and cannot answer is whether the retrieved copy would
+# *run*. These images are inert by construction - entry point 0, no PF_X, no
+# IMAGE_SCN_MEM_EXECUTE - and a polyglot never executes itself in any case:
+# activation is a separate link in the chain, outside the file, and specific
+# to the environment. What a round trip settles is the S.P.I.C.Y. Cascading
+# property, which is the part that lives in the bytes.
+
+SURVIVED_INTACT = 'intact'
+SURVIVED_PAYLOAD = 'payload_retained'
+SURVIVED_ALTERED = 'altered'
+SURVIVED_STRIPPED = 'stripped'
+SURVIVED_UNKNOWN = 'unknown'
+
+
+@dataclass
+class PipelineVerdict:
+    """What a store-and-retrieve round trip did to an embedded payload."""
+    outcome: str
+    detail: str
+    carrier_bytes_sent: int
+    carrier_bytes_returned: int
+
+    @property
+    def retained(self) -> bool:
+        """True if the embedded bytes came back, whole or as a fragment."""
+        return self.outcome in (SURVIVED_INTACT, SURVIVED_PAYLOAD,
+                                SURVIVED_ALTERED)
+
+
+def _private_values(data: bytes) -> Dict[int, bytes]:
+    """Every odd-group (private) element value in ``data``, keyed by tag.
+
+    Read through pydicom rather than by walking bytes, because a receiver is
+    free to re-encode: a different transfer syntax, coerced UIDs and a
+    regenerated File Meta group are all normal, and none of them mean the
+    payload was touched. Comparing element *values* sees through that.
+    """
+    from io import BytesIO
+    try:
+        dataset = pydicom.dcmread(BytesIO(data), force=True)
+    except Exception:
+        return {}
+    values: Dict[int, bytes] = {}
+    for element in dataset:
+        if element.tag.group % 2 == 0 or element.tag.element == 0x0010:
+            continue          # even groups are public; xx10 is the creator
+        try:
+            raw = element.value
+        except Exception:
+            continue
+        if isinstance(raw, (bytes, bytearray)):
+            values[int(element.tag)] = bytes(raw)
+    return values
+
+
+def compare_after_pipeline(original: bytes, retrieved: bytes) -> PipelineVerdict:
+    """Compare a payload with the copy an archive handed back.
+
+    Four outcomes, in descending order of what they say about the target:
+
+    ``intact``
+        The retrieved copy is still recognisable as the same second format at
+        offset 0 *and* carries the same private-element bytes. The archive is
+        a distribution channel for the artifact.
+    ``payload_retained``
+        The private-element bytes came back unchanged, but the header at
+        offset 0 did not survive. This is the expected result for C-STORE,
+        which transmits a Data Set and not a file, so the 128-byte preamble is
+        regenerated by the receiver. The embedded content is still there for
+        anything that reads the element.
+    ``altered``
+        The carrier is present but its bytes changed - the receiver rewrote
+        or truncated it.
+    ``stripped``
+        No private element came back. The archive removed it, which is the
+        outcome a defender wants.
+    """
+    sent = _private_values(original)
+    back = _private_values(retrieved)
+    sent_bytes = sum(len(v) for v in sent.values())
+    back_bytes = sum(len(v) for v in back.values())
+
+    if not sent:
+        return PipelineVerdict(
+            SURVIVED_UNKNOWN,
+            'the payload carries no private element to track', 0, back_bytes)
+    if not back:
+        return PipelineVerdict(
+            SURVIVED_STRIPPED,
+            f'none of the {len(sent)} private element(s) came back; the '
+            'receiver removed the embedded content',
+            sent_bytes, 0)
+
+    common = {tag for tag in sent if tag in back and sent[tag] == back[tag]}
+    if not common:
+        return PipelineVerdict(
+            SURVIVED_ALTERED,
+            'private elements came back but none matched what was sent',
+            sent_bytes, back_bytes)
+
+    fmt_sent = executable_format(original)
+    fmt_back = executable_format(retrieved)
+    if fmt_sent is not None and fmt_sent == fmt_back:
+        return PipelineVerdict(
+            SURVIVED_INTACT,
+            f'retrieved copy is still a {fmt_sent.upper()} at offset 0 and '
+            f'carries the same {len(common)} private element value(s)',
+            sent_bytes, back_bytes)
+
+    missing = 'never transmitted' if fmt_sent else 'not applicable'
+    return PipelineVerdict(
+        SURVIVED_PAYLOAD,
+        f'{len(common)} private element value(s) returned byte-identical; '
+        f'the offset-0 header was {missing} on this pathway',
+        sent_bytes, back_bytes)
 
 
 # ---------------------------------------------------------------------------
@@ -1087,6 +1441,7 @@ def validate_elf(data: bytes) -> List[str]:
                         'the end of the file')
         return problems
 
+    previous_end = None
     for i in range(e_phnum):
         base = e_phoff + i * phdr_len
         if bits == 64:
@@ -1113,6 +1468,13 @@ def validate_elf(data: bytes) -> List[str]:
                 problems.append(
                     f'PT_LOAD {i} p_offset={p_offset} is not congruent to '
                     f'p_vaddr=0x{p_vaddr:X} modulo p_align={p_align}')
+        # The kernel walks PT_LOAD entries in order and maps each in turn, so
+        # it requires them sorted by p_vaddr with no overlapping mappings.
+        if previous_end is not None and p_vaddr < previous_end:
+            problems.append(
+                f'PT_LOAD {i} p_vaddr=0x{p_vaddr:X} overlaps or precedes the '
+                f'previous segment, which ends at 0x{previous_end:X}')
+        previous_end = p_vaddr + p_memsz
     return problems
 
 

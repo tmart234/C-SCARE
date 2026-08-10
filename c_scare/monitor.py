@@ -17,9 +17,27 @@ __all__ = [
     'SanitizerMonitor',
     'ProtocolMonitor',
     'ProcessMonitor',
+    'PipelineMonitor',
     'SanitizerFinding',
     'parse_sanitizer_output',
+    'stored_successfully',
 ]
+
+
+def stored_successfully(status: Optional[int]) -> bool:
+    """True if a DIMSE status means the SCP kept the object (PS3.7 Annex C).
+
+    ``0x0000`` is Success. The ``0xBxxx`` warning class - coercion of data
+    elements, elements discarded, data set does not match SOP class - all mean
+    the object was stored anyway, with a note. ``0xAxxx`` and ``0xCxxx`` are
+    refusals and errors, where it was not.
+
+    The distinction matters because for some payloads storage *is* the
+    finding, and a warning status is still storage.
+    """
+    if status is None:
+        return False
+    return status == 0x0000 or (status & 0xF000) == 0xB000
 
 
 SIGNAL_NAMES = {
@@ -292,18 +310,43 @@ class ProtocolMonitor(BaseMonitor):
 
     NORMAL_ASSOCIATION_RESPONSES = (PDU_ASSOCIATE_AC, PDU_ASSOCIATE_RJ, PDU_ABORT)
 
+    #: ``metadata['finding_on']`` value meaning the payload is testing whether
+    #: the peer *accepts* it, so a successful store is the detection rather
+    #: than the absence of one.
+    FINDING_ON_STORE = 'store_accepted'
+
     def __init__(self):
         self._response: Optional[bytes] = None
         self._error: Optional[str] = None
+        self._finding_on: Optional[str] = None
+        self._accepted: Optional[bool] = None
 
     def pre_test(self, test_number: int):
         self._response = None
         self._error = None
+        self._finding_on = None
+        self._accepted = None
 
-    def set_response(self, response: Optional[bytes], error: Optional[str] = None):
-        """Called by test runner after delivery, before post_test()."""
+    def set_response(self, response: Optional[bytes], error: Optional[str] = None,
+                     finding_on: Optional[str] = None,
+                     accepted: Optional[bool] = None):
+        """Called by test runner after delivery, before post_test().
+
+        ``finding_on`` carries the payload's own expectation. Most payloads
+        are looking for the peer to misbehave, so an orderly answer is a pass.
+        A few are looking for the peer to *comply* - "the archive should not
+        store an executable" - and for those a clean DIMSE Success is the
+        result worth reporting. Without it the monitor has no way to tell the
+        two apart and calls a stored payload a normal response.
+        """
         self._response = response
         self._error = error
+        self._finding_on = finding_on
+        # Whether the archive kept the object, as the transport reported it.
+        # Deriving it from a DIMSE status here would only work for DIMSE: a
+        # STOW-RS 200 is not a DIMSE 0x0000, and reading one as the other
+        # made every DICOMweb store look like a refusal.
+        self._accepted = accepted
 
     def post_test(self) -> MonitorReport:
         if self._error == 'dry_run':
@@ -333,6 +376,26 @@ class ProtocolMonitor(BaseMonitor):
             if self._response and len(self._response) >= 2:
                 status = (self._response[0] << 8) | self._response[1]
             status_text = f'0x{status:04x}' if status is not None else 'unknown'
+            kept = (self._accepted if self._accepted is not None
+                    else stored_successfully(status))
+            if self._finding_on == self.FINDING_ON_STORE and kept:
+                # The payload asked whether the peer would accept it, and the
+                # peer did. Reporting that as a normal response is the wrong
+                # way round: for an object carrying an embedded executable, a
+                # clean store is the outcome the test exists to catch.
+                return MonitorReport(
+                    detected=True,
+                    finding_type='storage:payload_accepted',
+                    description=(
+                        f'SCP stored the object (DIMSE {status_text}), '
+                        'including attacker-controlled bytes in a region a '
+                        'conforming reader traverses without inspecting. '
+                        'C-STORE does not carry the 128-byte preamble, so a '
+                        'preamble-resident header is not what reached the '
+                        'archive — retrieve the stored instance and compare '
+                        'to establish what did.'),
+                    evidence=status_text,
+                )
             return MonitorReport(
                 detected=False,
                 description=f'C-STORE completed with DIMSE status {status_text}',
@@ -408,3 +471,100 @@ class ProcessMonitor(BaseMonitor):
                 description=f'Process died (exit code: {self._proc.exit_code()})',
             )
         return MonitorReport(detected=False, description='Process alive')
+
+
+class PipelineMonitor(BaseMonitor):
+    """Did the archive hand the embedded payload back, or neutralise it?
+
+    Acceptance alone cannot tell those apart, and they are opposite findings.
+    This monitor is fed the payload that was sent and the copy the archive
+    returned, and reports what the round trip did to the embedding — the
+    S.P.I.C.Y. Cascading property.
+
+    It says nothing about execution, deliberately. These images are inert by
+    construction, and a polyglot never executes itself in any case: activation
+    is a separate link in the chain, outside the file and specific to the
+    environment. What lives in the bytes is whether the artifact is still the
+    artifact after the pipeline handled it, and that is what this measures.
+    """
+
+    def __init__(self):
+        self._sent: Optional[bytes] = None
+        self._returned: Optional[bytes] = None
+        self._reason: Optional[str] = None
+
+    def pre_test(self, test_number: int):
+        self._sent = None
+        self._returned = None
+        self._reason = None
+
+    def set_round_trip(self, sent: Optional[bytes],
+                       returned: Optional[bytes],
+                       reason: Optional[str] = None):
+        """Called by the runner after a store-and-retrieve."""
+        self._sent = sent
+        self._returned = returned
+        self._reason = reason
+
+    def post_test(self) -> MonitorReport:
+        from .polyglot import (
+            SURVIVED_ALTERED, SURVIVED_INTACT, SURVIVED_PAYLOAD,
+            SURVIVED_STRIPPED, compare_after_pipeline,
+        )
+
+        if self._sent is None:
+            return MonitorReport(detected=False,
+                                 description='No round trip attempted')
+        if self._returned is None:
+            # Not a finding: a retrieve that never ran says nothing about the
+            # archive, the same way an undelivered payload says nothing.
+            return MonitorReport(
+                detected=False,
+                finding_type='retrieve:unavailable',
+                description=f'Could not retrieve the stored instance '
+                            f'({self._reason}) — the round trip concluded '
+                            'nothing about what the archive kept',
+                evidence=self._reason,
+            )
+
+        verdict = compare_after_pipeline(self._sent, self._returned)
+        if verdict.outcome == SURVIVED_STRIPPED:
+            return MonitorReport(
+                detected=False,
+                finding_type='pipeline:stripped',
+                description=f'Archive removed the embedded content on ingest '
+                            f'({verdict.detail}). This is the outcome a '
+                            'defender wants.',
+                evidence=verdict.detail,
+            )
+        if verdict.outcome == SURVIVED_INTACT:
+            return MonitorReport(
+                detected=True,
+                finding_type='pipeline:survived_intact',
+                description=f'Archive returned the artifact still valid in '
+                            f'both formats ({verdict.detail}). It is a '
+                            'distribution channel for this object, not just a '
+                            'store that accepted it.',
+                evidence=verdict.detail,
+            )
+        if verdict.outcome == SURVIVED_PAYLOAD:
+            return MonitorReport(
+                detected=True,
+                finding_type='pipeline:payload_retained',
+                description=f'Archive returned the embedded bytes unchanged '
+                            f'({verdict.detail}). Anything that reads the '
+                            'element still gets attacker-controlled content.',
+                evidence=verdict.detail,
+            )
+        if verdict.outcome == SURVIVED_ALTERED:
+            return MonitorReport(
+                detected=True,
+                finding_type='pipeline:altered',
+                description=f'Archive returned a modified carrier '
+                            f'({verdict.detail}). Worth checking whether the '
+                            'change neutralises the content or merely moves it.',
+                evidence=verdict.detail,
+            )
+        return MonitorReport(
+            detected=False,
+            description=f'Round trip inconclusive: {verdict.detail}')

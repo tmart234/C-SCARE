@@ -516,7 +516,8 @@ class TestCStoreOutcomeReasons:
         """associate() returns one False for four outcomes; recover which."""
         session = argparse.Namespace(last_reject=last_reject,
                                      last_error=last_error)
-        assert deliver._associate_failure_reason(session) == expected
+        from c_scare.client import associate_failure_reason
+        assert associate_failure_reason(session) == expected
 
     def test_send_cstore_keeps_its_status_only_contract(self, monkeypatch):
         """The published signature must not change under callers."""
@@ -642,3 +643,228 @@ class TestCorpusFilesAreConformantPart10:
             runner._save_corpus_file(result, str(tmp_path))).read_bytes()
         assert blob == result.payload
         assert blob[:2] == b'MZ'
+
+
+class TestStorageAcceptanceIsADetection:
+    """For some payloads, the target complying is the finding.
+
+    Most of the catalog looks for the peer to misbehave, so an orderly answer
+    is a pass. The polyglot family looks for the peer to *comply* — "an archive
+    should not store an executable" — and a clean DIMSE Success there means it
+    did not. That used to report as "C-STORE completed with DIMSE status
+    0x0000", detected=False: the run said nothing happened at the moment the
+    thing the test exists to catch had just happened.
+    """
+
+    def _report(self, status, finding_on):
+        from c_scare.monitor import ProtocolMonitor
+        monitor = ProtocolMonitor()
+        monitor.pre_test(0)
+        monitor.set_response(bytes([(status >> 8) & 0xFF, status & 0xFF]),
+                             error='cstore_status', finding_on=finding_on)
+        return monitor.post_test()
+
+    @pytest.mark.parametrize('status', [0x0000, 0xB000, 0xB007])
+    def test_a_stored_object_is_a_finding(self, status):
+        """Success and the 0xBxxx warnings all mean the object was kept."""
+        from c_scare.monitor import ProtocolMonitor
+        report = self._report(status, ProtocolMonitor.FINDING_ON_STORE)
+        assert report.detected is True
+        assert report.finding_type == 'storage:payload_accepted'
+        assert 'retrieve' in report.description, (
+            'the report must say what acceptance does not prove')
+
+    @pytest.mark.parametrize('status', [0xA700, 0xA900, 0xC000])
+    def test_a_refusal_is_not_a_finding(self, status):
+        """The archive did the right thing; saying otherwise is a false alarm."""
+        from c_scare.monitor import ProtocolMonitor
+        assert self._report(status, ProtocolMonitor.FINDING_ON_STORE).detected \
+            is False
+
+    @pytest.mark.parametrize('status', [0x0000, 0xA900])
+    def test_untagged_payloads_are_unaffected(self, status):
+        assert self._report(status, None).detected is False
+
+    def test_only_payloads_that_reach_the_archive_are_scored(self):
+        """Scoring a payload whose mechanism never arrives is a false alarm.
+
+        C-STORE carries a Data Set, not a file: the preamble and anything past
+        the final Data Element are never transmitted. A payload whose foreign
+        content lives there arrives as an ordinary image, so acceptance says
+        nothing about it.
+        """
+        from c_scare.attacks import CVEAttacks
+        from c_scare.monitor import ProtocolMonitor
+        family = [r for r in CVEAttacks.all()
+                  if r.metadata.get('cve') == 'CVE-2019-11687']
+        assert family
+        from c_scare import transport
+        dimse = transport.DimseTransport()
+        web = transport.DicomWebTransport(base_url='http://x/dicom-web')
+        args = argparse.Namespace(_transport=dimse)
+
+        for result in family:
+            region = result.metadata['payload_region']
+            scored = runner._scorable_finding_on(args, result) is not None
+            assert scored == transport.survives(region, dimse), (
+                f'{result.name}: scored={scored} over DIMSE but '
+                f'region={region}')
+
+        # The same catalog, unchanged, scores fully over a whole-file
+        # transport. That is the point of keeping region on the payload and
+        # carries_whole_file on the transport.
+        args_web = argparse.Namespace(_transport=web)
+        assert all(runner._scorable_finding_on(args_web, r) is not None
+                   for r in family)
+        assert any(r.metadata['payload_region'] == transport.REGION_DATA_SET
+                   for r in family)
+        assert any(r.metadata['payload_region'] == transport.REGION_WHOLE_FILE
+                   for r in family)
+
+    def test_region_is_a_payload_property_not_a_transport_one(self):
+        """Every polyglot declares where its content lives, once.
+
+        The earlier model tagged payloads with 'survives_cstore', which states
+        a transport fact as a payload property — adding STOW-RS would have
+        meant a second flag per payload, and two flags that must agree.
+        """
+        from c_scare import transport
+        from c_scare.attacks import CVEAttacks
+        for result in CVEAttacks.all():
+            if result.metadata.get('cve') != 'CVE-2019-11687':
+                continue
+            assert result.metadata['payload_region'] in (
+                transport.REGION_DATA_SET, transport.REGION_WHOLE_FILE)
+            assert 'survives_cstore' not in result.metadata
+
+    def test_the_runner_passes_the_expectation_through(self, monkeypatch):
+        """The wiring, not just the monitor: metadata has to reach set_response."""
+        from c_scare import deliver as deliver_mod
+        from c_scare.monitor import ProtocolMonitor
+
+        result = AttackResult(
+            name='polyglot', category='cve', payload=b'\x00' * 8,
+            description='d', expected_behavior='e',
+            metadata={'delivery_hint': 'cstore',
+                      'finding_on': ProtocolMonitor.FINDING_ON_STORE})
+        args = argparse.Namespace(
+            delivery='cstore', mutate=None, ae_title='PACS', calling_ae='SCU',
+            dry_run=None, max_associations=None, cstore_file=None,
+            store_sop=None, store_transfer_syntax=None, timeout=1.0,
+            monitors=None)
+        monkeypatch.setattr(
+            runner.deliver, 'send_cstore_outcome',
+            lambda *a, **k: deliver_mod.CStoreOutcome(0x0000, None))
+
+        monitor = ProtocolMonitor()
+        monkeypatch.setattr(runner, '_get_monitors', lambda _a: [monitor])
+        runner._run_monitored_test(args, result, ('127.0.0.1', 11112), 1.0)
+
+        assert result.success is True, 'a stored polyglot did not raise a finding'
+        assert result.monitor_reports[0].finding_type == 'storage:payload_accepted'
+
+
+class TestRoundTripTellsUsWhatTheArchiveKept:
+    """Acceptance cannot separate a distribution channel from a sanitiser.
+
+    An archive that stores a polyglot and one that stores it *and hands it
+    back unchanged* both answer C-STORE with 0x0000. Only fetching the
+    instance back distinguishes them, and they are opposite findings.
+
+    None of this asks whether the retrieved copy would run. The images are
+    inert by construction, and a polyglot never executes itself in any case —
+    activation is a separate link, outside the file. What a round trip settles
+    is whether the artifact is still the artifact.
+    """
+
+    def _payload(self):
+        from c_scare.attacks import CVEAttacks
+        return next(r for r in CVEAttacks.all()
+                    if r.name == 'cve_2019_11687_16_pe_in_storable_image').payload
+
+    def _reserialise(self, blob, mutate=None):
+        import io
+        import pydicom
+        ds = pydicom.dcmread(io.BytesIO(blob), force=False)
+        if mutate:
+            mutate(ds)
+        ds.preamble = b'\x00' * 128          # what a C-STORE receiver writes
+        buf = io.BytesIO()
+        ds.save_as(buf, enforce_file_format=True)
+        return buf.getvalue()
+
+    def _report(self, returned, reason=None):
+        from c_scare.monitor import PipelineMonitor
+        monitor = PipelineMonitor()
+        monitor.pre_test(0)
+        monitor.set_round_trip(self._payload(), returned, reason)
+        return monitor.post_test()
+
+    def test_whole_file_back_is_intact(self):
+        """The STOW-RS shape: preamble included, so both formats survive."""
+        from c_scare import polyglot
+        verdict = polyglot.compare_after_pipeline(self._payload(),
+                                                  self._payload())
+        assert verdict.outcome == polyglot.SURVIVED_INTACT
+        report = self._report(self._payload())
+        assert report.detected is True
+        assert report.finding_type == 'pipeline:survived_intact'
+
+    def test_data_set_back_retains_the_payload(self):
+        """The C-STORE shape: preamble regenerated, carrier bytes unchanged."""
+        report = self._report(self._reserialise(self._payload()))
+        assert report.detected is True
+        assert report.finding_type == 'pipeline:payload_retained'
+
+    def test_a_sanitising_archive_is_not_a_finding(self):
+        """Stripping the private elements is the outcome a defender wants."""
+        def strip(ds):
+            for element in [e for e in ds if e.tag.group % 2 == 1]:
+                del ds[element.tag]
+        report = self._report(self._reserialise(self._payload(), strip))
+        assert report.detected is False
+        assert report.finding_type == 'pipeline:stripped'
+        assert 'defender wants' in report.description
+
+    def test_a_rewritten_carrier_is_reported_separately(self):
+        def blank(ds):
+            ds[0x00091001].value = b'\x00' * 32
+        report = self._report(self._reserialise(self._payload(), blank))
+        assert report.detected is True
+        assert report.finding_type == 'pipeline:altered'
+
+    def test_a_failed_retrieve_is_not_a_finding(self):
+        """Same rule as an undelivered payload: no data, no conclusion."""
+        report = self._report(None, reason='no_objects:status=42754')
+        assert report.detected is False
+        assert report.finding_type == 'retrieve:unavailable'
+        assert '42754' in report.evidence
+
+    def test_no_round_trip_attempted_is_silent(self):
+        from c_scare.monitor import PipelineMonitor
+        monitor = PipelineMonitor()
+        monitor.pre_test(0)
+        assert monitor.post_test().detected is False
+
+    def test_a_refused_store_is_never_retrieved(self):
+        """Fetching an instance the archive refused would report 'stripped'
+        for an object that was never there — the mirror of every false
+        positive fixed elsewhere in this file."""
+        from c_scare.attacks import AttackResult
+        result = AttackResult(
+            name='p', category='cve', payload=b'x', description='d',
+            expected_behavior='e',
+            metadata={'cstore_status': 0xA900,
+                      'sop_instance_uid': '1.2.3'})
+        args = argparse.Namespace(max_associations=None, dry_run=None)
+        sent, returned, reason = runner._round_trip(
+            args, result, ('127.0.0.1', 1), 1.0)
+        assert (sent, returned, reason) == (None, None, 'not_stored')
+
+    def test_every_carried_payload_names_an_instance_to_fetch(self):
+        """Without a SOP Instance UID there is nothing to retrieve."""
+        from c_scare.attacks import CVEAttacks
+        missing = [r.name for r in CVEAttacks.all()
+                   if r.metadata.get('carrier')
+                   and not r.metadata.get('sop_instance_uid')]
+        assert missing == [], f'carried payloads with no instance UID: {missing}'

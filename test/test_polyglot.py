@@ -41,7 +41,8 @@ from c_scare import polyglot  # noqa: E402
 from c_scare.polyglot import (  # noqa: E402
     FILE_ALIGNMENT, FILL_PROFILES, MACHO_HEADER_LEN, PREAMBLE_LEN,
     SECTION_64_LEN, SEGMENT_COMMAND_64_LEN, dos_header, dos_stub, elf_header,
-    elf_image, enumerate_safe_zones, executable_format, filler, macho_header,
+    elf_fragments, elf_image, enumerate_safe_zones, executable_format, filler,
+    macho_header,
     macho_image, pe_fragments, pe_headers_len, pe_image, shannon_entropy,
     validate_dicom, validate_elf, validate_macho, validate_pe,
     validate_polyglot,
@@ -703,3 +704,96 @@ class TestContentShaping:
                 shaped["packed"].metadata["section_entropy"])
         for result in shaped.values():
             assert validate_polyglot(result.payload) == {"pe": [], "dicom": []}
+
+
+class TestELFFragmentsWhereAPECannot:
+    """ELF's placement rule is weaker than PE's, and that widens the surface.
+
+    A PE section must start on a 512-byte ``FileAlignment`` boundary at or
+    past ``SizeOfHeaders``. An ELF ``PT_LOAD`` needs only ``p_offset``
+    congruent to ``p_vaddr`` modulo ``p_align``, which any offset can satisfy
+    by choosing the address. A scanner that searches only the regions a PE
+    could occupy misses the ones an ELF can.
+    """
+
+    def _payload(self):
+        from c_scare.attacks import CVEAttacks
+        return CVEAttacks._fragmented_elfdicom()
+
+    def test_a_segment_lands_in_the_zone_pe_had_to_leave_empty(self):
+        """Preamble bytes 0x40-0x7F: 64 bytes, unaligned, before SizeOfHeaders."""
+        _data, fragments = self._payload()
+        stub = next(f for f in fragments if f["zone"] == "preamble_dos_stub")
+        assert stub["offset"] == polyglot.DOS_HEADER_LEN
+        assert stub["length"] == PREAMBLE_LEN - polyglot.DOS_HEADER_LEN
+        # The same placement offered to the PE builder is rejected outright.
+        with pytest.raises(ValueError):
+            pe_fragments(0x200, [(stub["offset"], stub["length"])])
+
+    def test_segments_sit_at_offsets_no_pe_section_could_use(self):
+        data, fragments = self._payload()
+        assert validate_elf(data) == []
+        unaligned = [f for f in fragments
+                     if f["zone"] != "private_element"
+                     and f["offset"] % FILE_ALIGNMENT]
+        assert len(unaligned) >= 2, (
+            "every segment happens to be FileAlignment-aligned, so this "
+            "payload no longer distinguishes ELF's rule from PE's")
+
+    def test_the_assembled_image_appears_nowhere_in_the_file(self):
+        data, fragments = self._payload()
+        pieces = [data[f["offset"]:f["offset"] + f["length"]]
+                  for f in fragments]
+        assert b"".join(pieces) not in data
+        for first, second in zip(pieces, pieces[1:]):
+            assert first + second not in data
+
+    def test_program_headers_describe_every_fragment(self):
+        """readelf has to be able to reassemble it; so does a scanner."""
+        data, fragments = self._payload()
+        e_phoff = struct.unpack("<Q", data[32:40])[0]
+        e_phnum = struct.unpack("<H", data[56:58])[0]
+        segments = [f for f in fragments if f["zone"] != "private_element"]
+        assert e_phnum == len(segments)
+        for i, fragment in enumerate(segments):
+            base = e_phoff + i * polyglot.ELF_PHDR_LEN[64]
+            p_offset = struct.unpack("<Q", data[base + 8:base + 16])[0]
+            assert p_offset == fragment["offset"], (
+                f"PT_LOAD {i} points at {p_offset}, fragment map says "
+                f"{fragment['offset']}")
+
+    def test_virtual_addresses_ascend_without_overlapping(self):
+        """The kernel maps PT_LOADs in order and rejects colliding ranges."""
+        table, _segments = elf_fragments(0x100, [(0x40, 64), (0x23e, 0x100),
+                                                 (0x35c, 0x100)])
+        previous_end = 0
+        for i in range(3):
+            base = i * polyglot.ELF_PHDR_LEN[64]
+            p_vaddr = struct.unpack("<Q", table[base + 16:base + 24])[0]
+            p_memsz = struct.unpack("<Q", table[base + 40:base + 48])[0]
+            assert p_vaddr >= previous_end
+            previous_end = p_vaddr + p_memsz
+
+    def test_validation_rejects_overlapping_segments(self):
+        data, _fragments = self._payload()
+        broken = bytearray(data)
+        e_phoff = struct.unpack("<Q", data[32:40])[0]
+        second = e_phoff + polyglot.ELF_PHDR_LEN[64]
+        struct.pack_into("<Q", broken, second + 16, 0)   # p_vaddr below the first
+        assert any("overlaps or precedes" in p
+                   for p in validate_elf(bytes(broken)))
+
+    @pytest.mark.parametrize("elf_type,label", [(polyglot.ELF_TYPE_EXEC, "EXEC"),
+                                                (polyglot.ELF_TYPE_DYN, "DYN")])
+    def test_both_elf_types_are_emitted(self, elf_type, label):
+        """PIE binaries are ET_DYN, and file(1) calls them shared objects.
+
+        A scanner keyed on 'ELF executable' misses every PIE on a modern
+        Linux system, so both types have to be producible.
+        """
+        header = elf_header(0x200, ph_count=1, elf_type=elf_type)
+        assert struct.unpack("<H", header[16:18])[0] == elf_type
+
+    def test_an_unknown_elf_type_is_rejected(self):
+        with pytest.raises(ValueError, match="elf_type"):
+            elf_header(elf_type=99)

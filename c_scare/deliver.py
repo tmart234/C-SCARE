@@ -36,13 +36,11 @@ __all__ = [
 # something) or whether the payload never got there (and the run learned
 # nothing) - collapsing the two makes an undelivered payload read like a
 # target that went quiet.
-CSTORE_UNAVAILABLE = 'unavailable'   # scapy/client not importable here
-CSTORE_REJECTED = 'rejected'         # peer sent an A-ASSOCIATE-RJ
+# The association-level reasons are named in client.ASSOC_* — that is where
+# associate_failure_reason produces them, and importing them here would cost
+# this module its ability to work without scapy. They are spelled out rather
+# than aliased so there is one set of names, not two that must agree.
 CSTORE_NO_CONTEXT = 'no_context'     # associated, but our SOP class/TS was not accepted
-CSTORE_UNREACHABLE = 'unreachable'   # the TCP connection could not be made
-CSTORE_REFUSED = 'refused'           # TCP connection refused
-CSTORE_RESET = 'reset'               # connection reset mid-exchange
-CSTORE_TIMEOUT = 'timeout'           # no answer within the timeout
 CSTORE_NO_STATUS = 'no_status'       # object sent, no C-STORE-RSP came back
 
 #: Reasons that describe something the target did. The rest mean the payload
@@ -51,13 +49,13 @@ CSTORE_NO_STATUS = 'no_status'       # object sent, no C-STORE-RSP came back
 #: raw-PDU path treats them that way: against a target that answered the
 #: opening smoke test, they are how a process that has died presents.
 CSTORE_REASONS = {
-    CSTORE_UNAVAILABLE: False,
-    CSTORE_REJECTED: False,
+    'unavailable': False,          # client.ASSOC_UNAVAILABLE
+    'rejected': False,             # client.ASSOC_REJECTED
     CSTORE_NO_CONTEXT: False,
-    CSTORE_UNREACHABLE: False,
-    CSTORE_REFUSED: True,
-    CSTORE_RESET: True,
-    CSTORE_TIMEOUT: True,
+    'unreachable': False,          # client.ASSOC_UNREACHABLE
+    'refused': True,               # client.ASSOC_REFUSED
+    'reset': True,                 # client.ASSOC_RESET
+    'timeout': True,               # client.ASSOC_TIMEOUT
     CSTORE_NO_STATUS: True,
 }
 
@@ -189,33 +187,6 @@ def send_sequence(target: Tuple[str, int],
     return responses
 
 
-def _associate_failure_reason(session) -> str:
-    """Why ``DICOMSession.associate`` returned ``False``.
-
-    It collapses four outcomes into one ``False``, and they are not the same
-    result: nothing listening on the port, an explicit A-ASSOCIATE-RJ, and a
-    peer that went silent mid-handshake mean a dead target, a working target
-    and a possibly-dying target respectively. The session records enough to
-    tell them apart — ``last_reject`` for a rejection, ``last_error`` for
-    everything the transport caught — so the distinction is recovered here
-    rather than reported as whichever one came first in the code.
-    """
-    if getattr(session, 'last_reject', None):
-        return CSTORE_REJECTED
-    error = getattr(session, 'last_error', None) or ''
-    if error.startswith('ConnectionRefusedError'):
-        return CSTORE_REFUSED
-    if error.startswith('ConnectionResetError'):
-        return CSTORE_RESET
-    if error.startswith(('timeout', 'TimeoutError', 'no response')):
-        return CSTORE_TIMEOUT
-    if error:
-        # Some other transport failure — host unreachable, DNS, a bad bind.
-        # Name the exception type so it stays triageable.
-        return f'{CSTORE_UNREACHABLE}:{error.split(":")[0]}'
-    return CSTORE_REJECTED
-
-
 def send_cstore_outcome(target: Tuple[str, int],
                         payload: bytes,
                         sop_class_uid: str,
@@ -250,17 +221,17 @@ def send_cstore_outcome(target: Tuple[str, int],
     need to pre-chunk large payloads.
     """
     try:
-        from .client import DICOMSession
+        from .client import DICOMSession, associate_failure_reason
         from .scapy_dicom import DEFAULT_TRANSFER_SYNTAX_UID
     except ImportError as exc:
-        return CStoreOutcome(None, f'{CSTORE_UNAVAILABLE}:{exc.name or "scapy"}')
+        return CStoreOutcome(None, f'unavailable:{exc.name or "scapy"}')
 
     ts = transfer_syntax or DEFAULT_TRANSFER_SYNTAX_UID
     try:
         with DICOMSession(target[0], target[1], called_ae, calling_ae) as sock:
             if not sock.associate({sop_class_uid: [ts]},
                                   user_identity=user_identity):
-                return CStoreOutcome(None, _associate_failure_reason(sock))
+                return CStoreOutcome(None, associate_failure_reason(sock))
 
             # c_store() returns None for "no presentation context was
             # accepted" and for "no C-STORE-RSP came back", which are a
@@ -276,11 +247,11 @@ def send_cstore_outcome(target: Tuple[str, int],
             return CStoreOutcome(
                 None, CSTORE_NO_STATUS if negotiated else CSTORE_NO_CONTEXT)
     except ConnectionRefusedError:
-        return CStoreOutcome(None, CSTORE_REFUSED)
+        return CStoreOutcome(None, 'refused')
     except ConnectionResetError:
-        return CStoreOutcome(None, CSTORE_RESET)
+        return CStoreOutcome(None, 'reset')
     except socket.timeout:
-        return CStoreOutcome(None, CSTORE_TIMEOUT)
+        return CStoreOutcome(None, 'timeout')
     except Exception as exc:
         # Anything left is a fault in this tool or an unmodelled transport
         # error. Naming the type keeps it triageable instead of silently

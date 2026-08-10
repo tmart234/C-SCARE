@@ -48,10 +48,10 @@ try:
         DICM_PREFIX, EXPLICIT_VR_LE_UID, PART10_PREAMBLE_LEN,
         part10_file, standard_file_meta,
     )
-    from . import deliver
+    from . import client, deliver, transport
     from .monitor import (
         BaseMonitor, MonitorReport, SanitizerMonitor,
-        ProtocolMonitor, ProcessMonitor,
+        ProtocolMonitor, ProcessMonitor, PipelineMonitor,
     )
     from .process_manager import InstrumentedProcess
 except ImportError:
@@ -64,10 +64,12 @@ except ImportError:
         DICM_PREFIX, EXPLICIT_VR_LE_UID, PART10_PREAMBLE_LEN,
         part10_file, standard_file_meta,
     )
+    import client
     import deliver
+    import transport
     from monitor import (
         BaseMonitor, MonitorReport, SanitizerMonitor,
-        ProtocolMonitor, ProcessMonitor,
+        ProtocolMonitor, ProcessMonitor, PipelineMonitor,
     )
     from process_manager import InstrumentedProcess
 
@@ -827,9 +829,23 @@ def _deliver(args, result: AttackResult, target, timeout: float):
             last = next((r for r in reversed(responses) if r is not None), None)
             return last, ('timeout' if last is None else None)
         if kind == 'cstore':
+            carrier = _transport_for(args, target)
             file_payload = _cstore_file_payload_for_result(args, result)
             if file_payload is not None:
                 cstore_payload, sop_class, sop_inst, transfer_syntax = file_payload
+            elif carrier.carries_whole_file:
+                # STOW-RS posts complete instances, so the Part-10 wrapper is
+                # what goes up — stripping it here would throw away the
+                # preamble this transport exists to carry.
+                cstore_payload = payload
+                _p10, part10_meta = _dataset_from_part10(payload)
+                sop_class = result.metadata.get('sop_class_uid') \
+                    or part10_meta.get('sop_class_uid') \
+                    or getattr(args, 'store_sop', None) or _DEFAULT_STORE_SOP
+                sop_inst = result.metadata.get('sop_instance_uid') \
+                    or part10_meta.get('sop_instance_uid') or '1.2.3.4.5'
+                transfer_syntax = result.metadata.get('transfer_syntax') \
+                    or part10_meta.get('transfer_syntax')
             else:
                 cstore_payload, part10_meta = _dataset_from_part10(payload)
                 sop_class = result.metadata.get('sop_class_uid') \
@@ -845,14 +861,15 @@ def _deliver(args, result: AttackResult, target, timeout: float):
             if getattr(args, 'dry_run', None):
                 _dry_run_write(args, result, kind, [cstore_payload])
                 return None, 'dry_run'
-            outcome = deliver.send_cstore_outcome(
-                target, cstore_payload, sop_class, sop_inst,
-                transfer_syntax=transfer_syntax,
-                called_ae=getattr(args, 'ae_title', 'TARGET'),
-                calling_ae=getattr(args, 'calling_ae', 'ATTACKER'),
+            outcome = carrier.store(
+                cstore_payload, sop_class_uid=sop_class,
+                sop_instance_uid=sop_inst, transfer_syntax=transfer_syntax,
+                study_instance_uid=result.metadata.get('study_instance_uid'),
                 timeout=timeout)
             status = outcome.status
+            result.metadata['transport'] = carrier.name
             result.metadata['cstore_status'] = status
+            result.metadata['store_accepted'] = outcome.accepted
             if status is None:
                 result.metadata['delivery_error'] = outcome.reason
                 # A payload that never reached the target's parser supports no
@@ -876,6 +893,67 @@ def _deliver(args, result: AttackResult, target, timeout: float):
         return None, 'reset'
 
 
+def _transport_for(args, target=None):
+    """The transport this run uses, built once and cached on ``args``.
+
+    ``target`` is the address the caller already resolved; it is passed
+    through because the delivery paths are handed one explicitly and it is
+    authoritative over anything on ``args``.
+    """
+    carrier = getattr(args, '_transport', None)
+    if carrier is None:
+        carrier = transport.for_args(args, target)
+        args._transport = carrier
+    return carrier
+
+
+def _scorable_finding_on(args, result: AttackResult):
+    """The payload's expectation, but only where the transport can honour it.
+
+    A payload that keeps its content in the preamble asks "will you store an
+    executable?", and over C-STORE the archive is never shown one — the
+    preamble is not transmitted. Scoring acceptance there would report a
+    finding against an archive that received an ordinary image. Over STOW-RS
+    the same payload arrives whole, and the same question is answerable.
+
+    So the expectation is passed through only when
+    :func:`transport.survives` says the mechanism reached the far side.
+    """
+    finding_on = result.metadata.get('finding_on')
+    if not finding_on:
+        return None
+    region = result.metadata.get('payload_region')
+    if not transport.survives(region, _transport_for(args)):
+        return None
+    return finding_on
+
+
+def _round_trip(args, result: AttackResult, target, timeout: float):
+    """Fetch back what was just stored. Returns ``(sent, returned, reason)``.
+
+    Only attempted when the store succeeded — retrieving an instance the
+    archive refused would report ``stripped`` for an object that was never
+    there, which is the false negative that mirrors every false positive
+    fixed elsewhere in this file.
+    """
+    if not result.metadata.get('store_accepted'):
+        return None, None, 'not_stored'
+    sop_class = (result.metadata.get('sop_class_uid') or _DEFAULT_STORE_SOP)
+    sop_instance = result.metadata.get('sop_instance_uid')
+    if not sop_instance:
+        return None, None, 'no_sop_instance_uid'
+
+    _charge_associations(args, 1)
+    outcome = _transport_for(args, target).retrieve(
+        sop_class_uid=sop_class, sop_instance_uid=sop_instance,
+        study_instance_uid=result.metadata.get('study_instance_uid'),
+        series_instance_uid=result.metadata.get('series_instance_uid'),
+        transfer_syntax=result.metadata.get('transfer_syntax'),
+        timeout=timeout)
+    result.metadata['retrieve_reason'] = outcome.reason
+    return result.payload, outcome.data, outcome.reason
+
+
 def _run_monitored_test(args, result: AttackResult, target, timeout: float):
     """Send a payload and check all monitors for findings."""
     monitors = _get_monitors(args)
@@ -894,7 +972,12 @@ def _run_monitored_test(args, result: AttackResult, target, timeout: float):
 
     for monitor in monitors:
         if isinstance(monitor, ProtocolMonitor):
-            monitor.set_response(response, error=error)
+            monitor.set_response(
+                response, error=error,
+                finding_on=_scorable_finding_on(args, result),
+                accepted=result.metadata.get('store_accepted'))
+        elif isinstance(monitor, PipelineMonitor):
+            monitor.set_round_trip(*_round_trip(args, result, target, timeout))
 
     if any(isinstance(m, SanitizerMonitor) for m in monitors):
         time.sleep(SANITIZER_FLUSH_DELAY)
@@ -1432,6 +1515,34 @@ def _print_undelivered(results: list) -> None:
     print("         Those tests concluded nothing about the target.")
 
 
+def _print_file_only(results: list, args=None) -> None:
+    """Note payloads whose mechanism cannot survive an association.
+
+    C-STORE carries a Data Set, so a payload whose foreign content lives in
+    the 128-byte preamble or past the final Data Element arrives as an
+    ordinary object — the archive is being asked a question the wire cannot
+    put to it. Delivering them anyway is harmless, but reporting the result as
+    if it meant something is not, so the run says which ones need a file path
+    instead.
+    """
+    carrier = _transport_for(args) if args is not None else None
+    if carrier is None or carrier.carries_whole_file:
+        return
+    unreached = [r for r in results
+                 if r.metadata.get('payload_region') == transport.REGION_WHOLE_FILE
+                 and r.metadata.get('delivery') in ('cstore', 'pdu')]
+    if not unreached:
+        return
+    print(f"NOTE: {len(unreached)} payload(s) keep their content in the "
+          "preamble or past the Data Set,")
+    print(f"      which the {carrier.name} transport does not carry — it "
+          "sends a Data Set, not a file.")
+    print("      Reach them with --dicomweb-url (STOW-RS posts whole "
+          "instances), or")
+    print("      `c-scare corpus -o ./out` through media, a DICOMDIR or an "
+          "import folder.")
+
+
 def _run_catalog(args, catalog, label: str, note: Optional[str] = None) -> int:
     """Run one static attack catalog: deliver each payload to a monitored live
     target, print results, collect findings, and optionally write the payloads
@@ -1457,6 +1568,7 @@ def _run_catalog(args, catalog, label: str, note: Optional[str] = None) -> int:
 
     print(f"\nTotal {label.lower()} tests: {len(results)}")
     _print_undelivered(results)
+    _print_file_only(results, args)
     if note:
         print(note)
     _collect_results(args, results)
@@ -2229,6 +2341,33 @@ def main(argv: Optional[List[str]] = None):
     )
 
     parser.add_argument(
+        '--dicomweb-url',
+        metavar='URL',
+        help='Deliver over DICOMweb instead of DIMSE, e.g. '
+             'http://host:8042/dicom-web. STOW-RS posts complete Part-10 '
+             'instances as application/dicom, so the 128-byte preamble and '
+             'anything past the Data Set cross the wire — which C-STORE '
+             'cannot do. Retrieval uses WADO-RS.')
+    parser.add_argument(
+        '--dicomweb-token',
+        metavar='TOKEN',
+        help='Bearer token for the DICOMweb endpoint.')
+    parser.add_argument(
+        '--insecure',
+        action='store_true',
+        help='Skip TLS verification for --dicomweb-url. Clinical endpoints '
+             'often present internal-CA certificates; this is opt-in so a '
+             'run never silently downgrades.')
+    parser.add_argument(
+        '--verify-retrieval',
+        action='store_true',
+        help='After a successful C-STORE, fetch the instance back with C-GET '
+             'and report what the archive did to the embedded content: '
+             'returned intact, payload retained, altered, or stripped. '
+             'Acceptance alone cannot tell a distribution channel from an '
+             'archive that neutralised the object. Costs one extra '
+             'association per stored payload and needs C-GET support.')
+    parser.add_argument(
         '--delivery',
         choices=['auto', 'pdu', 'cstore'],
         default='auto',
@@ -2411,13 +2550,19 @@ def main(argv: Optional[List[str]] = None):
             ProcessMonitor(proc),
             ProtocolMonitor(),
         ]
+        if getattr(args, 'verify_retrieval', False):
+            args._monitors.append(PipelineMonitor())
         args.target = f"{args.ip}:{asan_port}"
         print(f"Monitors: SanitizerMonitor, ProcessMonitor, ProtocolMonitor")
         print(f"Target: {args.target} (ASan-instrumented)")
         print()
     else:
         args._monitors = [ProtocolMonitor()]
-        print("Monitors: ProtocolMonitor (black-box)")
+        if getattr(args, 'verify_retrieval', False):
+            args._monitors.append(PipelineMonitor())
+        print("Monitors: " + ", ".join(type(m).__name__
+                                       for m in args._monitors)
+              + " (black-box)")
         print(f"Target: {args.target}")
         print()
 

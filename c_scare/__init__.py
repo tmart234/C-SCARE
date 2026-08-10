@@ -180,6 +180,7 @@ from .server import RawSCP, ConnectionState, Connection
 from .deliver import (
     CStoreOutcome, send_pdu, send_sequence, send_cstore, send_cstore_outcome,
 )
+from .client import RetrieveOutcome, retrieve_instance
 
 # SCU-side attack workflows (issuer drivers): AE brute, credential brute,
 # sculpted query builder. Query/retrieve flows (c_find/c_get/c_move) live on
@@ -355,7 +356,7 @@ __all__ = [
     # Rogue server & network delivery
     "RawSCP", "ConnectionState", "Connection",
     "send_pdu", "send_sequence", "send_cstore", "send_cstore_outcome",
-    "CStoreOutcome",
+    "CStoreOutcome", "RetrieveOutcome", "retrieve_instance",
     # SCU-side attack workflows
     "RoleNegotiationResult", "HostileObservation",
     "AETResult", "CredResult", "QR_MODELS",

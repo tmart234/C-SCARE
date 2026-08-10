@@ -172,6 +172,132 @@ signature before `execve` will touch an image, which cannot be synthesised
 inertly; that payload therefore tests whether a scanner *recognises* an
 embedded Mach-O, not whether the host would load one.
 
+*What the payload rides on* decides whether an archive ever reads it. Payloads
+1–15 build their own minimal Part-10 file, which establishes the structure and
+stops there: a Secondary Capture with no Pixel Data, no Study or Series UID and
+no image geometry is an incomplete object, so a PACS rejects it against the IOD
+before any private element is parsed, and the result says nothing about whether
+the archive would accept an executable. `metadata['carrier']` marks the
+payloads that ride a complete Secondary Capture built with pydicom — full UID
+chain, Image Pixel module, and Pixel Data whose length matches
+`Rows × Columns × SamplesPerPixel × BitsAllocated / 8`. The embed lands in the
+private group, which sorts ahead of `(7FE0,0010)`, so the object still renders
+the image it rendered before and a refusal is attributable to the payload.
+
+Those carriers also fix a conformance problem in the published construction.
+Aguilar & Palmer §5.2 report the reference implementation using "group 0x0009,
+element 0x0000, with a 12-byte Explicit VR (long form) header", and the V3GAS
+slides show `(0009,0010)` for the SLDPLD container. Those are the Group Length
+tag and the private creator slot; neither may hold an OB value, and neither is
+preceded by a creator claiming a block — which Hetzel et al. §3.2 states a
+vendor "must first define" before using private elements. C-SCARE emits a real
+private block: an LO creator at `(0009,0010)` claiming block `10xx`, with the
+carrier at `(0009,1001)`. A validator can reject the published shape for a
+reason unrelated to what it is hiding; it cannot reject this one.
+
+`cve_2019_11687_23_published_group_length_tag` reproduces the published shape
+anyway, marked `conformance: non-conformant-by-design`. It is what the released
+toolkit emits, pydicom parses it, and a detector tuned only against a proper
+private block would miss the tool actually in circulation.
+
+One figure differs deliberately. §5.1 of the paper gives "approximately 46"
+usable bytes for the preamble DOS-header zone; `enumerate_safe_zones` reports
+58. The 12-byte gap is the legacy block header PS3.10 cites as the reason the
+preamble exists — reserving it is conservative, but a PE loader reads only
+`e_magic` and `e_lfanew`, so 58 is what the format actually imposes on an
+attacker. The zone's `note` records both numbers.
+
+Alongside the executable polyglots, `metadata['container_format']` marks a
+second embedding shape from the same talk: a length-prefixed blob —
+`[magic 8B][size uint32 LE][body]` — in a private element after the File Meta
+group and ahead of the pixel data. The framing is the durable signal, since the
+talk states the magic string is regenerated per engagement, so the catalog
+ships the same container under the published example magic and under a
+different one. A detector keyed on the literal string catches one and misses
+the other; a detector keyed on the structure catches both. The body is an inert
+marker — this catalog builds detection tests, not loaders, so the shellcode and
+the sideloaded-DLL execution chain that the talk pairs with the format are
+deliberately absent.
+
+### Which half survives the wire
+
+Measured against a pynetdicom Storage SCP, not assumed. C-STORE carries a Data
+Set; the 128-byte preamble is a *file* construct PS3.10 defines outside it, and
+so is anything past the final Data Element. Neither is transmitted — the
+receiving SCP writes its own zeroed preamble.
+
+The consequence is worth stating plainly: **no executable polyglot survives
+C-STORE as a loadable image.** `MZ`, `\x7fELF` and the Mach-O magic all sit at
+offset 0, and `e_lfanew` at 0x3C. What does survive is whatever lives inside a
+Data Element — the PE headers and section data in a private element, the
+container blob, the padding-tail payload — and that arrives intact.
+
+This is recorded as a property of the *payload*, not of a transport:
+`metadata['payload_region']` is `data_set` when the content sits inside a Data
+Element and `whole_file` when it sits in the preamble or past the Data Set.
+Each transport separately declares whether it `carries_whole_file`, and
+`transport.survives()` combines the two. Only payloads whose mechanism reaches
+the archive are scored on acceptance — scoring the rest would report a finding
+against an archive that received an ordinary image.
+
+| Transport | Carries whole files | Polyglot payloads whose mechanism arrives |
+|-----------|:-------------------:|:------------------------------------------:|
+| DIMSE (C-STORE / C-GET) | no — sends a Data Set | 14 of 23 |
+| DICOMweb (STOW-RS / WADO-RS) | yes — `application/dicom` instances | 23 of 23 |
+
+`--dicomweb-url http://host:8042/dicom-web` selects the HTTP transport, which
+is the pathway Hetzel et al. §3.1 used to load polyglots into Orthanc. It is
+also the only one on which a round trip can return `pipeline:survived_intact`,
+because the preamble crosses in both directions. Media, DICOMDIR and import
+folders carry whole files too; `c-scare corpus -o ./out` writes them for those.
+
+| Zone | Reaches the archive over C-STORE |
+|------|----------------------------------|
+| Private (odd-group) `OB` element | yes — the value is a Data Element |
+| Padding tail of a Data Element | yes — inside the declared length |
+| Preamble DOS header / DOS stub | no — never transmitted |
+| Space after the final Data Element | no — outside the Data Set |
+| Fragmented across zones | no — the trailing piece is lost and the object fails to decode |
+
+When a payload whose content *does* arrive is stored, `ProtocolMonitor` reports
+`storage:payload_accepted` rather than a clean result. That inversion matters:
+for most of the catalog an orderly answer is a pass, but here the archive
+complying — keeping attacker-controlled bytes in a region conforming readers
+never inspect — is the outcome the test exists to catch.
+
+### Did it survive the pipeline?
+
+Acceptance still cannot separate an archive that *distributes* the artifact
+from one that neutralised it on ingest — both answer `0x0000`. `--verify-retrieval`
+fetches the instance back with C-GET and compares, which is the S.P.I.C.Y.
+Cascading property measured rather than assumed:
+
+| Verdict | Finding | Meaning |
+|---------|:-------:|---------|
+| `pipeline:survived_intact` | yes | Retrieved copy is still valid in both formats. The archive is a distribution channel for the object. |
+| `pipeline:payload_retained` | yes | Private-element bytes came back unchanged; the offset-0 header did not survive this pathway. Expected for C-STORE. |
+| `pipeline:altered` | yes | Carrier returned but rewritten — check whether the change neutralises it. |
+| `pipeline:stripped` | no | The archive removed the embedded content. The outcome a defender wants. |
+| `retrieve:unavailable` | no | Could not fetch it back; the round trip concluded nothing. |
+
+The retrieve is skipped when the store was refused — fetching an instance that
+was never accepted would report `stripped` for an object that was never there.
+
+**What this does not measure is execution, deliberately.** These images are
+inert by construction — entry point 0, no `PF_X`, no `IMAGE_SCN_MEM_EXECUTE` —
+and a polyglot never executes itself in any case. Activation is a separate
+link in the chain that lives outside the file and depends on the environment:
+Hetzel et al. Fig. 4 executes theirs by invoking it from a terminal, Aguilar &
+Palmer §6.1 assume a separate prompting channel, and the SLDPLD format relies
+on a sideloaded DLL to extract and run the blob. What lives in the bytes is
+whether the artifact is still the artifact after the pipeline handled it, and
+that is what these verdicts report.
+
+C-GET rather than C-MOVE because it needs no inbound listener and no AE
+registration on the target. The cost is that fewer archives implement it, and
+the SCP must grant the Storage SCP role — without it the retrieve comes back
+`0xA702 Refused: unable to perform sub-operations`.
+
 The payloads are structurally complete on both sides — `validate_polyglot`
 dispatches on the magic at offset 0 and confirms a loader can walk every
 header (`validate_pe`, `validate_elf`, `validate_macho`) while pydicom reads

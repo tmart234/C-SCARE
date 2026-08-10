@@ -121,10 +121,13 @@ from .element import Element, Dataset, Tag, VR
 from .corruptor import Corruptor, Override, Injection, InjectionPoint
 from .pixel import EncapsulatedPixelData, Fragment
 from .file import DicomFile
+from .monitor import ProtocolMonitor
+from .transport import REGION_DATA_SET, REGION_WHOLE_FILE
 from .polyglot import (
-    FILE_ALIGNMENT, align_up, dos_header, dos_stub, elf_header, elf_image,
-    filler, macho_header, macho_image, pe_fragments, pe_headers_len, pe_image,
-    shannon_entropy,
+    ELF_HEADER_LEN, ELF_PHDR_LEN, ELF_TYPE_DYN, ELF_TYPE_EXEC, FILE_ALIGNMENT,
+    align_up, dos_header, dos_stub, elf_fragments, elf_header, elf_image,
+    embed_in_carrier, filler, inspect_carrier, macho_header, macho_image,
+    pe_fragments, pe_headers_len, pe_image, shannon_entropy,
 )
 
 # Scapy imports - may not be available in all environments
@@ -281,6 +284,90 @@ def part10_file(meta_elements: List[Element], dataset: bytes = b'',
         implicit_vr=False, little_endian=True)
     return (preamble[:PART10_PREAMBLE_LEN].ljust(PART10_PREAMBLE_LEN, b'\x00')
             + DICM_PREFIX + header + body + dataset)
+
+
+#: Fixed UID root for synthesised carriers, so a run is reproducible and the
+#: objects are traceable to this tool rather than colliding with real studies.
+CARRIER_UID_ROOT = '1.2.826.0.1.3680043.10.1337'
+
+
+def secondary_capture_carrier(rows: int = 16, columns: int = 16,
+                              sop_instance_uid: str = None,
+                              transfer_syntax: str = EXPLICIT_VR_LE_UID
+                              ) -> bytes:
+    """A complete Secondary Capture object a PACS has no reason to refuse.
+
+    Built with pydicom so the encoding is not this project's opinion of the
+    standard. Everything the Secondary Capture IOD makes Type 1 or Type 2 is
+    present — the SOP Common, Patient, Study, Series and General Image
+    modules, plus an Image Pixel module whose Pixel Data length actually
+    matches ``Rows × Columns × SamplesPerPixel × BitsAllocated / 8``.
+
+    That last part is the difference between a carrier and a stub. An archive
+    validates against the IOD before it looks at anything else, so a synthetic
+    object missing Study/Series UIDs or Pixel Data is rejected as incomplete
+    and an embedded payload never gets read. Requiring a real image also makes
+    the polyglot honest: it is what a technologist would see rendered.
+    """
+    from io import BytesIO
+
+    import pydicom
+    from pydicom.dataset import Dataset as PydicomDataset, FileMetaDataset
+
+    instance = sop_instance_uid or f'{CARRIER_UID_ROOT}.1.1'
+
+    meta = FileMetaDataset()
+    meta.MediaStorageSOPClassUID = SECONDARY_CAPTURE_SOP_CLASS_UID
+    meta.MediaStorageSOPInstanceUID = instance
+    meta.TransferSyntaxUID = transfer_syntax
+    meta.ImplementationClassUID = IMPLEMENTATION_CLASS_UID
+
+    ds = PydicomDataset()
+    ds.file_meta = meta
+    ds.preamble = b'\x00' * PART10_PREAMBLE_LEN
+
+    # SOP Common — the dataset UIDs must agree with the File Meta group, or a
+    # receiver that cross-checks them rejects the object.
+    ds.SOPClassUID = SECONDARY_CAPTURE_SOP_CLASS_UID
+    ds.SOPInstanceUID = instance
+    ds.SpecificCharacterSet = 'ISO_IR 100'
+
+    # Patient / Study / Series — Type 2 means present, and may be empty; the
+    # UID chain is Type 1 and may not.
+    ds.PatientName = 'Test^Polyglot'
+    ds.PatientID = 'C-SCARE-0001'
+    ds.PatientBirthDate = ''
+    ds.PatientSex = ''
+    ds.StudyInstanceUID = f'{CARRIER_UID_ROOT}.1'
+    ds.SeriesInstanceUID = f'{CARRIER_UID_ROOT}.1.2'
+    ds.StudyDate = '20260101'
+    ds.StudyTime = '120000'
+    ds.AccessionNumber = ''
+    ds.ReferringPhysicianName = ''
+    ds.StudyID = '1'
+    ds.SeriesNumber = '1'
+    ds.InstanceNumber = '1'
+    ds.Modality = 'OT'
+    ds.ConversionType = 'WSD'          # Type 1 for Secondary Capture
+
+    # Image Pixel module. A simple gradient rather than a constant fill, so the
+    # rendered image is visibly an image and the pixel data has an ordinary
+    # byte distribution instead of a flat one.
+    ds.SamplesPerPixel = 1
+    ds.PhotometricInterpretation = 'MONOCHROME2'
+    ds.Rows = rows
+    ds.Columns = columns
+    ds.BitsAllocated = 8
+    ds.BitsStored = 8
+    ds.HighBit = 7
+    ds.PixelRepresentation = 0
+    ds.PixelData = bytes(
+        ((x * 255) // max(columns - 1, 1) + (y * 255) // max(rows - 1, 1)) // 2
+        for y in range(rows) for x in range(columns))
+
+    buffer = BytesIO()
+    ds.save_as(buffer, enforce_file_format=True)
+    return buffer.getvalue()
 
 
 def minimal_dataset() -> bytes:
@@ -4471,6 +4558,167 @@ class CVEAttacks:
         return payload, fragments
 
     @staticmethod
+    def _pedicom_published_tag(bits: int = 64) -> bytes:
+        """PEDICOM with the carrier at (0009,0000), as the paper describes it.
+
+        Aguilar & Palmer §5.2 report the reference implementation using
+        "group 0x0009, element 0x0000, with a 12-byte Explicit VR (long form)
+        header". That is the Group Length tag, which PS3.5 does not permit to
+        hold an OB value, and there is no Private Creator claiming a block —
+        Hetzel et al. §3.2 note a vendor "must first define a Private Creator
+        Data Element to reserve a range of Data Element Numbers".
+
+        Every other payload here uses the conformant form, because a validator
+        can reject the published shape for a reason unrelated to what it
+        hides. This one reproduces the published shape anyway: it is what the
+        released toolkit emits, so a detector tuned only against a proper
+        private block would miss the tool actually in circulation. pydicom
+        reads it, which is the point — non-conformant is not the same as
+        unparseable.
+        """
+        head = CVEAttacks._polyglot_head_len()
+        identity = CVEAttacks._polyglot_identity()
+        value_start = (head + len(identity) +
+                       CVEAttacks._LONG_FORM_HEADER_LEN)
+        pad = -value_start % 4
+        pe_offset = value_start + pad
+
+        carrier = Element(0x0009, 0x0000, 'OB',
+                          b'\x00' * pad + pe_image(pe_offset, bits=bits))
+        return CVEAttacks._polyglot_part10(
+            preamble=dos_header(pe_offset) + dos_stub(),
+            insert=carrier.encode(implicit_vr=False, little_endian=True),
+        )
+
+    @staticmethod
+    def _fragmented_elfdicom(bits: int = 64
+                             ) -> Tuple[bytes, List[Dict[str, Any]]]:
+        """An ELF split across four regions, one of which no PE can use.
+
+        The PE fragmentation payload had to leave the preamble's DOS-stub zone
+        empty: a PE section must start on a 512-byte ``FileAlignment``
+        boundary at or past ``SizeOfHeaders``, and bytes 0x40-0x7F satisfy
+        neither. ELF has no such rule — a ``PT_LOAD`` may begin at any file
+        offset provided ``p_vaddr`` agrees with it modulo the page size — so
+        the same 64 bytes hold a real segment here.
+
+        That is the concrete reason a scanner cannot reuse its PE reasoning:
+        the regions worth searching are not the same regions, and the ELF set
+        is strictly larger.
+
+        Layout: header at 0, one segment in the preamble tail, the program
+        header table in a private element, a second segment in an element's
+        padding tail, and a third past the end of the Data Set.
+        """
+        head = CVEAttacks._polyglot_head_len()
+        identity = CVEAttacks._polyglot_identity()
+        patient = CVEAttacks._polyglot_patient()
+        creator = CVEAttacks._POLYGLOT_PRIVATE_CREATOR.encode(
+            implicit_vr=False, little_endian=True)
+        long_form = CVEAttacks._LONG_FORM_HEADER_LEN
+        phdr_len = ELF_PHDR_LEN[bits]
+        header_len = ELF_HEADER_LEN[bits]
+
+        # Segment A: the preamble bytes the ELF header does not occupy.
+        stub_offset = header_len
+        stub_size = PART10_PREAMBLE_LEN - header_len
+
+        # The program header table, in a private OB element.
+        table_value_start = (head + len(identity) + len(creator) + long_form)
+        pad = -table_value_start % 8      # natural alignment of the phdr fields
+        table_offset = table_value_start + pad
+        table_len = 3 * phdr_len
+        table_value_len = pad + table_len
+        table_value_len += table_value_len % 2
+        after_table = table_value_start + table_value_len
+
+        # Segment B: the padding tail of a second private element. No
+        # alignment maths — ELF takes the offset as it falls.
+        content = b'VENDORCFG\x00'
+        b_value_start = after_table + long_form
+        seg_b_offset = b_value_start + len(content)
+        seg_b_size = 0x100
+        after_b = b_value_start + len(content) + seg_b_size
+
+        # Segment C: past the final Data Element.
+        seg_c_offset = after_b + len(patient)
+        seg_c_size = 0x100
+
+        table, (seg_a, seg_b, seg_c) = elf_fragments(
+            table_offset,
+            [(stub_offset, stub_size), (seg_b_offset, seg_b_size),
+             (seg_c_offset, seg_c_size)],
+            bits=bits)
+
+        carriers = (
+            Element(0x0009, 0x1001, 'OB', b'\x00' * pad + table),
+            Element(0x0009, 0x1002, 'UN', content + seg_b),
+        )
+        payload = CVEAttacks._polyglot_part10(
+            preamble=elf_header(table_offset, ph_count=3, bits=bits) + seg_a,
+            insert=creator + b''.join(
+                c.encode(implicit_vr=False, little_endian=True)
+                for c in carriers),
+            trailing=seg_c,
+        )
+
+        fragments = [
+            {'zone': 'preamble_dos_stub', 'offset': stub_offset,
+             'length': stub_size,
+             'part': 'PT_LOAD 0 — a region no PE section can occupy'},
+            {'zone': 'private_element', 'offset': table_offset,
+             'length': table_len, 'part': 'program header table'},
+            {'zone': 'element_padding', 'offset': seg_b_offset,
+             'length': seg_b_size, 'part': 'PT_LOAD 1'},
+            {'zone': 'trailing', 'offset': seg_c_offset,
+             'length': seg_c_size, 'part': 'PT_LOAD 2'},
+        ]
+        for fragment in fragments:
+            end = fragment['offset'] + fragment['length']
+            assert end <= len(payload), (fragment, len(payload))
+        return payload, fragments
+
+    @staticmethod
+    def _elfdicom_on_carrier(bits: int = 64, fill: str = 'strings',
+                             segment_size: int = 0x400,
+                             elf_type: int = ELF_TYPE_EXEC
+                             ) -> Tuple[bytes, Dict[str, Any]]:
+        """ELFDICOM embedded in a complete Secondary Capture image.
+
+        The Linux counterpart of :meth:`_pedicom_on_carrier`, and the payload
+        to reach for against a Linux PACS: an object the archive accepts on
+        IOD grounds, which a ``file(1)``/``binfmt_elf`` magic check also calls
+        an ELF executable. Only the preamble is replaced — the ELF header
+        fits the first 64 bytes exactly — so the image still renders.
+        """
+        host = secondary_capture_carrier()
+        before = inspect_carrier(host)
+        data, offset = embed_in_carrier(
+            host,
+            lambda at: elf_image(at, bits=bits, segment_size=segment_size,
+                                 fill=fill),
+            align=8,
+            preamble=lambda at: elf_header(
+                at, ph_count=1, bits=bits, elf_type=elf_type).ljust(
+                    PART10_PREAMBLE_LEN, b'\x00'),
+        )
+        after = inspect_carrier(data)
+        return data, {
+            'ph_offset': offset,
+            'elf_bits': bits,
+            'elf_type': 'ET_DYN' if elf_type == ELF_TYPE_DYN else 'ET_EXEC',
+            'carrier_sop_instance_uid': after.sop_instance_uid,
+            'study_instance_uid': after.study_instance_uid,
+            'series_instance_uid': after.series_instance_uid,
+            'study_instance_uid': after.study_instance_uid,
+            'series_instance_uid': after.series_instance_uid,
+            'carrier_pixel_data_offset': after.pixel_data_offset,
+            'carrier_pixel_data_bytes': after.pixel_data_length,
+            'carrier_pixel_data_intact':
+                before.pixel_data_length == after.pixel_data_length,
+        }
+
+    @staticmethod
     def _elfdicom(bits: int = 64, segment_size: int = 0x200) -> bytes:
         """The ELF counterpart of :meth:`_pedicom`, with ELF's own rules.
 
@@ -4543,6 +4791,109 @@ class CVEAttacks:
                                             little_endian=True),
         )
 
+    # -- Embedding into a real, storable image object ----------------------
+    #
+    # The payloads above build their own minimal Part-10 file, which proves
+    # the structure and stops there: a Secondary Capture with no Pixel Data,
+    # no Study or Series UID and no image geometry is an incomplete object,
+    # and an archive rejects it against the IOD before any private element is
+    # read. These carry the same constructions on an object a PACS has no
+    # reason to refuse, so a rejection means something.
+
+    @staticmethod
+    def _pedicom_on_carrier(bits: int = 64, fill: str = 'zeros',
+                            section_size: int = 0x200,
+                            section_name: bytes = b'.rdata'
+                            ) -> Tuple[bytes, Dict[str, Any]]:
+        """PEDICOM embedded in a complete Secondary Capture image.
+
+        The private element sorts between the (0008,xxxx) and (0010,xxxx)
+        groups, so the PE lands well ahead of (7FE0,0010) and the image is
+        untouched — the object still renders as the gradient a viewer would
+        show. ``e_lfanew`` is resolved against the finished file, which is why
+        the image is built by a callback that receives its own offset.
+        """
+        host = secondary_capture_carrier()
+        before = inspect_carrier(host)
+        data, offset = embed_in_carrier(
+            host,
+            lambda at: pe_image(at, bits=bits, section_size=section_size,
+                                section_name=section_name, fill=fill),
+            align=4,
+            preamble=lambda at: dos_header(at) + dos_stub(),
+        )
+        after = inspect_carrier(data)
+        return data, {
+            'pe_offset': offset,
+            'pe_bits': bits,
+            'carrier_sop_class_uid': after.sop_class_uid,
+            'carrier_sop_instance_uid': after.sop_instance_uid,
+            'study_instance_uid': after.study_instance_uid,
+            'series_instance_uid': after.series_instance_uid,
+            'study_instance_uid': after.study_instance_uid,
+            'series_instance_uid': after.series_instance_uid,
+            'carrier_pixel_data_offset': after.pixel_data_offset,
+            'carrier_pixel_data_bytes': after.pixel_data_length,
+            'carrier_pixel_data_intact':
+                before.pixel_data_length == after.pixel_data_length,
+        }
+
+    # The published example magic from the V3GAS talk's SLDPLD format. The
+    # talk states the real string is generated per engagement, so a signature
+    # on this literal catches only the demo — which is exactly what the pair
+    # of payloads below is for.
+    _SLDPLD_EXAMPLE_MAGIC = b'SLDPLD\x00\x00'
+    _SLDPLD_ALTERNATE_MAGIC = b'CSCARE\x00\x00'
+
+    @staticmethod
+    def _tagged_blob(magic: bytes, body: bytes) -> bytes:
+        """``[magic 8B][size uint32 LE][body]`` — the SLDPLD container shape.
+
+        The framing is the durable signal. A loader that reads a length-
+        prefixed blob out of a private element needs a magic to find it and a
+        size to bound it, whatever bytes it later hands to something else, so
+        a detector keyed on the *structure* keeps working when the magic
+        changes and one keyed on the string does not.
+
+        ``body`` here is an inert marker. Nothing in this catalog emits
+        executable code, and a container carrying a marker exercises exactly
+        the same recogniser.
+        """
+        if len(magic) != 8:
+            raise ValueError(f'magic is {len(magic)} bytes, must be 8')
+        return magic + struct.pack('<I', len(body)) + body
+
+    @staticmethod
+    def _sldpld_on_carrier(magic: bytes) -> Tuple[bytes, Dict[str, Any]]:
+        """A length-prefixed private-tag container on a storable image.
+
+        Placed the way the talk describes it — a private element after the
+        File Meta group and ahead of the pixel data — so a viewer renders the
+        image and a conforming parser walks past the container without
+        inspecting it.
+        """
+        marker = (b'C-SCARE INERT MARKER: this container carries no code. '
+                  b'It exists so a scanner can be tested against the '
+                  b'framing, not against a payload.')
+        body = CVEAttacks._tagged_blob(magic, marker)
+        host = secondary_capture_carrier()
+        before = inspect_carrier(host)
+        data, offset = embed_in_carrier(host, lambda _at: body, align=2)
+        after = inspect_carrier(data)
+        return data, {
+            'container_offset': offset,
+            'container_magic': magic.rstrip(b'\x00').decode('ascii'),
+            'carrier_sop_instance_uid': after.sop_instance_uid,
+            'study_instance_uid': after.study_instance_uid,
+            'series_instance_uid': after.series_instance_uid,
+            'study_instance_uid': after.study_instance_uid,
+            'series_instance_uid': after.series_instance_uid,
+            'container_body_bytes': len(marker),
+            'carrier_pixel_data_offset': after.pixel_data_offset,
+            'carrier_pixel_data_intact':
+                before.pixel_data_length == after.pixel_data_length,
+        }
+
     @staticmethod
     def cve_2019_11687_polyglot() -> List[AttackResult]:
         """
@@ -4606,46 +4957,87 @@ class CVEAttacks:
                       'zone': 'preamble_dos_header', 'elf_bits': 64}
         ))
 
-        # Test 3: Shell script in preamble
-        script = b'#!/bin/sh\necho "pwned"\n#'
+        # Test 3: Shell script in preamble.
+        #
+        # The `exit 0` is load-bearing. A shebang and a comment marker are not
+        # enough: `#` comments to the end of its line only, so without an exit
+        # the interpreter runs on into the Data Set and parses DICOM bytes as
+        # shell. `sh -n` rejected the earlier version with "EOF in backquote
+        # substitution" — it was a file that *looked* like a script polyglot
+        # and was not one. Hetzel et al. Fig. 2 shows the same construction
+        # with "a proper exit from the script" for this reason.
+        script = b'#!/bin/sh\nexit 0\n#'
         script += b'\x00' * (128 - len(script))
-        
-        file_data = CVEAttacks._polyglot_part10(script)
-        
+
         results.append(AttackResult(
             name='cve_2019_11687_03_script_preamble',
             category='cve',
-            payload=file_data,
-            description='Shell script in DICOM preamble',
-            expected_behavior='Scanner should detect script',
+            payload=CVEAttacks._polyglot_part10(script),
+            description='POSIX shell script in the DICOM preamble that exits '
+                        'before the Data Set',
+            expected_behavior='Scanner should detect the shebang; a file that '
+                              'is both a rendered image and a script the '
+                              'shell will run is the point',
             metadata={'cve': 'CVE-2019-11687', 'polyglot': 'shell',
                       'zone': 'preamble_dos_header'}
         ))
-        
-        # Test 4: Batch script in preamble
-        batch = b'@echo off\r\necho pwned\r\nREM '
+
+        # Test 4: Batch script in preamble. `EXIT /B` for the same reason
+        # `exit 0` is there in test 3 — REM comments one line, and cmd.exe
+        # would otherwise keep reading the Data Set as batch commands.
+        batch = b'@echo off\r\nEXIT /B 0\r\nREM '
         batch += b' ' * (128 - len(batch))
-        
-        file_data = CVEAttacks._polyglot_part10(batch)
-        
+
         results.append(AttackResult(
             name='cve_2019_11687_04_batch_preamble',
             category='cve',
-            payload=file_data,
-            description='Batch script in DICOM preamble',
-            expected_behavior='Scanner should detect batch script',
+            payload=CVEAttacks._polyglot_part10(batch),
+            description='Windows batch script in the DICOM preamble that '
+                        'exits before the Data Set',
+            expected_behavior='Scanner should detect batch content in the '
+                              'preamble',
             metadata={'cve': 'CVE-2019-11687', 'polyglot': 'batch',
                       'zone': 'preamble_dos_header'}
         ))
 
-        # Test 5: TIFF header in preamble (dual-purpose TIFF/DICOM)
-        # The CVE explicitly cites whole-slide-imaging TIFF/DICOM polyglots
-        # as a real-world dual-purpose case.
-        tiff = b'II*\x00'                     # TIFF little-endian (Intel) magic
-        tiff += struct.pack('<I', 8)          # offset to first IFD
-        tiff += struct.pack('<H', 0)          # IFD with 0 directory entries
+        # Test 5: a complete 1x1 TIFF inside the preamble.
+        #
+        # Whole-slide imaging really does ship TIFF/DICOM dual-purpose files,
+        # so this one has to open as an image, not just carry the magic. The
+        # earlier version declared an IFD with zero directory entries: `file`
+        # reported "TIFF image data, direntries=0" while Pillow refused it
+        # with UnidentifiedImageError, which made it a magic probe wearing a
+        # dual-purpose label.
+        #
+        # Eight tags is the minimum a reader needs, and at 12 bytes each the
+        # whole structure plus one pixel fits the 128-byte preamble with room
+        # to spare.
+        _tiff_ifd_offset = 8
+        _tiff_entries = [
+            (0x0100, 3, 1, 1),        # ImageWidth  = 1
+            (0x0101, 3, 1, 1),        # ImageLength = 1
+            (0x0102, 3, 1, 8),        # BitsPerSample = 8
+            (0x0103, 3, 1, 1),        # Compression = none
+            (0x0106, 3, 1, 1),        # PhotometricInterpretation = BlackIsZero
+            (0x0111, 4, 1, 0),        # StripOffsets — patched below
+            (0x0116, 3, 1, 1),        # RowsPerStrip = 1
+            (0x0117, 4, 1, 1),        # StripByteCounts = 1
+        ]
+        _tiff_pixel_offset = (_tiff_ifd_offset + 2
+                              + len(_tiff_entries) * 12 + 4)
+        tiff = b'II*\x00' + struct.pack('<I', _tiff_ifd_offset)
+        tiff += struct.pack('<H', len(_tiff_entries))
+        for tag, field_type, count, value in _tiff_entries:
+            if tag == 0x0111:
+                value = _tiff_pixel_offset
+            # Values <= 4 bytes live in the value field itself, left-aligned.
+            tiff += struct.pack('<HHI', tag, field_type, count)
+            tiff += (struct.pack('<H', value) + b'\x00\x00'
+                     if field_type == 3 else struct.pack('<I', value))
         tiff += struct.pack('<I', 0)          # no next IFD
-        tiff += b'\x00' * (128 - len(tiff))   # pad out the 128-byte preamble
+        tiff += b'\x80'                       # the single mid-grey pixel
+        assert len(tiff) == _tiff_pixel_offset + 1, len(tiff)
+        tiff = tiff.ljust(128, b'\x00')       # pad out the 128-byte preamble
 
         file_data = CVEAttacks._polyglot_part10(tiff)
 
@@ -4861,6 +5253,193 @@ class CVEAttacks:
                       'section_entropy': round(
                           shannon_entropy(filler('packed', 0x1000)), 3)}
         ))
+
+        # Test 16: the same construction as test 1, carried by an object an
+        # archive has no reason to refuse. Tests 1-15 build their own minimal
+        # Part-10 file, which proves the structure and stops there — a
+        # Secondary Capture with no Pixel Data and no Study/Series UID is an
+        # incomplete object, so a PACS rejects it against the IOD and the
+        # private element is never read. Here the payload rides a complete
+        # image that still renders, so a rejection is about the executable.
+        carried, carried_meta = CVEAttacks._pedicom_on_carrier(
+            bits=64, fill='strings', section_name=b'.rdata')
+        results.append(AttackResult(
+            name='cve_2019_11687_16_pe_in_storable_image',
+            category='cve',
+            payload=carried,
+            description='PEDICOM embedded in a complete Secondary Capture '
+                        'object that still renders its image',
+            expected_behavior='PACS should reject or strip the executable; a '
+                              'rejection here is about the payload, not about '
+                              'an incomplete object',
+            metadata={'cve': 'CVE-2019-11687', 'polyglot': 'PE',
+                      'zone': 'private_element',
+                      'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                      'sop_instance_uid': carried_meta[
+                          'carrier_sop_instance_uid'],
+                      'carrier': 'secondary_capture_image',
+                      **carried_meta}
+        ))
+
+        # Tests 17 and 18: the length-prefixed private-tag container the V3GAS
+        # talk calls SLDPLD — a magic, a 32-bit size, and a body a loader
+        # would read back out. The body here is an inert marker; the framing
+        # is what a scanner has to recognise.
+        #
+        # Two magics on purpose. The talk states the real string is generated
+        # per engagement, so a detector keyed on the published literal catches
+        # 17 and misses 18, while one keyed on the structure catches both.
+        # Shipping only the published magic would score the weaker detector as
+        # a pass.
+        for suffix, name, magic in (
+                ('17', 'published_magic', CVEAttacks._SLDPLD_EXAMPLE_MAGIC),
+                ('18', 'rotated_magic', CVEAttacks._SLDPLD_ALTERNATE_MAGIC)):
+            payload, container_meta = CVEAttacks._sldpld_on_carrier(magic)
+            results.append(AttackResult(
+                name=f'cve_2019_11687_{suffix}_private_tag_container_{name}',
+                category='cve',
+                payload=payload,
+                description='Length-prefixed container (magic + uint32 size + '
+                            f'body) in a private OB element, magic '
+                            f'{container_meta["container_magic"]!r}',
+                expected_behavior='Scanner should key on the container framing '
+                                  'inside private elements, not on one literal '
+                                  'magic string',
+                metadata={'cve': 'CVE-2019-11687',
+                          'zone': 'private_element',
+                          'container_format': 'magic+len32+body',
+                          'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                          'sop_instance_uid': container_meta[
+                              'carrier_sop_instance_uid'],
+                          'carrier': 'secondary_capture_image',
+                          **container_meta}
+            ))
+
+        # Tests 19-22: ELF coverage to match the PE side, for a Linux target.
+        # Until now ELF had two payloads to PE's ten, so a Linux PACS or
+        # scanner was being tested against a fraction of the surface.
+
+        # 19: the ELF32 variant of test 12. Elf32_Phdr orders its fields
+        # differently from Elf64_Phdr — p_flags is last rather than second —
+        # so a reader that handles one layout and assumes the other reads
+        # segment permissions out of the wrong offset.
+        results.append(AttackResult(
+            name='cve_2019_11687_19_elf32_private_element',
+            category='cve',
+            payload=CVEAttacks._elfdicom(bits=32),
+            description='ELFDICOM with a 32-bit ELF whose program header '
+                        'table and PT_LOAD live in a private OB element',
+            expected_behavior='Scanner should follow e_phoff regardless of ELF '
+                              'class; Elf32_Phdr is not Elf64_Phdr with '
+                              'smaller fields',
+            metadata={'cve': 'CVE-2019-11687', 'polyglot': 'ELF',
+                      'zone': 'private_element', 'elf_bits': 32}
+        ))
+
+        # 20: ELF fragmentation, which reaches a region the PE version cannot.
+        # See CVEAttacks._fragmented_elfdicom.
+        elf_fragged, elf_frags = CVEAttacks._fragmented_elfdicom()
+        results.append(AttackResult(
+            name='cve_2019_11687_20_elf_fragmented_zones',
+            category='cve',
+            payload=elf_fragged,
+            description='ELF split across the preamble tail, a private '
+                        'element, an element padding tail and the trailing '
+                        'region',
+            expected_behavior='Scanner should follow the program header table '
+                              'rather than match a contiguous image, and must '
+                              'not assume PE alignment rules bound where an '
+                              'ELF segment can sit',
+            metadata={'cve': 'CVE-2019-11687', 'polyglot': 'ELF',
+                      'zone': 'fragmented', 'elf_bits': 64,
+                      'fragments': elf_frags}
+        ))
+
+        # 21 and 22: ELF on an object a PACS will actually keep — the Linux
+        # counterpart of test 16. ET_DYN ships alongside ET_EXEC because
+        # modern Linux toolchains emit PIE binaries as shared objects, and
+        # file(1) reports them differently; a scanner keyed on 'ELF
+        # executable' misses every PIE on the system.
+        for suffix, name, elf_type in (
+                ('21', 'elf_in_storable_image', ELF_TYPE_EXEC),
+                ('22', 'elf_pie_in_storable_image', ELF_TYPE_DYN)):
+            carried_elf, elf_meta = CVEAttacks._elfdicom_on_carrier(
+                elf_type=elf_type)
+            results.append(AttackResult(
+                name=f'cve_2019_11687_{suffix}_{name}',
+                category='cve',
+                payload=carried_elf,
+                description=f'ELFDICOM ({elf_meta["elf_type"]}) embedded in a '
+                            'complete Secondary Capture object that still '
+                            'renders its image',
+                expected_behavior='PACS should reject or strip the executable; '
+                                  'a rejection here is about the payload, not '
+                                  'about an incomplete object',
+                metadata={'cve': 'CVE-2019-11687', 'polyglot': 'ELF',
+                          'zone': 'private_element',
+                          'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                          'sop_instance_uid': elf_meta[
+                              'carrier_sop_instance_uid'],
+                          'carrier': 'secondary_capture_image',
+                          **elf_meta}
+            ))
+
+        # Test 23: the construction exactly as the paper documents it, with
+        # the carrier at (0009,0000) and no private creator. See
+        # CVEAttacks._pedicom_published_tag for why the rest of the catalog
+        # deviates and why this one does not.
+        results.append(AttackResult(
+            name='cve_2019_11687_23_published_group_length_tag',
+            category='cve',
+            payload=CVEAttacks._pedicom_published_tag(),
+            description='PEDICOM whose PE image sits in (0009,0000) with no '
+                        'private creator, matching the published reference '
+                        'implementation',
+            expected_behavior='Scanner should inspect private-group values '
+                              'whatever element number they use, and a '
+                              'validator should flag an OB value in a Group '
+                              'Length tag',
+            metadata={'cve': 'CVE-2019-11687', 'polyglot': 'PE',
+                      'zone': 'private_element', 'pe_bits': 64,
+                      'private_tag': '(0009,0000)',
+                      'conformance': 'non-conformant-by-design',
+                      'bug_class': 'group-length-tag-as-carrier'}
+        ))
+
+        # Where each payload keeps its foreign content.
+        #
+        # This is a property of the payload, not of any transport. Content
+        # inside a Data Element travels on anything that moves DICOM objects.
+        # Content in the 128-byte preamble, or past the final Data Element,
+        # only travels on something that moves whole *files*: PS3.10 puts both
+        # regions outside the Data Set, so DIMSE C-STORE leaves them behind
+        # and the receiver writes its own preamble, while DICOMweb STOW-RS
+        # posts instances as application/dicom and carries them intact.
+        #
+        # Measured against a pynetdicom Storage SCP rather than assumed: every
+        # payload whose content lives in the preamble or the trailing region
+        # arrives as an ordinary object with nothing in it, and the fragmented
+        # ones do not decode as a Data Set at all. Which means, plainly: no
+        # executable polyglot survives C-STORE as a loadable image, because
+        # MZ, \x7fELF and the Mach-O magic all sit at offset 0 and e_lfanew at
+        # 0x3C.
+        #
+        # transport.survives() combines this with what a transport carries, so
+        # adding a transport does not mean re-tagging the catalog — which is
+        # exactly what the old per-payload 'survives_cstore' flag would have
+        # required.
+        IN_DATA_SET = {'private_element', 'element_padding'}
+        for result in results:
+            result.metadata['payload_region'] = (
+                REGION_DATA_SET if result.metadata.get('zone') in IN_DATA_SET
+                else REGION_WHOLE_FILE)
+            # Every payload here asks an archive the same question, and the
+            # answer that matters is "yes" — the premise of CVE-2019-11687 is
+            # that a PACS keeps a file which is also an executable. Whether
+            # acceptance is *scorable* depends on whether the mechanism
+            # reached the archive at all, which only the transport knows.
+            result.metadata.setdefault('finding_on',
+                                       ProtocolMonitor.FINDING_ON_STORE)
 
         return results
 

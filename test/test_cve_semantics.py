@@ -49,9 +49,20 @@ def with_meta(key):
     return [r for r in ALL if r.metadata.get(key) is not None]
 
 
+def flavoured():
+    """CVE-2019-11687 payloads that claim to be a second *executable* format.
+
+    Not every payload under this CVE is one. The private-element container
+    payloads exercise the same opaque-element property without pretending to
+    be a PE, so holding them to dual-format rules would assert something they
+    never claimed.
+    """
+    return [r for r in by_cve("CVE-2019-11687") if r.metadata.get("polyglot")]
+
+
 def buried():
     """Polyglots whose second-format body lives past the preamble."""
-    return [r for r in by_cve("CVE-2019-11687")
+    return [r for r in flavoured()
             if r.metadata.get("zone") in BURIED_ZONES]
 
 
@@ -73,6 +84,12 @@ def foreign_body_offset(payload):
     if fmt == "pe":
         return struct.unpack("<I", payload[60:64])[0]
     if fmt == "elf":
+        # e_phoff sits at a different offset and width per ELF class: byte 32
+        # as a 64-bit value in Elf64_Ehdr, byte 28 as a 32-bit one in
+        # Elf32_Ehdr. Reading the 64-bit field out of a 32-bit header is the
+        # exact mistake payload 19 exists to catch a scanner making.
+        if payload[4] == 1:                      # EI_CLASS = ELFCLASS32
+            return struct.unpack("<I", payload[28:32])[0]
         return struct.unpack("<Q", payload[32:40])[0]
     if fmt == "macho":
         pos = polyglot.MACHO_HEADER_LEN[64]
@@ -94,8 +111,7 @@ class TestPolyglotsAreActuallyDualFormat:
     file is.
     """
 
-    @pytest.mark.parametrize("result", by_cve("CVE-2019-11687"),
-                             ids=lambda r: r.metadata.get("polyglot"))
+    @pytest.mark.parametrize("result", flavoured(), ids=lambda r: r.name)
     def test_executable_magic_sits_at_offset_zero(self, result):
         flavour = result.metadata["polyglot"]
         magic = POLYGLOT_MAGIC[flavour]
@@ -104,13 +120,13 @@ class TestPolyglotsAreActuallyDualFormat:
             f"got {result.payload[:4]!r}")
 
     @pytest.mark.parametrize("result", by_cve("CVE-2019-11687"),
-                             ids=lambda r: r.metadata.get("polyglot"))
+                             ids=lambda r: r.name)
     def test_dicm_magic_still_sits_at_offset_128(self, result):
         """The preamble trick only works if the DICOM half stays valid."""
         assert result.payload[128:132] == b"DICM"
 
     @pytest.mark.parametrize("result", by_cve("CVE-2019-11687"),
-                             ids=lambda r: r.metadata.get("polyglot"))
+                             ids=lambda r: r.name)
     def test_preamble_is_exactly_128_bytes(self, result):
         """Executable content must fit the preamble, not push DICM along."""
         assert result.payload.index(b"DICM") == 128
@@ -378,3 +394,202 @@ class TestPart10Conformance:
                 f"({last[0]:04X},{last[1]:04X}) — Data Set descends")
             last = tag
             pos = voff + length
+
+
+class TestCarriedPayloadsRideAStorableObject:
+    """A payload an archive refuses on IOD grounds proves nothing.
+
+    The self-built Part-10 payloads establish structure. These establish that
+    the structure survives on an object a PACS would actually accept, so when
+    one *is* refused the refusal is about the embedded content rather than
+    about a Secondary Capture with no image in it.
+    """
+
+    CARRIED = [r for r in ALL if r.metadata.get("carrier")]
+
+    def _read(self, result):
+        import io
+        import pydicom
+        return pydicom.dcmread(io.BytesIO(result.payload), force=False)
+
+    def test_there_are_carried_payloads(self):
+        assert self.CARRIED, "no payloads declare a carrier"
+
+    @pytest.mark.parametrize("result", CARRIED, ids=lambda r: r.name)
+    def test_file_meta_passes_pydicom_validation(self, result):
+        from pydicom.dataset import validate_file_meta
+        validate_file_meta(self._read(result).file_meta, enforce_standard=True)
+
+    @pytest.mark.parametrize("result", CARRIED, ids=lambda r: r.name)
+    def test_required_iod_attributes_are_present(self, result):
+        """The Type 1 attributes an archive checks before anything else."""
+        ds = self._read(result)
+        for keyword in ("SOPClassUID", "SOPInstanceUID", "StudyInstanceUID",
+                        "SeriesInstanceUID", "Modality", "ConversionType",
+                        "Rows", "Columns", "BitsAllocated", "BitsStored",
+                        "HighBit", "PixelRepresentation", "SamplesPerPixel",
+                        "PhotometricInterpretation", "PixelData"):
+            assert keyword in ds, f"missing Type 1 attribute {keyword}"
+
+    @pytest.mark.parametrize("result", CARRIED, ids=lambda r: r.name)
+    def test_uids_agree_between_file_meta_and_data_set(self, result):
+        """A receiver that cross-checks them rejects an object that disagrees."""
+        ds = self._read(result)
+        assert ds.SOPClassUID == ds.file_meta.MediaStorageSOPClassUID
+        assert ds.SOPInstanceUID == ds.file_meta.MediaStorageSOPInstanceUID
+
+    @pytest.mark.parametrize("result", CARRIED, ids=lambda r: r.name)
+    def test_pixel_data_length_matches_the_image_geometry(self, result):
+        ds = self._read(result)
+        expected = (ds.Rows * ds.Columns * ds.SamplesPerPixel *
+                    ds.BitsAllocated // 8)
+        assert len(ds.PixelData) == expected, (
+            f"Pixel Data is {len(ds.PixelData)} bytes, geometry implies "
+            f"{expected}")
+
+    @pytest.mark.parametrize("result", CARRIED, ids=lambda r: r.name)
+    def test_the_embed_left_the_image_untouched(self, result):
+        """The object must still render what the carrier rendered.
+
+        An embed that shifted or truncated the pixel data would make the file
+        conspicuous to a human before any scanner ran.
+        """
+        import io
+        import pydicom
+        from c_scare.attacks import secondary_capture_carrier
+
+        pytest.importorskip("numpy")  # pixel_array needs it
+        original = pydicom.dcmread(io.BytesIO(secondary_capture_carrier()),
+                                   force=False)
+        assert (self._read(result).pixel_array == original.pixel_array).all()
+
+    @pytest.mark.parametrize("result", CARRIED, ids=lambda r: r.name)
+    def test_the_payload_sits_ahead_of_the_pixel_data(self, result):
+        """Group 0009 sorts before (7FE0,0010), and the bytes must agree."""
+        offsets = [result.metadata[key]
+                   for key in ("pe_offset", "ph_offset", "container_offset")
+                   if key in result.metadata]
+        assert len(offsets) == 1, (
+            f"{result.name} declares {len(offsets)} payload offsets; each "
+            "carried payload names exactly one")
+        assert offsets[0] < result.metadata["carrier_pixel_data_offset"]
+        assert result.metadata["carrier_pixel_data_intact"] is True
+
+    @pytest.mark.parametrize("result", CARRIED, ids=lambda r: r.name)
+    def test_the_private_block_is_conformant(self, result):
+        """A creator element claiming the block, then the carrier in it.
+
+        The published construction puts its payload straight into
+        (0009,0000) or (0009,0010) — a Group Length tag and the private
+        creator slot respectively. Neither may hold an OB payload, so a
+        validator can reject that file for a reason that has nothing to do
+        with what it is hiding.
+        """
+        ds = self._read(result)
+        private = {f"{e.tag:08X}": e for e in ds if e.tag.group == 0x0009}
+        assert "00090010" in private, "no private creator claiming the block"
+        assert private["00090010"].VR == "LO"
+        assert private["00090010"].value, "private creator is empty"
+        carriers = [t for t in private if t != "00090010"]
+        assert carriers, "creator claims a block with nothing in it"
+        for tag in carriers:
+            assert tag[4:6] == "10", (
+                f"({tag[:4]},{tag[4:]}) is outside the block the creator claims")
+
+
+class TestPrivateTagContainerFraming:
+    """The container is ``[magic 8B][size uint32 LE][body]``.
+
+    A detector keyed on the published magic string catches the demo and
+    nothing else — the talk says the string is generated per engagement. The
+    framing is the durable signal, so the catalog ships the same container
+    under two magics and the pair only passes a detector that reads structure.
+    """
+
+    CONTAINERS = [r for r in ALL
+                  if r.metadata.get("container_format") == "magic+len32+body"]
+
+    def test_both_magics_ship(self):
+        magics = {r.metadata["container_magic"] for r in self.CONTAINERS}
+        assert len(magics) >= 2, (
+            f"only {magics} ships; a literal-string detector would score a "
+            "pass it has not earned")
+
+    @pytest.mark.parametrize("result", CONTAINERS, ids=lambda r: r.name)
+    def test_the_container_is_where_the_metadata_says(self, result):
+        blob = result.payload
+        at = result.metadata["container_offset"]
+        magic = result.metadata["container_magic"].encode().ljust(8, b"\x00")
+        assert blob[at:at + 8] == magic
+        size = struct.unpack("<I", blob[at + 8:at + 12])[0]
+        assert size == result.metadata["container_body_bytes"]
+        assert at + 12 + size <= len(blob), "declared body runs past the file"
+
+    @pytest.mark.parametrize("result", CONTAINERS, ids=lambda r: r.name)
+    def test_the_body_is_an_inert_marker(self, result):
+        """This catalog builds detection tests, not loaders."""
+        at = result.metadata["container_offset"]
+        size = struct.unpack("<I", result.payload[at + 8:at + 12])[0]
+        body = result.payload[at + 12:at + 12 + size]
+        assert b"INERT MARKER" in body
+        assert body.decode("ascii")  # printable text, not machine code
+
+    @pytest.mark.parametrize("result", CONTAINERS, ids=lambda r: r.name)
+    def test_the_container_carries_no_executable_magic(self, result):
+        """It is a container, not a polyglot — no second format is claimed."""
+        assert polyglot.executable_format(result.payload) is None
+        assert "polyglot" not in result.metadata
+
+
+class TestPublishedConstructionIsAlsoCovered:
+    """We deviate from the paper's tag layout — but still have to test it.
+
+    Aguilar & Palmer §5.2 report the reference implementation putting the PE
+    in (0009,0000) with no private creator. That is a Group Length tag holding
+    an OB value, which PS3.5 does not permit, so every other payload here uses
+    a conformant private block instead. Shipping only the conformant shape
+    would leave a detector tuned against it blind to the toolkit actually in
+    circulation.
+    """
+
+    PUBLISHED = next(r for r in ALL
+                     if r.name == 'cve_2019_11687_23_published_group_length_tag')
+
+    def test_the_carrier_really_is_the_group_length_tag(self):
+        blob = self.PUBLISHED.payload
+        assert b'\x09\x00\x00\x00OB' in blob, (
+            'the (0009,0000) OB carrier the paper describes is not present')
+
+    def test_no_private_creator_claims_the_block(self):
+        """The published shape omits it; that omission is what we reproduce."""
+        import io
+        import pydicom
+        ds = pydicom.dcmread(io.BytesIO(self.PUBLISHED.payload), force=False)
+        group = {f'{e.tag:08X}' for e in ds if e.tag.group == 0x0009}
+        assert group == {'00090000'}, group
+
+    def test_it_still_parses_and_still_loads(self):
+        """Non-conformant is not unparseable — that is the whole problem."""
+        assert polyglot.validate_polyglot(self.PUBLISHED.payload) == {
+            'pe': [], 'dicom': []}
+
+    def test_it_is_flagged_as_a_deliberate_deviation(self):
+        assert self.PUBLISHED.metadata['conformance'] == \
+            'non-conformant-by-design'
+        assert self.PUBLISHED.metadata['private_tag'] == '(0009,0000)'
+
+    def test_every_other_polyglot_uses_a_conformant_private_block(self):
+        import io
+        import pydicom
+        for result in ALL:
+            if result.metadata.get('cve') != 'CVE-2019-11687':
+                continue
+            if result.metadata.get('conformance') == 'non-conformant-by-design':
+                continue
+            ds = pydicom.dcmread(io.BytesIO(result.payload), force=False)
+            private = {f'{e.tag:08X}': e for e in ds if e.tag.group == 0x0009}
+            if not private:
+                continue
+            assert '00090010' in private, (
+                f'{result.name} uses group 0009 with no private creator')
+            assert private['00090010'].VR == 'LO'
