@@ -21,7 +21,7 @@ import logging
 import socket
 import struct
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 from scapy.packet import Packet
 
@@ -786,3 +786,141 @@ class DICOMSession:
         self.sock = None
         self.stream = None
         self.assoc_established = False
+
+
+# ---------------------------------------------------------------------------
+# Association outcomes and retrieval
+# ---------------------------------------------------------------------------
+#
+# These live here rather than in deliver.py because deliver.py sends payloads
+# *to* a target - that is what the module is - while these read a DICOMSession's
+# own record of why an association failed, and fetch objects back. Both are SCU
+# operations over the session below, next to c_find/c_move/c_get.
+
+#: Why an association attempt produced no usable result. Shared vocabulary:
+#: deliver.py reports these on a failed C-STORE, retrieval on a failed fetch.
+ASSOC_UNAVAILABLE = 'unavailable'   # a dependency was not importable
+ASSOC_REJECTED = 'rejected'         # peer sent an A-ASSOCIATE-RJ
+ASSOC_UNREACHABLE = 'unreachable'   # the TCP connection could not be made
+ASSOC_REFUSED = 'refused'           # TCP connection refused
+ASSOC_RESET = 'reset'               # connection reset mid-exchange
+ASSOC_TIMEOUT = 'timeout'           # no answer within the timeout
+
+
+def associate_failure_reason(session) -> str:
+    """Why ``DICOMSession.associate`` returned ``False``.
+
+    It collapses four outcomes into one ``False``, and they are not the same
+    result: nothing listening on the port, an explicit A-ASSOCIATE-RJ, and a
+    peer that went silent mid-handshake mean a dead target, a working target
+    and a possibly-dying target respectively. The session records enough to
+    tell them apart — ``last_reject`` for a rejection, ``last_error`` for
+    everything the transport caught — so the distinction is recovered here
+    rather than reported as whichever one came first in the code.
+    """
+    if getattr(session, 'last_reject', None):
+        return ASSOC_REJECTED
+    error = getattr(session, 'last_error', None) or ''
+    if error.startswith('ConnectionRefusedError'):
+        return ASSOC_REFUSED
+    if error.startswith('ConnectionResetError'):
+        return ASSOC_RESET
+    if error.startswith(('timeout', 'TimeoutError', 'no response')):
+        return ASSOC_TIMEOUT
+    if error:
+        # Some other transport failure — host unreachable, DNS, a bad bind.
+        # Name the exception type so it stays triageable.
+        return f'{ASSOC_UNREACHABLE}:{error.split(":")[0]}'
+    return ASSOC_REJECTED
+
+
+class RetrieveOutcome(NamedTuple):
+    """What came back when an instance was fetched from the archive.
+
+    ``data`` is the retrieved object re-serialised as Part-10 bytes, or
+    ``None``. ``reason`` says why not. As with :class:`CStoreOutcome`, the two
+    are separate because "the archive returned nothing" and "the retrieve
+    never ran" are different results.
+    """
+    data: Optional[bytes]
+    reason: Optional[str]
+
+
+def retrieve_instance(target: Tuple[str, int],
+                      sop_class_uid: str,
+                      sop_instance_uid: str,
+                      transfer_syntax: str = None,
+                      timeout: float = 10.0,
+                      called_ae: str = 'TARGET',
+                      calling_ae: str = 'ATTACKER') -> RetrieveOutcome:
+    """Fetch one stored instance back with C-GET, on a single association.
+
+    C-GET rather than C-MOVE because it needs no inbound listener and no AE
+    registration on the target — the objects come back as C-STORE
+    sub-operations on the same association. The cost is that fewer archives
+    implement it; a C-MOVE path would need a Storage SCP of our own running
+    and the target configured to know it.
+
+    The SCU proposes the Storage SCP role for ``sop_class_uid``, without which
+    the archive has nowhere to send the sub-operation.
+
+    Note what the returned bytes are: a re-serialisation of the Data Set the
+    archive sent, not the file on its disk. C-GET moves Data Sets, so the
+    128-byte preamble is ours, not theirs — which is exactly why
+    :func:`~c_scare.polyglot.compare_after_pipeline` reports the offset-0
+    header separately from the private-element content.
+    """
+    try:
+        from io import BytesIO
+
+        import pydicom
+
+        from .scapy_dicom import (
+            DEFAULT_TRANSFER_SYNTAX_UID, STUDY_ROOT_QR_GET_SOP_CLASS_UID,
+        )
+    except ImportError as exc:
+        return RetrieveOutcome(None, f'{ASSOC_UNAVAILABLE}:{exc.name or "scapy"}')
+
+    ts = transfer_syntax or DEFAULT_TRANSFER_SYNTAX_UID
+    try:
+        with DICOMSession(target[0], target[1], called_ae, calling_ae) as sock:
+            contexts = {
+                STUDY_ROOT_QR_GET_SOP_CLASS_UID: [ts],
+                sop_class_uid: [ts],
+            }
+            if not sock.associate(contexts,
+                                  roles={sop_class_uid: (1, 1)}):
+                return RetrieveOutcome(None, associate_failure_reason(sock))
+
+            query = pydicom.Dataset()
+            query.QueryRetrieveLevel = 'IMAGE'
+            query.StudyInstanceUID = ''
+            query.SeriesInstanceUID = ''
+            query.SOPInstanceUID = sop_instance_uid
+            result = sock.c_get(
+                query, sop_class_uid=STUDY_ROOT_QR_GET_SOP_CLASS_UID)
+
+            objects = result.get('objects') or []
+            if not objects:
+                return RetrieveOutcome(
+                    None, f'no_objects:status={result.get("status")}')
+
+            retrieved = objects[0]
+            if not hasattr(retrieved, 'file_meta') or not retrieved.file_meta:
+                meta = pydicom.dataset.FileMetaDataset()
+                meta.MediaStorageSOPClassUID = sop_class_uid
+                meta.MediaStorageSOPInstanceUID = sop_instance_uid
+                meta.TransferSyntaxUID = ts
+                retrieved.file_meta = meta
+            retrieved.preamble = b'\x00' * 128
+            buffer = BytesIO()
+            retrieved.save_as(buffer, enforce_file_format=True)
+            return RetrieveOutcome(buffer.getvalue(), None)
+    except ConnectionRefusedError:
+        return RetrieveOutcome(None, ASSOC_REFUSED)
+    except ConnectionResetError:
+        return RetrieveOutcome(None, ASSOC_RESET)
+    except socket.timeout:
+        return RetrieveOutcome(None, ASSOC_TIMEOUT)
+    except Exception as exc:
+        return RetrieveOutcome(None, f'error:{type(exc).__name__}')

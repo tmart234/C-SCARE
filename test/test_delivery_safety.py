@@ -516,7 +516,8 @@ class TestCStoreOutcomeReasons:
         """associate() returns one False for four outcomes; recover which."""
         session = argparse.Namespace(last_reject=last_reject,
                                      last_error=last_error)
-        assert deliver._associate_failure_reason(session) == expected
+        from c_scare.client import associate_failure_reason
+        assert associate_failure_reason(session) == expected
 
     def test_send_cstore_keeps_its_status_only_contract(self, monkeypatch):
         """The published signature must not change under callers."""

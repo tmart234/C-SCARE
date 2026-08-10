@@ -48,7 +48,7 @@ try:
         DICM_PREFIX, EXPLICIT_VR_LE_UID, PART10_PREAMBLE_LEN,
         part10_file, standard_file_meta,
     )
-    from . import deliver
+    from . import client, deliver
     from .monitor import (
         BaseMonitor, MonitorReport, SanitizerMonitor,
         ProtocolMonitor, ProcessMonitor, PipelineMonitor, stored_successfully,
@@ -64,6 +64,7 @@ except ImportError:
         DICM_PREFIX, EXPLICIT_VR_LE_UID, PART10_PREAMBLE_LEN,
         part10_file, standard_file_meta,
     )
+    import client
     import deliver
     from monitor import (
         BaseMonitor, MonitorReport, SanitizerMonitor,
@@ -892,7 +893,7 @@ def _round_trip(args, result: AttackResult, target, timeout: float):
         return None, None, 'no_sop_instance_uid'
 
     _charge_associations(args, 1)
-    outcome = deliver.retrieve_instance(
+    outcome = client.retrieve_instance(
         target, sop_class, sop_instance,
         transfer_syntax=result.metadata.get('transfer_syntax'),
         timeout=timeout,
