@@ -260,6 +260,39 @@ for most of the catalog an orderly answer is a pass, but here the archive
 complying — keeping attacker-controlled bytes in a region conforming readers
 never inspect — is the outcome the test exists to catch.
 
+### Did it survive the pipeline?
+
+Acceptance still cannot separate an archive that *distributes* the artifact
+from one that neutralised it on ingest — both answer `0x0000`. `--verify-retrieval`
+fetches the instance back with C-GET and compares, which is the S.P.I.C.Y.
+Cascading property measured rather than assumed:
+
+| Verdict | Finding | Meaning |
+|---------|:-------:|---------|
+| `pipeline:survived_intact` | yes | Retrieved copy is still valid in both formats. The archive is a distribution channel for the object. |
+| `pipeline:payload_retained` | yes | Private-element bytes came back unchanged; the offset-0 header did not survive this pathway. Expected for C-STORE. |
+| `pipeline:altered` | yes | Carrier returned but rewritten — check whether the change neutralises it. |
+| `pipeline:stripped` | no | The archive removed the embedded content. The outcome a defender wants. |
+| `retrieve:unavailable` | no | Could not fetch it back; the round trip concluded nothing. |
+
+The retrieve is skipped when the store was refused — fetching an instance that
+was never accepted would report `stripped` for an object that was never there.
+
+**What this does not measure is execution, deliberately.** These images are
+inert by construction — entry point 0, no `PF_X`, no `IMAGE_SCN_MEM_EXECUTE` —
+and a polyglot never executes itself in any case. Activation is a separate
+link in the chain that lives outside the file and depends on the environment:
+Hetzel et al. Fig. 4 executes theirs by invoking it from a terminal, Aguilar &
+Palmer §6.1 assume a separate prompting channel, and the SLDPLD format relies
+on a sideloaded DLL to extract and run the blob. What lives in the bytes is
+whether the artifact is still the artifact after the pipeline handled it, and
+that is what these verdicts report.
+
+C-GET rather than C-MOVE because it needs no inbound listener and no AE
+registration on the target. The cost is that fewer archives implement it, and
+the SCP must grant the Storage SCP role — without it the retrieve comes back
+`0xA702 Refused: unable to perform sub-operations`.
+
 The payloads are structurally complete on both sides — `validate_polyglot`
 dispatches on the magic at offset 0 and confirms a loader can walk every
 header (`validate_pe`, `validate_elf`, `validate_macho`) while pydicom reads

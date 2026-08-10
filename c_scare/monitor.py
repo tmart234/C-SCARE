@@ -17,6 +17,7 @@ __all__ = [
     'SanitizerMonitor',
     'ProtocolMonitor',
     'ProcessMonitor',
+    'PipelineMonitor',
     'SanitizerFinding',
     'parse_sanitizer_output',
     'stored_successfully',
@@ -461,3 +462,100 @@ class ProcessMonitor(BaseMonitor):
                 description=f'Process died (exit code: {self._proc.exit_code()})',
             )
         return MonitorReport(detected=False, description='Process alive')
+
+
+class PipelineMonitor(BaseMonitor):
+    """Did the archive hand the embedded payload back, or neutralise it?
+
+    Acceptance alone cannot tell those apart, and they are opposite findings.
+    This monitor is fed the payload that was sent and the copy the archive
+    returned, and reports what the round trip did to the embedding — the
+    S.P.I.C.Y. Cascading property.
+
+    It says nothing about execution, deliberately. These images are inert by
+    construction, and a polyglot never executes itself in any case: activation
+    is a separate link in the chain, outside the file and specific to the
+    environment. What lives in the bytes is whether the artifact is still the
+    artifact after the pipeline handled it, and that is what this measures.
+    """
+
+    def __init__(self):
+        self._sent: Optional[bytes] = None
+        self._returned: Optional[bytes] = None
+        self._reason: Optional[str] = None
+
+    def pre_test(self, test_number: int):
+        self._sent = None
+        self._returned = None
+        self._reason = None
+
+    def set_round_trip(self, sent: Optional[bytes],
+                       returned: Optional[bytes],
+                       reason: Optional[str] = None):
+        """Called by the runner after a store-and-retrieve."""
+        self._sent = sent
+        self._returned = returned
+        self._reason = reason
+
+    def post_test(self) -> MonitorReport:
+        from .polyglot import (
+            SURVIVED_ALTERED, SURVIVED_INTACT, SURVIVED_PAYLOAD,
+            SURVIVED_STRIPPED, compare_after_pipeline,
+        )
+
+        if self._sent is None:
+            return MonitorReport(detected=False,
+                                 description='No round trip attempted')
+        if self._returned is None:
+            # Not a finding: a retrieve that never ran says nothing about the
+            # archive, the same way an undelivered payload says nothing.
+            return MonitorReport(
+                detected=False,
+                finding_type='retrieve:unavailable',
+                description=f'Could not retrieve the stored instance '
+                            f'({self._reason}) — the round trip concluded '
+                            'nothing about what the archive kept',
+                evidence=self._reason,
+            )
+
+        verdict = compare_after_pipeline(self._sent, self._returned)
+        if verdict.outcome == SURVIVED_STRIPPED:
+            return MonitorReport(
+                detected=False,
+                finding_type='pipeline:stripped',
+                description=f'Archive removed the embedded content on ingest '
+                            f'({verdict.detail}). This is the outcome a '
+                            'defender wants.',
+                evidence=verdict.detail,
+            )
+        if verdict.outcome == SURVIVED_INTACT:
+            return MonitorReport(
+                detected=True,
+                finding_type='pipeline:survived_intact',
+                description=f'Archive returned the artifact still valid in '
+                            f'both formats ({verdict.detail}). It is a '
+                            'distribution channel for this object, not just a '
+                            'store that accepted it.',
+                evidence=verdict.detail,
+            )
+        if verdict.outcome == SURVIVED_PAYLOAD:
+            return MonitorReport(
+                detected=True,
+                finding_type='pipeline:payload_retained',
+                description=f'Archive returned the embedded bytes unchanged '
+                            f'({verdict.detail}). Anything that reads the '
+                            'element still gets attacker-controlled content.',
+                evidence=verdict.detail,
+            )
+        if verdict.outcome == SURVIVED_ALTERED:
+            return MonitorReport(
+                detected=True,
+                finding_type='pipeline:altered',
+                description=f'Archive returned a modified carrier '
+                            f'({verdict.detail}). Worth checking whether the '
+                            'change neutralises the content or merely moves it.',
+                evidence=verdict.detail,
+            )
+        return MonitorReport(
+            detected=False,
+            description=f'Round trip inconclusive: {verdict.detail}')

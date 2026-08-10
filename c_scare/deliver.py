@@ -28,6 +28,8 @@ __all__ = [
     'send_sequence',
     'send_cstore',
     'send_cstore_outcome',
+    'RetrieveOutcome',
+    'retrieve_instance',
 ]
 
 
@@ -286,6 +288,99 @@ def send_cstore_outcome(target: Tuple[str, int],
         # error. Naming the type keeps it triageable instead of silently
         # becoming an absent response.
         return CStoreOutcome(None, f'error:{type(exc).__name__}')
+
+
+class RetrieveOutcome(NamedTuple):
+    """What came back when an instance was fetched from the archive.
+
+    ``data`` is the retrieved object re-serialised as Part-10 bytes, or
+    ``None``. ``reason`` says why not. As with :class:`CStoreOutcome`, the two
+    are separate because "the archive returned nothing" and "the retrieve
+    never ran" are different results.
+    """
+    data: Optional[bytes]
+    reason: Optional[str]
+
+
+def retrieve_instance(target: Tuple[str, int],
+                      sop_class_uid: str,
+                      sop_instance_uid: str,
+                      transfer_syntax: str = None,
+                      timeout: float = 10.0,
+                      called_ae: str = 'TARGET',
+                      calling_ae: str = 'ATTACKER') -> RetrieveOutcome:
+    """Fetch one stored instance back with C-GET, on a single association.
+
+    C-GET rather than C-MOVE because it needs no inbound listener and no AE
+    registration on the target — the objects come back as C-STORE
+    sub-operations on the same association. The cost is that fewer archives
+    implement it; a C-MOVE path would need a Storage SCP of our own running
+    and the target configured to know it.
+
+    The SCU proposes the Storage SCP role for ``sop_class_uid``, without which
+    the archive has nowhere to send the sub-operation.
+
+    Note what the returned bytes are: a re-serialisation of the Data Set the
+    archive sent, not the file on its disk. C-GET moves Data Sets, so the
+    128-byte preamble is ours, not theirs — which is exactly why
+    :func:`~c_scare.polyglot.compare_after_pipeline` reports the offset-0
+    header separately from the private-element content.
+    """
+    try:
+        from io import BytesIO
+
+        import pydicom
+
+        from .client import DICOMSession
+        from .scapy_dicom import (
+            DEFAULT_TRANSFER_SYNTAX_UID, STUDY_ROOT_QR_GET_SOP_CLASS_UID,
+        )
+    except ImportError as exc:
+        return RetrieveOutcome(None, f'{CSTORE_UNAVAILABLE}:{exc.name or "scapy"}')
+
+    ts = transfer_syntax or DEFAULT_TRANSFER_SYNTAX_UID
+    try:
+        with DICOMSession(target[0], target[1], called_ae, calling_ae) as sock:
+            contexts = {
+                STUDY_ROOT_QR_GET_SOP_CLASS_UID: [ts],
+                sop_class_uid: [ts],
+            }
+            if not sock.associate(contexts,
+                                  roles={sop_class_uid: (1, 1)}):
+                return RetrieveOutcome(None, _associate_failure_reason(sock))
+
+            query = pydicom.Dataset()
+            query.QueryRetrieveLevel = 'IMAGE'
+            query.StudyInstanceUID = ''
+            query.SeriesInstanceUID = ''
+            query.SOPInstanceUID = sop_instance_uid
+            result = sock.c_get(
+                query, sop_class_uid=STUDY_ROOT_QR_GET_SOP_CLASS_UID)
+
+            objects = result.get('objects') or []
+            if not objects:
+                return RetrieveOutcome(
+                    None, f'no_objects:status={result.get("status")}')
+
+            retrieved = objects[0]
+            if not hasattr(retrieved, 'file_meta') or not retrieved.file_meta:
+                meta = pydicom.dataset.FileMetaDataset()
+                meta.MediaStorageSOPClassUID = sop_class_uid
+                meta.MediaStorageSOPInstanceUID = sop_instance_uid
+                meta.TransferSyntaxUID = ts
+                retrieved.file_meta = meta
+            retrieved.preamble = b'\x00' * 128
+            buffer = BytesIO()
+            retrieved.save_as(buffer, enforce_file_format=True)
+            return RetrieveOutcome(buffer.getvalue(), None)
+    except ConnectionRefusedError:
+        return RetrieveOutcome(None, CSTORE_REFUSED)
+    except ConnectionResetError:
+        return RetrieveOutcome(None, CSTORE_RESET)
+    except socket.timeout:
+        return RetrieveOutcome(None, CSTORE_TIMEOUT)
+    except Exception as exc:
+        return RetrieveOutcome(None, f'error:{type(exc).__name__}')
 
 
 def send_cstore(target: Tuple[str, int],

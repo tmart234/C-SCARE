@@ -4874,6 +4874,7 @@ class CVEAttacks:
         return data, {
             'container_offset': offset,
             'container_magic': magic.rstrip(b'\x00').decode('ascii'),
+            'carrier_sop_instance_uid': after.sop_instance_uid,
             'container_body_bytes': len(marker),
             'carrier_pixel_data_offset': after.pixel_data_offset,
             'carrier_pixel_data_intact':
@@ -5295,6 +5296,8 @@ class CVEAttacks:
                           'zone': 'private_element',
                           'container_format': 'magic+len32+body',
                           'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                          'sop_instance_uid': container_meta[
+                              'carrier_sop_instance_uid'],
                           'carrier': 'secondary_capture_image',
                           **container_meta}
             ))

@@ -51,7 +51,7 @@ try:
     from . import deliver
     from .monitor import (
         BaseMonitor, MonitorReport, SanitizerMonitor,
-        ProtocolMonitor, ProcessMonitor,
+        ProtocolMonitor, ProcessMonitor, PipelineMonitor, stored_successfully,
     )
     from .process_manager import InstrumentedProcess
 except ImportError:
@@ -67,7 +67,7 @@ except ImportError:
     import deliver
     from monitor import (
         BaseMonitor, MonitorReport, SanitizerMonitor,
-        ProtocolMonitor, ProcessMonitor,
+        ProtocolMonitor, ProcessMonitor, PipelineMonitor, stored_successfully,
     )
     from process_manager import InstrumentedProcess
 
@@ -876,6 +876,32 @@ def _deliver(args, result: AttackResult, target, timeout: float):
         return None, 'reset'
 
 
+def _round_trip(args, result: AttackResult, target, timeout: float):
+    """Fetch back what was just stored. Returns ``(sent, returned, reason)``.
+
+    Only attempted when the store succeeded — retrieving an instance the
+    archive refused would report ``stripped`` for an object that was never
+    there, which is the false negative that mirrors every false positive
+    fixed elsewhere in this file.
+    """
+    if not stored_successfully(result.metadata.get('cstore_status')):
+        return None, None, 'not_stored'
+    sop_class = (result.metadata.get('sop_class_uid') or _DEFAULT_STORE_SOP)
+    sop_instance = result.metadata.get('sop_instance_uid')
+    if not sop_instance:
+        return None, None, 'no_sop_instance_uid'
+
+    _charge_associations(args, 1)
+    outcome = deliver.retrieve_instance(
+        target, sop_class, sop_instance,
+        transfer_syntax=result.metadata.get('transfer_syntax'),
+        timeout=timeout,
+        called_ae=getattr(args, 'ae_title', 'TARGET'),
+        calling_ae=getattr(args, 'calling_ae', 'ATTACKER'))
+    result.metadata['retrieve_reason'] = outcome.reason
+    return result.payload, outcome.data, outcome.reason
+
+
 def _run_monitored_test(args, result: AttackResult, target, timeout: float):
     """Send a payload and check all monitors for findings."""
     monitors = _get_monitors(args)
@@ -896,6 +922,8 @@ def _run_monitored_test(args, result: AttackResult, target, timeout: float):
         if isinstance(monitor, ProtocolMonitor):
             monitor.set_response(response, error=error,
                                  finding_on=result.metadata.get('finding_on'))
+        elif isinstance(monitor, PipelineMonitor):
+            monitor.set_round_trip(*_round_trip(args, result, target, timeout))
 
     if any(isinstance(m, SanitizerMonitor) for m in monitors):
         time.sleep(SANITIZER_FLUSH_DELAY)
@@ -2256,6 +2284,15 @@ def main(argv: Optional[List[str]] = None):
     )
 
     parser.add_argument(
+        '--verify-retrieval',
+        action='store_true',
+        help='After a successful C-STORE, fetch the instance back with C-GET '
+             'and report what the archive did to the embedded content: '
+             'returned intact, payload retained, altered, or stripped. '
+             'Acceptance alone cannot tell a distribution channel from an '
+             'archive that neutralised the object. Costs one extra '
+             'association per stored payload and needs C-GET support.')
+    parser.add_argument(
         '--delivery',
         choices=['auto', 'pdu', 'cstore'],
         default='auto',
@@ -2438,13 +2475,19 @@ def main(argv: Optional[List[str]] = None):
             ProcessMonitor(proc),
             ProtocolMonitor(),
         ]
+        if getattr(args, 'verify_retrieval', False):
+            args._monitors.append(PipelineMonitor())
         args.target = f"{args.ip}:{asan_port}"
         print(f"Monitors: SanitizerMonitor, ProcessMonitor, ProtocolMonitor")
         print(f"Target: {args.target} (ASan-instrumented)")
         print()
     else:
         args._monitors = [ProtocolMonitor()]
-        print("Monitors: ProtocolMonitor (black-box)")
+        if getattr(args, 'verify_retrieval', False):
+            args._monitors.append(PipelineMonitor())
+        print("Monitors: " + ", ".join(type(m).__name__
+                                       for m in args._monitors)
+              + " (black-box)")
         print(f"Target: {args.target}")
         print()
 

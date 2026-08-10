@@ -745,3 +745,109 @@ class TestStorageAcceptanceIsADetection:
 
         assert result.success is True, 'a stored polyglot did not raise a finding'
         assert result.monitor_reports[0].finding_type == 'storage:payload_accepted'
+
+
+class TestRoundTripTellsUsWhatTheArchiveKept:
+    """Acceptance cannot separate a distribution channel from a sanitiser.
+
+    An archive that stores a polyglot and one that stores it *and hands it
+    back unchanged* both answer C-STORE with 0x0000. Only fetching the
+    instance back distinguishes them, and they are opposite findings.
+
+    None of this asks whether the retrieved copy would run. The images are
+    inert by construction, and a polyglot never executes itself in any case —
+    activation is a separate link, outside the file. What a round trip settles
+    is whether the artifact is still the artifact.
+    """
+
+    def _payload(self):
+        from c_scare.attacks import CVEAttacks
+        return next(r for r in CVEAttacks.all()
+                    if r.name == 'cve_2019_11687_16_pe_in_storable_image').payload
+
+    def _reserialise(self, blob, mutate=None):
+        import io
+        import pydicom
+        ds = pydicom.dcmread(io.BytesIO(blob), force=False)
+        if mutate:
+            mutate(ds)
+        ds.preamble = b'\x00' * 128          # what a C-STORE receiver writes
+        buf = io.BytesIO()
+        ds.save_as(buf, enforce_file_format=True)
+        return buf.getvalue()
+
+    def _report(self, returned, reason=None):
+        from c_scare.monitor import PipelineMonitor
+        monitor = PipelineMonitor()
+        monitor.pre_test(0)
+        monitor.set_round_trip(self._payload(), returned, reason)
+        return monitor.post_test()
+
+    def test_whole_file_back_is_intact(self):
+        """The STOW-RS shape: preamble included, so both formats survive."""
+        from c_scare import polyglot
+        verdict = polyglot.compare_after_pipeline(self._payload(),
+                                                  self._payload())
+        assert verdict.outcome == polyglot.SURVIVED_INTACT
+        report = self._report(self._payload())
+        assert report.detected is True
+        assert report.finding_type == 'pipeline:survived_intact'
+
+    def test_data_set_back_retains_the_payload(self):
+        """The C-STORE shape: preamble regenerated, carrier bytes unchanged."""
+        report = self._report(self._reserialise(self._payload()))
+        assert report.detected is True
+        assert report.finding_type == 'pipeline:payload_retained'
+
+    def test_a_sanitising_archive_is_not_a_finding(self):
+        """Stripping the private elements is the outcome a defender wants."""
+        def strip(ds):
+            for element in [e for e in ds if e.tag.group % 2 == 1]:
+                del ds[element.tag]
+        report = self._report(self._reserialise(self._payload(), strip))
+        assert report.detected is False
+        assert report.finding_type == 'pipeline:stripped'
+        assert 'defender wants' in report.description
+
+    def test_a_rewritten_carrier_is_reported_separately(self):
+        def blank(ds):
+            ds[0x00091001].value = b'\x00' * 32
+        report = self._report(self._reserialise(self._payload(), blank))
+        assert report.detected is True
+        assert report.finding_type == 'pipeline:altered'
+
+    def test_a_failed_retrieve_is_not_a_finding(self):
+        """Same rule as an undelivered payload: no data, no conclusion."""
+        report = self._report(None, reason='no_objects:status=42754')
+        assert report.detected is False
+        assert report.finding_type == 'retrieve:unavailable'
+        assert '42754' in report.evidence
+
+    def test_no_round_trip_attempted_is_silent(self):
+        from c_scare.monitor import PipelineMonitor
+        monitor = PipelineMonitor()
+        monitor.pre_test(0)
+        assert monitor.post_test().detected is False
+
+    def test_a_refused_store_is_never_retrieved(self):
+        """Fetching an instance the archive refused would report 'stripped'
+        for an object that was never there — the mirror of every false
+        positive fixed elsewhere in this file."""
+        from c_scare.attacks import AttackResult
+        result = AttackResult(
+            name='p', category='cve', payload=b'x', description='d',
+            expected_behavior='e',
+            metadata={'cstore_status': 0xA900,
+                      'sop_instance_uid': '1.2.3'})
+        args = argparse.Namespace(max_associations=None, dry_run=None)
+        sent, returned, reason = runner._round_trip(
+            args, result, ('127.0.0.1', 1), 1.0)
+        assert (sent, returned, reason) == (None, None, 'not_stored')
+
+    def test_every_carried_payload_names_an_instance_to_fetch(self):
+        """Without a SOP Instance UID there is nothing to retrieve."""
+        from c_scare.attacks import CVEAttacks
+        missing = [r.name for r in CVEAttacks.all()
+                   if r.metadata.get('carrier')
+                   and not r.metadata.get('sop_instance_uid')]
+        assert missing == [], f'carried payloads with no instance UID: {missing}'
