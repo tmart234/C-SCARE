@@ -319,14 +319,17 @@ class ProtocolMonitor(BaseMonitor):
         self._response: Optional[bytes] = None
         self._error: Optional[str] = None
         self._finding_on: Optional[str] = None
+        self._accepted: Optional[bool] = None
 
     def pre_test(self, test_number: int):
         self._response = None
         self._error = None
         self._finding_on = None
+        self._accepted = None
 
     def set_response(self, response: Optional[bytes], error: Optional[str] = None,
-                     finding_on: Optional[str] = None):
+                     finding_on: Optional[str] = None,
+                     accepted: Optional[bool] = None):
         """Called by test runner after delivery, before post_test().
 
         ``finding_on`` carries the payload's own expectation. Most payloads
@@ -339,6 +342,11 @@ class ProtocolMonitor(BaseMonitor):
         self._response = response
         self._error = error
         self._finding_on = finding_on
+        # Whether the archive kept the object, as the transport reported it.
+        # Deriving it from a DIMSE status here would only work for DIMSE: a
+        # STOW-RS 200 is not a DIMSE 0x0000, and reading one as the other
+        # made every DICOMweb store look like a refusal.
+        self._accepted = accepted
 
     def post_test(self) -> MonitorReport:
         if self._error == 'dry_run':
@@ -368,8 +376,9 @@ class ProtocolMonitor(BaseMonitor):
             if self._response and len(self._response) >= 2:
                 status = (self._response[0] << 8) | self._response[1]
             status_text = f'0x{status:04x}' if status is not None else 'unknown'
-            if (self._finding_on == self.FINDING_ON_STORE
-                    and stored_successfully(status)):
+            kept = (self._accepted if self._accepted is not None
+                    else stored_successfully(status))
+            if self._finding_on == self.FINDING_ON_STORE and kept:
                 # The payload asked whether the peer would accept it, and the
                 # peer did. Reporting that as a normal response is the wrong
                 # way round: for an object carrying an embedded executable, a

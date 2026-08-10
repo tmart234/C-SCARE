@@ -698,28 +698,44 @@ class TestStorageAcceptanceIsADetection:
         family = [r for r in CVEAttacks.all()
                   if r.metadata.get('cve') == 'CVE-2019-11687']
         assert family
+        from c_scare import transport
+        dimse = transport.DimseTransport()
+        web = transport.DicomWebTransport(base_url='http://x/dicom-web')
+        args = argparse.Namespace(_transport=dimse)
+
         for result in family:
-            scored = (result.metadata.get('finding_on')
-                      == ProtocolMonitor.FINDING_ON_STORE)
-            assert scored == result.metadata['survives_cstore'], (
-                f'{result.name}: scored={scored} but '
-                f'survives_cstore={result.metadata["survives_cstore"]}')
-        assert any(r.metadata['survives_cstore'] for r in family)
-        assert any(not r.metadata['survives_cstore'] for r in family)
+            region = result.metadata['payload_region']
+            scored = runner._scorable_finding_on(args, result) is not None
+            assert scored == transport.survives(region, dimse), (
+                f'{result.name}: scored={scored} over DIMSE but '
+                f'region={region}')
 
-    def test_whole_file_payloads_say_so(self):
-        """An operator needs to know which pathway still carries these.
+        # The same catalog, unchanged, scores fully over a whole-file
+        # transport. That is the point of keeping region on the payload and
+        # carries_whole_file on the transport.
+        args_web = argparse.Namespace(_transport=web)
+        assert all(runner._scorable_finding_on(args_web, r) is not None
+                   for r in family)
+        assert any(r.metadata['payload_region'] == transport.REGION_DATA_SET
+                   for r in family)
+        assert any(r.metadata['payload_region'] == transport.REGION_WHOLE_FILE
+                   for r in family)
 
-        Not "undeliverable": DICOMweb STOW-RS posts complete Part-10
-        instances as application/dicom, preamble included — the pathway
-        Hetzel et al. used against Orthanc. Only C-STORE drops the content,
-        because only C-STORE sends a Data Set rather than a file.
+    def test_region_is_a_payload_property_not_a_transport_one(self):
+        """Every polyglot declares where its content lives, once.
+
+        The earlier model tagged payloads with 'survives_cstore', which states
+        a transport fact as a payload property — adding STOW-RS would have
+        meant a second flag per payload, and two flags that must agree.
         """
+        from c_scare import transport
         from c_scare.attacks import CVEAttacks
         for result in CVEAttacks.all():
-            if result.metadata.get('survives_cstore') is False:
-                assert result.metadata.get('delivery_scope') == 'whole_file'
-                assert 'finding_on' not in result.metadata
+            if result.metadata.get('cve') != 'CVE-2019-11687':
+                continue
+            assert result.metadata['payload_region'] in (
+                transport.REGION_DATA_SET, transport.REGION_WHOLE_FILE)
+            assert 'survives_cstore' not in result.metadata
 
     def test_the_runner_passes_the_expectation_through(self, monkeypatch):
         """The wiring, not just the monitor: metadata has to reach set_response."""

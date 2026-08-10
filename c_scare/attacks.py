@@ -122,6 +122,7 @@ from .corruptor import Corruptor, Override, Injection, InjectionPoint
 from .pixel import EncapsulatedPixelData, Fragment
 from .file import DicomFile
 from .monitor import ProtocolMonitor
+from .transport import REGION_DATA_SET, REGION_WHOLE_FILE
 from .polyglot import (
     ELF_HEADER_LEN, ELF_PHDR_LEN, ELF_TYPE_DYN, ELF_TYPE_EXEC, FILE_ALIGNMENT,
     align_up, dos_header, dos_stub, elf_fragments, elf_header, elf_image,
@@ -4707,6 +4708,10 @@ class CVEAttacks:
             'elf_bits': bits,
             'elf_type': 'ET_DYN' if elf_type == ELF_TYPE_DYN else 'ET_EXEC',
             'carrier_sop_instance_uid': after.sop_instance_uid,
+            'study_instance_uid': after.study_instance_uid,
+            'series_instance_uid': after.series_instance_uid,
+            'study_instance_uid': after.study_instance_uid,
+            'series_instance_uid': after.series_instance_uid,
             'carrier_pixel_data_offset': after.pixel_data_offset,
             'carrier_pixel_data_bytes': after.pixel_data_length,
             'carrier_pixel_data_intact':
@@ -4823,6 +4828,10 @@ class CVEAttacks:
             'pe_bits': bits,
             'carrier_sop_class_uid': after.sop_class_uid,
             'carrier_sop_instance_uid': after.sop_instance_uid,
+            'study_instance_uid': after.study_instance_uid,
+            'series_instance_uid': after.series_instance_uid,
+            'study_instance_uid': after.study_instance_uid,
+            'series_instance_uid': after.series_instance_uid,
             'carrier_pixel_data_offset': after.pixel_data_offset,
             'carrier_pixel_data_bytes': after.pixel_data_length,
             'carrier_pixel_data_intact':
@@ -4875,6 +4884,10 @@ class CVEAttacks:
             'container_offset': offset,
             'container_magic': magic.rstrip(b'\x00').decode('ascii'),
             'carrier_sop_instance_uid': after.sop_instance_uid,
+            'study_instance_uid': after.study_instance_uid,
+            'series_instance_uid': after.series_instance_uid,
+            'study_instance_uid': after.study_instance_uid,
+            'series_instance_uid': after.series_instance_uid,
             'container_body_bytes': len(marker),
             'carrier_pixel_data_offset': after.pixel_data_offset,
             'carrier_pixel_data_intact':
@@ -5393,43 +5406,40 @@ class CVEAttacks:
                       'bug_class': 'group-length-tag-as-carrier'}
         ))
 
-        # Which of these survive the wire, and which are file-only.
+        # Where each payload keeps its foreign content.
         #
-        # C-STORE carries a Data Set. The 128-byte preamble is a *file*
-        # construct that PS3.10 defines outside the Data Set, so it is never
-        # transmitted — the receiving SCP writes its own, zeroed. Bytes past
-        # the final Data Element are outside the Data Set too and go the same
-        # way. Measured against a pynetdicom Storage SCP: every payload whose
-        # foreign content lives in the preamble or the trailing region arrives
-        # as an ordinary object with nothing in it, and the fragmented ones do
-        # not decode as a Data Set at all.
+        # This is a property of the payload, not of any transport. Content
+        # inside a Data Element travels on anything that moves DICOM objects.
+        # Content in the 128-byte preamble, or past the final Data Element,
+        # only travels on something that moves whole *files*: PS3.10 puts both
+        # regions outside the Data Set, so DIMSE C-STORE leaves them behind
+        # and the receiver writes its own preamble, while DICOMweb STOW-RS
+        # posts instances as application/dicom and carries them intact.
         #
-        # The consequence is worth stating plainly: **no executable polyglot
-        # survives C-STORE as a loadable image**, because MZ, \x7fELF and the
-        # Mach-O magic all sit at offset 0, and e_lfanew sits at 0x3C. What
-        # does survive is whatever is inside a Data Element — the PE headers
-        # and section data in a private element, the container blob, the
-        # padding-tail payload. Those reach the archive intact.
+        # Measured against a pynetdicom Storage SCP rather than assumed: every
+        # payload whose content lives in the preamble or the trailing region
+        # arrives as an ordinary object with nothing in it, and the fragmented
+        # ones do not decode as a Data Set at all. Which means, plainly: no
+        # executable polyglot survives C-STORE as a loadable image, because
+        # MZ, \x7fELF and the Mach-O magic all sit at offset 0 and e_lfanew at
+        # 0x3C.
         #
-        # So only the payloads whose mechanism actually arrives are scored on
-        # acceptance. Tagging the rest would report a finding against an
-        # archive that received an ordinary image, which is the false positive
-        # this catalog is supposed to avoid producing.
-        SURVIVES_CSTORE = {'private_element', 'element_padding'}
+        # transport.survives() combines this with what a transport carries, so
+        # adding a transport does not mean re-tagging the catalog — which is
+        # exactly what the old per-payload 'survives_cstore' flag would have
+        # required.
+        IN_DATA_SET = {'private_element', 'element_padding'}
         for result in results:
-            survives = result.metadata.get('zone') in SURVIVES_CSTORE
-            result.metadata['survives_cstore'] = survives
-            if survives:
-                result.metadata.setdefault('finding_on',
-                                           ProtocolMonitor.FINDING_ON_STORE)
-            else:
-                # Not "undeliverable" — deliverable by any path that moves the
-                # whole Part-10 file. DICOMweb STOW-RS posts complete
-                # instances as application/dicom, preamble included, which is
-                # the pathway Hetzel et al. used against Orthanc; so do media,
-                # DICOMDIR and import folders. Only C-STORE drops it, because
-                # only C-STORE sends a Data Set instead of a file.
-                result.metadata.setdefault('delivery_scope', 'whole_file')
+            result.metadata['payload_region'] = (
+                REGION_DATA_SET if result.metadata.get('zone') in IN_DATA_SET
+                else REGION_WHOLE_FILE)
+            # Every payload here asks an archive the same question, and the
+            # answer that matters is "yes" — the premise of CVE-2019-11687 is
+            # that a PACS keeps a file which is also an executable. Whether
+            # acceptance is *scorable* depends on whether the mechanism
+            # reached the archive at all, which only the transport knows.
+            result.metadata.setdefault('finding_on',
+                                       ProtocolMonitor.FINDING_ON_STORE)
 
         return results
 

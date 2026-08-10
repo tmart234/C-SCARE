@@ -1037,6 +1037,8 @@ class Carrier:
     transfer_syntax: str
     sop_class_uid: str
     sop_instance_uid: str
+    study_instance_uid: Optional[str]
+    series_instance_uid: Optional[str]
     pixel_data_offset: Optional[int]
     pixel_data_length: Optional[int]
     dataset_offset: Optional[int]
@@ -1077,6 +1079,11 @@ def inspect_carrier(data: bytes) -> Carrier:
         transfer_syntax=str(dataset.file_meta.TransferSyntaxUID),
         sop_class_uid=str(dataset.file_meta.MediaStorageSOPClassUID),
         sop_instance_uid=str(dataset.file_meta.MediaStorageSOPInstanceUID),
+        # WADO-RS addresses an instance by its full Study/Series/SOP path, so
+        # a carrier that cannot name its place in the hierarchy cannot be
+        # fetched back over DICOMweb.
+        study_instance_uid=str(getattr(dataset, 'StudyInstanceUID', '')) or None,
+        series_instance_uid=str(getattr(dataset, 'SeriesInstanceUID', '')) or None,
         pixel_data_offset=pixel_offset,
         pixel_data_length=pixel_length,
         dataset_offset=dataset_offset(data),

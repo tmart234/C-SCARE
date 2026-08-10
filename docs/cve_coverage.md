@@ -232,19 +232,24 @@ offset 0, and `e_lfanew` at 0x3C. What does survive is whatever lives inside a
 Data Element — the PE headers and section data in a private element, the
 container blob, the padding-tail payload — and that arrives intact.
 
-`metadata['survives_cstore']` records which is which, and only the payloads
-whose mechanism actually arrives are scored on acceptance. Scoring the rest
-over an association would report a finding against an archive that received an
-ordinary image.
+This is recorded as a property of the *payload*, not of a transport:
+`metadata['payload_region']` is `data_set` when the content sits inside a Data
+Element and `whole_file` when it sits in the preamble or past the Data Set.
+Each transport separately declares whether it `carries_whole_file`, and
+`transport.survives()` combines the two. Only payloads whose mechanism reaches
+the archive are scored on acceptance — scoring the rest would report a finding
+against an archive that received an ordinary image.
 
-Those carry `delivery_scope: 'whole_file'` — not "undeliverable". **DICOMweb
-STOW-RS posts complete Part-10 instances as `application/dicom`, preamble
-included**, and that is the pathway Hetzel et al. §3.1 used to load polyglots
-into Orthanc. Media, DICOMDIR and import folders carry the whole file too.
-C-STORE is the outlier, because it alone sends a Data Set rather than a file.
-C-SCARE has no STOW-RS client, so for now deliver those payloads with
-`c-scare corpus -o ./out` and post them by whatever DICOMweb path the target
-exposes.
+| Transport | Carries whole files | Polyglot payloads whose mechanism arrives |
+|-----------|:-------------------:|:------------------------------------------:|
+| DIMSE (C-STORE / C-GET) | no — sends a Data Set | 14 of 23 |
+| DICOMweb (STOW-RS / WADO-RS) | yes — `application/dicom` instances | 23 of 23 |
+
+`--dicomweb-url http://host:8042/dicom-web` selects the HTTP transport, which
+is the pathway Hetzel et al. §3.1 used to load polyglots into Orthanc. It is
+also the only one on which a round trip can return `pipeline:survived_intact`,
+because the preamble crosses in both directions. Media, DICOMDIR and import
+folders carry whole files too; `c-scare corpus -o ./out` writes them for those.
 
 | Zone | Reaches the archive over C-STORE |
 |------|----------------------------------|
