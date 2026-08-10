@@ -185,12 +185,27 @@ private group, which sorts ahead of `(7FE0,0010)`, so the object still renders
 the image it rendered before and a refusal is attributable to the payload.
 
 Those carriers also fix a conformance problem in the published construction.
-The V3GAS talk puts its payload directly in `(0009,0000)` or `(0009,0010)` —
-a Group Length tag and the private creator slot respectively, neither of which
-may hold an OB value. C-SCARE emits a real private block: an LO creator at
-`(0009,0010)` claiming block `10xx`, with the carrier at `(0009,1001)`. A
-validator can reject the published shape for a reason unrelated to what it is
-hiding; it cannot reject this one.
+Aguilar & Palmer §5.2 report the reference implementation using "group 0x0009,
+element 0x0000, with a 12-byte Explicit VR (long form) header", and the V3GAS
+slides show `(0009,0010)` for the SLDPLD container. Those are the Group Length
+tag and the private creator slot; neither may hold an OB value, and neither is
+preceded by a creator claiming a block — which Hetzel et al. §3.2 states a
+vendor "must first define" before using private elements. C-SCARE emits a real
+private block: an LO creator at `(0009,0010)` claiming block `10xx`, with the
+carrier at `(0009,1001)`. A validator can reject the published shape for a
+reason unrelated to what it is hiding; it cannot reject this one.
+
+`cve_2019_11687_23_published_group_length_tag` reproduces the published shape
+anyway, marked `conformance: non-conformant-by-design`. It is what the released
+toolkit emits, pydicom parses it, and a detector tuned only against a proper
+private block would miss the tool actually in circulation.
+
+One figure differs deliberately. §5.1 of the paper gives "approximately 46"
+usable bytes for the preamble DOS-header zone; `enumerate_safe_zones` reports
+58. The 12-byte gap is the legacy block header PS3.10 cites as the reason the
+preamble exists — reserving it is conservative, but a PE loader reads only
+`e_magic` and `e_lfanew`, so 58 is what the format actually imposes on an
+attacker. The zone's `note` records both numbers.
 
 Alongside the executable polyglots, `metadata['container_format']` marks a
 second embedding shape from the same talk: a length-prefixed blob —
@@ -218,11 +233,18 @@ Data Element — the PE headers and section data in a private element, the
 container blob, the padding-tail payload — and that arrives intact.
 
 `metadata['survives_cstore']` records which is which, and only the payloads
-whose mechanism actually arrives are scored on acceptance. The rest carry
-`delivery_scope: 'file'`: deliver them with `c-scare corpus -o ./out` through
-an import path, media or a DICOMDIR, where the file itself moves. Scoring them
+whose mechanism actually arrives are scored on acceptance. Scoring the rest
 over an association would report a finding against an archive that received an
 ordinary image.
+
+Those carry `delivery_scope: 'whole_file'` — not "undeliverable". **DICOMweb
+STOW-RS posts complete Part-10 instances as `application/dicom`, preamble
+included**, and that is the pathway Hetzel et al. §3.1 used to load polyglots
+into Orthanc. Media, DICOMDIR and import folders carry the whole file too.
+C-STORE is the outlier, because it alone sends a Data Set rather than a file.
+C-SCARE has no STOW-RS client, so for now deliver those payloads with
+`c-scare corpus -o ./out` and post them by whatever DICOMweb path the target
+exposes.
 
 | Zone | Reaches the archive over C-STORE |
 |------|----------------------------------|

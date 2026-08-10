@@ -706,12 +706,18 @@ class TestStorageAcceptanceIsADetection:
         assert any(r.metadata['survives_cstore'] for r in family)
         assert any(not r.metadata['survives_cstore'] for r in family)
 
-    def test_file_only_payloads_say_so(self):
-        """An operator needs to know to deliver these as files instead."""
+    def test_whole_file_payloads_say_so(self):
+        """An operator needs to know which pathway still carries these.
+
+        Not "undeliverable": DICOMweb STOW-RS posts complete Part-10
+        instances as application/dicom, preamble included — the pathway
+        Hetzel et al. used against Orthanc. Only C-STORE drops the content,
+        because only C-STORE sends a Data Set rather than a file.
+        """
         from c_scare.attacks import CVEAttacks
         for result in CVEAttacks.all():
             if result.metadata.get('survives_cstore') is False:
-                assert result.metadata.get('delivery_scope') == 'file'
+                assert result.metadata.get('delivery_scope') == 'whole_file'
                 assert 'finding_on' not in result.metadata
 
     def test_the_runner_passes_the_expectation_through(self, monkeypatch):

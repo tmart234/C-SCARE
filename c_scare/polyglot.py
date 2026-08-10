@@ -954,7 +954,11 @@ def enumerate_safe_zones(data: bytes) -> List[SafeZone]:
         kind='preamble_dos_header', offset=0, length=DOS_HEADER_LEN,
         usable=DOS_HEADER_LEN - 2 - 4,
         note='preamble bytes 0x00-0x3F; the MZ magic (2) and e_lfanew (4) are '
-             'spoken for, the rest is free'))
+             'spoken for, the rest is free. Aguilar & Palmer report '
+             '"approximately 46" for this zone, 12 fewer: that reserves the '
+             'legacy 12-byte block header PS3.10 cites as the reason the '
+             'preamble exists. 58 is the figure a PE loader actually imposes, '
+             'since it reads only e_magic and e_lfanew'))
     zones.append(SafeZone(
         kind='preamble_dos_stub', offset=DOS_HEADER_LEN,
         length=PREAMBLE_LEN - DOS_HEADER_LEN,

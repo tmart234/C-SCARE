@@ -4557,6 +4557,39 @@ class CVEAttacks:
         return payload, fragments
 
     @staticmethod
+    def _pedicom_published_tag(bits: int = 64) -> bytes:
+        """PEDICOM with the carrier at (0009,0000), as the paper describes it.
+
+        Aguilar & Palmer §5.2 report the reference implementation using
+        "group 0x0009, element 0x0000, with a 12-byte Explicit VR (long form)
+        header". That is the Group Length tag, which PS3.5 does not permit to
+        hold an OB value, and there is no Private Creator claiming a block —
+        Hetzel et al. §3.2 note a vendor "must first define a Private Creator
+        Data Element to reserve a range of Data Element Numbers".
+
+        Every other payload here uses the conformant form, because a validator
+        can reject the published shape for a reason unrelated to what it
+        hides. This one reproduces the published shape anyway: it is what the
+        released toolkit emits, so a detector tuned only against a proper
+        private block would miss the tool actually in circulation. pydicom
+        reads it, which is the point — non-conformant is not the same as
+        unparseable.
+        """
+        head = CVEAttacks._polyglot_head_len()
+        identity = CVEAttacks._polyglot_identity()
+        value_start = (head + len(identity) +
+                       CVEAttacks._LONG_FORM_HEADER_LEN)
+        pad = -value_start % 4
+        pe_offset = value_start + pad
+
+        carrier = Element(0x0009, 0x0000, 'OB',
+                          b'\x00' * pad + pe_image(pe_offset, bits=bits))
+        return CVEAttacks._polyglot_part10(
+            preamble=dos_header(pe_offset) + dos_stub(),
+            insert=carrier.encode(implicit_vr=False, little_endian=True),
+        )
+
+    @staticmethod
     def _fragmented_elfdicom(bits: int = 64
                              ) -> Tuple[bytes, List[Dict[str, Any]]]:
         """An ELF split across four regions, one of which no PE can use.
@@ -5294,6 +5327,28 @@ class CVEAttacks:
                           **elf_meta}
             ))
 
+        # Test 23: the construction exactly as the paper documents it, with
+        # the carrier at (0009,0000) and no private creator. See
+        # CVEAttacks._pedicom_published_tag for why the rest of the catalog
+        # deviates and why this one does not.
+        results.append(AttackResult(
+            name='cve_2019_11687_23_published_group_length_tag',
+            category='cve',
+            payload=CVEAttacks._pedicom_published_tag(),
+            description='PEDICOM whose PE image sits in (0009,0000) with no '
+                        'private creator, matching the published reference '
+                        'implementation',
+            expected_behavior='Scanner should inspect private-group values '
+                              'whatever element number they use, and a '
+                              'validator should flag an OB value in a Group '
+                              'Length tag',
+            metadata={'cve': 'CVE-2019-11687', 'polyglot': 'PE',
+                      'zone': 'private_element', 'pe_bits': 64,
+                      'private_tag': '(0009,0000)',
+                      'conformance': 'non-conformant-by-design',
+                      'bug_class': 'group-length-tag-as-carrier'}
+        ))
+
         # Which of these survive the wire, and which are file-only.
         #
         # C-STORE carries a Data Set. The 128-byte preamble is a *file*
@@ -5324,9 +5379,13 @@ class CVEAttacks:
                 result.metadata.setdefault('finding_on',
                                            ProtocolMonitor.FINDING_ON_STORE)
             else:
-                # Deliver these as files: `c-scare corpus -o ./out` and an
-                # import path, media, or a DICOMDIR — not over an association.
-                result.metadata.setdefault('delivery_scope', 'file')
+                # Not "undeliverable" — deliverable by any path that moves the
+                # whole Part-10 file. DICOMweb STOW-RS posts complete
+                # instances as application/dicom, preamble included, which is
+                # the pathway Hetzel et al. used against Orthanc; so do media,
+                # DICOMDIR and import folders. Only C-STORE drops it, because
+                # only C-STORE sends a Data Set instead of a file.
+                result.metadata.setdefault('delivery_scope', 'whole_file')
 
         return results
 

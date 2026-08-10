@@ -1444,14 +1444,18 @@ def _print_file_only(results: list) -> None:
     instead.
     """
     file_only = [r for r in results
-                 if r.metadata.get('delivery_scope') == 'file'
+                 if r.metadata.get('delivery_scope') == 'whole_file'
                  and r.metadata.get('delivery') in ('cstore', 'pdu')]
     if not file_only:
         return
     print(f"NOTE: {len(file_only)} payload(s) carry their content in the "
-          "preamble or past the Data Set,")
-    print("      which C-STORE does not transmit. Deliver those as files —")
-    print("      `c-scare corpus -o ./out` — through an import path or media.")
+          "preamble or past the Data Set.")
+    print("      C-STORE sends a Data Set, not a file, so it drops that "
+          "content.")
+    print("      Deliver them whole — `c-scare corpus -o ./out` — via "
+          "DICOMweb STOW-RS,")
+    print("      media, a DICOMDIR or an import folder, which carry the "
+          "preamble.")
 
 
 def _run_catalog(args, catalog, label: str, note: Optional[str] = None) -> int:

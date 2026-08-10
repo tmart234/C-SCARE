@@ -539,3 +539,57 @@ class TestPrivateTagContainerFraming:
         """It is a container, not a polyglot — no second format is claimed."""
         assert polyglot.executable_format(result.payload) is None
         assert "polyglot" not in result.metadata
+
+
+class TestPublishedConstructionIsAlsoCovered:
+    """We deviate from the paper's tag layout — but still have to test it.
+
+    Aguilar & Palmer §5.2 report the reference implementation putting the PE
+    in (0009,0000) with no private creator. That is a Group Length tag holding
+    an OB value, which PS3.5 does not permit, so every other payload here uses
+    a conformant private block instead. Shipping only the conformant shape
+    would leave a detector tuned against it blind to the toolkit actually in
+    circulation.
+    """
+
+    PUBLISHED = next(r for r in ALL
+                     if r.name == 'cve_2019_11687_23_published_group_length_tag')
+
+    def test_the_carrier_really_is_the_group_length_tag(self):
+        blob = self.PUBLISHED.payload
+        assert b'\x09\x00\x00\x00OB' in blob, (
+            'the (0009,0000) OB carrier the paper describes is not present')
+
+    def test_no_private_creator_claims_the_block(self):
+        """The published shape omits it; that omission is what we reproduce."""
+        import io
+        import pydicom
+        ds = pydicom.dcmread(io.BytesIO(self.PUBLISHED.payload), force=False)
+        group = {f'{e.tag:08X}' for e in ds if e.tag.group == 0x0009}
+        assert group == {'00090000'}, group
+
+    def test_it_still_parses_and_still_loads(self):
+        """Non-conformant is not unparseable — that is the whole problem."""
+        assert polyglot.validate_polyglot(self.PUBLISHED.payload) == {
+            'pe': [], 'dicom': []}
+
+    def test_it_is_flagged_as_a_deliberate_deviation(self):
+        assert self.PUBLISHED.metadata['conformance'] == \
+            'non-conformant-by-design'
+        assert self.PUBLISHED.metadata['private_tag'] == '(0009,0000)'
+
+    def test_every_other_polyglot_uses_a_conformant_private_block(self):
+        import io
+        import pydicom
+        for result in ALL:
+            if result.metadata.get('cve') != 'CVE-2019-11687':
+                continue
+            if result.metadata.get('conformance') == 'non-conformant-by-design':
+                continue
+            ds = pydicom.dcmread(io.BytesIO(result.payload), force=False)
+            private = {f'{e.tag:08X}': e for e in ds if e.tag.group == 0x0009}
+            if not private:
+                continue
+            assert '00090010' in private, (
+                f'{result.name} uses group 0009 with no private creator')
+            assert private['00090010'].VR == 'LO'
