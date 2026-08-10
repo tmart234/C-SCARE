@@ -33,7 +33,7 @@ as an AFL/AFLNet seed corpus (`c-scare corpus -o ./corpus`) — see
 | **State Machine** | 13 | Out-of-order PDUs (Sta1–Sta13), post-abort and post-release processing, release collision, acceptor PDUs sent by the requestor, DIMSE message-ordering and cross-context reassembly | `StateMachineAttacks` |
 | **Negotiation** | 15 | A-ASSOCIATE User Information sub-items (PS3.7 D.3.3): User Identity authentication — empty credentials, length lies, Kerberos/SAML/JWT parser reachability, duplicate identity items — plus extended negotiation, role selection, async window | `NegotiationAttacks` |
 | **DIMSE-N** | 11 | Normalized services: MPPS N-CREATE/N-SET state transitions and duplicate instances, Storage Commitment N-ACTION/N-EVENT-REPORT false and unsolicited results, N-GET attribute bombs, well-known-instance N-DELETE | `DimseNAttacks` |
-| **CVE** | 69 | DCMTK, GDCM, Orthanc, pydicom, dcm4che/standard polyglot (five safe zones × six second formats, plus a fragmented and two entropy-shaped variants), and ICSMA-26-181-01 DCMTK cases | `CVEAttacks` |
+| **CVE** | 72 | DCMTK, GDCM, Orthanc, pydicom, dcm4che/standard polyglot (five safe zones × six second formats, plus fragmented, entropy-shaped, storable-carrier and private-tag-container variants), and ICSMA-26-181-01 DCMTK cases | `CVEAttacks` |
 
 Each `*Attacks` class exposes an `all()` iterator of `AttackResult` objects.
 

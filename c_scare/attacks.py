@@ -123,8 +123,8 @@ from .pixel import EncapsulatedPixelData, Fragment
 from .file import DicomFile
 from .polyglot import (
     FILE_ALIGNMENT, align_up, dos_header, dos_stub, elf_header, elf_image,
-    filler, macho_header, macho_image, pe_fragments, pe_headers_len, pe_image,
-    shannon_entropy,
+    embed_in_carrier, filler, inspect_carrier, macho_header, macho_image,
+    pe_fragments, pe_headers_len, pe_image, shannon_entropy,
 )
 
 # Scapy imports - may not be available in all environments
@@ -281,6 +281,90 @@ def part10_file(meta_elements: List[Element], dataset: bytes = b'',
         implicit_vr=False, little_endian=True)
     return (preamble[:PART10_PREAMBLE_LEN].ljust(PART10_PREAMBLE_LEN, b'\x00')
             + DICM_PREFIX + header + body + dataset)
+
+
+#: Fixed UID root for synthesised carriers, so a run is reproducible and the
+#: objects are traceable to this tool rather than colliding with real studies.
+CARRIER_UID_ROOT = '1.2.826.0.1.3680043.10.1337'
+
+
+def secondary_capture_carrier(rows: int = 16, columns: int = 16,
+                              sop_instance_uid: str = None,
+                              transfer_syntax: str = EXPLICIT_VR_LE_UID
+                              ) -> bytes:
+    """A complete Secondary Capture object a PACS has no reason to refuse.
+
+    Built with pydicom so the encoding is not this project's opinion of the
+    standard. Everything the Secondary Capture IOD makes Type 1 or Type 2 is
+    present — the SOP Common, Patient, Study, Series and General Image
+    modules, plus an Image Pixel module whose Pixel Data length actually
+    matches ``Rows × Columns × SamplesPerPixel × BitsAllocated / 8``.
+
+    That last part is the difference between a carrier and a stub. An archive
+    validates against the IOD before it looks at anything else, so a synthetic
+    object missing Study/Series UIDs or Pixel Data is rejected as incomplete
+    and an embedded payload never gets read. Requiring a real image also makes
+    the polyglot honest: it is what a technologist would see rendered.
+    """
+    from io import BytesIO
+
+    import pydicom
+    from pydicom.dataset import Dataset as PydicomDataset, FileMetaDataset
+
+    instance = sop_instance_uid or f'{CARRIER_UID_ROOT}.1.1'
+
+    meta = FileMetaDataset()
+    meta.MediaStorageSOPClassUID = SECONDARY_CAPTURE_SOP_CLASS_UID
+    meta.MediaStorageSOPInstanceUID = instance
+    meta.TransferSyntaxUID = transfer_syntax
+    meta.ImplementationClassUID = IMPLEMENTATION_CLASS_UID
+
+    ds = PydicomDataset()
+    ds.file_meta = meta
+    ds.preamble = b'\x00' * PART10_PREAMBLE_LEN
+
+    # SOP Common — the dataset UIDs must agree with the File Meta group, or a
+    # receiver that cross-checks them rejects the object.
+    ds.SOPClassUID = SECONDARY_CAPTURE_SOP_CLASS_UID
+    ds.SOPInstanceUID = instance
+    ds.SpecificCharacterSet = 'ISO_IR 100'
+
+    # Patient / Study / Series — Type 2 means present, and may be empty; the
+    # UID chain is Type 1 and may not.
+    ds.PatientName = 'Test^Polyglot'
+    ds.PatientID = 'C-SCARE-0001'
+    ds.PatientBirthDate = ''
+    ds.PatientSex = ''
+    ds.StudyInstanceUID = f'{CARRIER_UID_ROOT}.1'
+    ds.SeriesInstanceUID = f'{CARRIER_UID_ROOT}.1.2'
+    ds.StudyDate = '20260101'
+    ds.StudyTime = '120000'
+    ds.AccessionNumber = ''
+    ds.ReferringPhysicianName = ''
+    ds.StudyID = '1'
+    ds.SeriesNumber = '1'
+    ds.InstanceNumber = '1'
+    ds.Modality = 'OT'
+    ds.ConversionType = 'WSD'          # Type 1 for Secondary Capture
+
+    # Image Pixel module. A simple gradient rather than a constant fill, so the
+    # rendered image is visibly an image and the pixel data has an ordinary
+    # byte distribution instead of a flat one.
+    ds.SamplesPerPixel = 1
+    ds.PhotometricInterpretation = 'MONOCHROME2'
+    ds.Rows = rows
+    ds.Columns = columns
+    ds.BitsAllocated = 8
+    ds.BitsStored = 8
+    ds.HighBit = 7
+    ds.PixelRepresentation = 0
+    ds.PixelData = bytes(
+        ((x * 255) // max(columns - 1, 1) + (y * 255) // max(rows - 1, 1)) // 2
+        for y in range(rows) for x in range(columns))
+
+    buffer = BytesIO()
+    ds.save_as(buffer, enforce_file_format=True)
+    return buffer.getvalue()
 
 
 def minimal_dataset() -> bytes:
@@ -4543,6 +4627,100 @@ class CVEAttacks:
                                             little_endian=True),
         )
 
+    # -- Embedding into a real, storable image object ----------------------
+    #
+    # The payloads above build their own minimal Part-10 file, which proves
+    # the structure and stops there: a Secondary Capture with no Pixel Data,
+    # no Study or Series UID and no image geometry is an incomplete object,
+    # and an archive rejects it against the IOD before any private element is
+    # read. These carry the same constructions on an object a PACS has no
+    # reason to refuse, so a rejection means something.
+
+    @staticmethod
+    def _pedicom_on_carrier(bits: int = 64, fill: str = 'zeros',
+                            section_size: int = 0x200,
+                            section_name: bytes = b'.rdata'
+                            ) -> Tuple[bytes, Dict[str, Any]]:
+        """PEDICOM embedded in a complete Secondary Capture image.
+
+        The private element sorts between the (0008,xxxx) and (0010,xxxx)
+        groups, so the PE lands well ahead of (7FE0,0010) and the image is
+        untouched — the object still renders as the gradient a viewer would
+        show. ``e_lfanew`` is resolved against the finished file, which is why
+        the image is built by a callback that receives its own offset.
+        """
+        host = secondary_capture_carrier()
+        before = inspect_carrier(host)
+        data, offset = embed_in_carrier(
+            host,
+            lambda at: pe_image(at, bits=bits, section_size=section_size,
+                                section_name=section_name, fill=fill),
+            align=4,
+            preamble=lambda at: dos_header(at) + dos_stub(),
+        )
+        after = inspect_carrier(data)
+        return data, {
+            'pe_offset': offset,
+            'pe_bits': bits,
+            'carrier_sop_class_uid': after.sop_class_uid,
+            'carrier_sop_instance_uid': after.sop_instance_uid,
+            'carrier_pixel_data_offset': after.pixel_data_offset,
+            'carrier_pixel_data_bytes': after.pixel_data_length,
+            'carrier_pixel_data_intact':
+                before.pixel_data_length == after.pixel_data_length,
+        }
+
+    # The published example magic from the V3GAS talk's SLDPLD format. The
+    # talk states the real string is generated per engagement, so a signature
+    # on this literal catches only the demo — which is exactly what the pair
+    # of payloads below is for.
+    _SLDPLD_EXAMPLE_MAGIC = b'SLDPLD\x00\x00'
+    _SLDPLD_ALTERNATE_MAGIC = b'CSCARE\x00\x00'
+
+    @staticmethod
+    def _tagged_blob(magic: bytes, body: bytes) -> bytes:
+        """``[magic 8B][size uint32 LE][body]`` — the SLDPLD container shape.
+
+        The framing is the durable signal. A loader that reads a length-
+        prefixed blob out of a private element needs a magic to find it and a
+        size to bound it, whatever bytes it later hands to something else, so
+        a detector keyed on the *structure* keeps working when the magic
+        changes and one keyed on the string does not.
+
+        ``body`` here is an inert marker. Nothing in this catalog emits
+        executable code, and a container carrying a marker exercises exactly
+        the same recogniser.
+        """
+        if len(magic) != 8:
+            raise ValueError(f'magic is {len(magic)} bytes, must be 8')
+        return magic + struct.pack('<I', len(body)) + body
+
+    @staticmethod
+    def _sldpld_on_carrier(magic: bytes) -> Tuple[bytes, Dict[str, Any]]:
+        """A length-prefixed private-tag container on a storable image.
+
+        Placed the way the talk describes it — a private element after the
+        File Meta group and ahead of the pixel data — so a viewer renders the
+        image and a conforming parser walks past the container without
+        inspecting it.
+        """
+        marker = (b'C-SCARE INERT MARKER: this container carries no code. '
+                  b'It exists so a scanner can be tested against the '
+                  b'framing, not against a payload.')
+        body = CVEAttacks._tagged_blob(magic, marker)
+        host = secondary_capture_carrier()
+        before = inspect_carrier(host)
+        data, offset = embed_in_carrier(host, lambda _at: body, align=2)
+        after = inspect_carrier(data)
+        return data, {
+            'container_offset': offset,
+            'container_magic': magic.rstrip(b'\x00').decode('ascii'),
+            'container_body_bytes': len(marker),
+            'carrier_pixel_data_offset': after.pixel_data_offset,
+            'carrier_pixel_data_intact':
+                before.pixel_data_length == after.pixel_data_length,
+        }
+
     @staticmethod
     def cve_2019_11687_polyglot() -> List[AttackResult]:
         """
@@ -4861,6 +5039,65 @@ class CVEAttacks:
                       'section_entropy': round(
                           shannon_entropy(filler('packed', 0x1000)), 3)}
         ))
+
+        # Test 16: the same construction as test 1, carried by an object an
+        # archive has no reason to refuse. Tests 1-15 build their own minimal
+        # Part-10 file, which proves the structure and stops there — a
+        # Secondary Capture with no Pixel Data and no Study/Series UID is an
+        # incomplete object, so a PACS rejects it against the IOD and the
+        # private element is never read. Here the payload rides a complete
+        # image that still renders, so a rejection is about the executable.
+        carried, carried_meta = CVEAttacks._pedicom_on_carrier(
+            bits=64, fill='strings', section_name=b'.rdata')
+        results.append(AttackResult(
+            name='cve_2019_11687_16_pe_in_storable_image',
+            category='cve',
+            payload=carried,
+            description='PEDICOM embedded in a complete Secondary Capture '
+                        'object that still renders its image',
+            expected_behavior='PACS should reject or strip the executable; a '
+                              'rejection here is about the payload, not about '
+                              'an incomplete object',
+            metadata={'cve': 'CVE-2019-11687', 'polyglot': 'PE',
+                      'zone': 'private_element',
+                      'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                      'sop_instance_uid': carried_meta[
+                          'carrier_sop_instance_uid'],
+                      'carrier': 'secondary_capture_image',
+                      **carried_meta}
+        ))
+
+        # Tests 17 and 18: the length-prefixed private-tag container the V3GAS
+        # talk calls SLDPLD — a magic, a 32-bit size, and a body a loader
+        # would read back out. The body here is an inert marker; the framing
+        # is what a scanner has to recognise.
+        #
+        # Two magics on purpose. The talk states the real string is generated
+        # per engagement, so a detector keyed on the published literal catches
+        # 17 and misses 18, while one keyed on the structure catches both.
+        # Shipping only the published magic would score the weaker detector as
+        # a pass.
+        for suffix, name, magic in (
+                ('17', 'published_magic', CVEAttacks._SLDPLD_EXAMPLE_MAGIC),
+                ('18', 'rotated_magic', CVEAttacks._SLDPLD_ALTERNATE_MAGIC)):
+            payload, container_meta = CVEAttacks._sldpld_on_carrier(magic)
+            results.append(AttackResult(
+                name=f'cve_2019_11687_{suffix}_private_tag_container_{name}',
+                category='cve',
+                payload=payload,
+                description='Length-prefixed container (magic + uint32 size + '
+                            f'body) in a private OB element, magic '
+                            f'{container_meta["container_magic"]!r}',
+                expected_behavior='Scanner should key on the container framing '
+                                  'inside private elements, not on one literal '
+                                  'magic string',
+                metadata={'cve': 'CVE-2019-11687',
+                          'zone': 'private_element',
+                          'container_format': 'magic+len32+body',
+                          'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                          'carrier': 'secondary_capture_image',
+                          **container_meta}
+            ))
 
         return results
 

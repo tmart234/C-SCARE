@@ -93,6 +93,9 @@ __all__ = [
     'macho_image',
     'dataset_offset',
     'enumerate_safe_zones',
+    'Carrier',
+    'inspect_carrier',
+    'embed_in_carrier',
     'executable_format',
     'validate_pe',
     'validate_elf',
@@ -944,6 +947,163 @@ def enumerate_safe_zones(data: bytes) -> List[SafeZone]:
         note='bytes after the final Data Element; readers stop at the end of '
              'the Data Set and never reach them'))
     return zones
+
+
+# ---------------------------------------------------------------------------
+# Embedding into a real carrier object
+# ---------------------------------------------------------------------------
+#
+# Synthesising a minimal Part-10 file is enough to prove the *structure* of a
+# polyglot, and not enough to get one stored. A PACS validates against the IOD:
+# a Secondary Capture with no Pixel Data, no Study/Series UIDs and no image
+# geometry is rejected as an incomplete object long before anything looks at a
+# private element. The payload then proves nothing about whether a real archive
+# accepts an executable, which is the question.
+#
+# These take an existing conformant object and add to it, so everything a PACS
+# checks - the SOP Class, the UID chain, the image module, the pixel data -
+# comes from a file that was already acceptable.
+
+@dataclass
+class Carrier:
+    """What a host object is, and where the parts that must not move are.
+
+    ``pixel_data_offset`` is the pipeline's "identify pixel data location"
+    step: the embedded payload has to land *before* it, both because group
+    0009 sorts ahead of (7FE0,0010) and because a payload that displaced the
+    image would change what the object renders as.
+    """
+    transfer_syntax: str
+    sop_class_uid: str
+    sop_instance_uid: str
+    pixel_data_offset: Optional[int]
+    pixel_data_length: Optional[int]
+    dataset_offset: Optional[int]
+
+
+def inspect_carrier(data: bytes) -> Carrier:
+    """Parse a Part-10 carrier and locate the parts an embed must not disturb.
+
+    Raises ``ValueError`` if ``data`` is not a readable Part-10 file, because
+    everything downstream assumes the host object is already one - embedding
+    into a broken carrier produces a broken polyglot and hides the reason.
+    """
+    from io import BytesIO
+    try:
+        dataset = pydicom.dcmread(BytesIO(data), force=False)
+    except Exception as exc:
+        raise ValueError(f'carrier is not a readable Part-10 file: {exc}')
+
+    for required in ('TransferSyntaxUID', 'MediaStorageSOPClassUID',
+                     'MediaStorageSOPInstanceUID'):
+        if required not in dataset.file_meta:
+            raise ValueError(f'carrier File Meta group has no {required}')
+
+    pixel_offset = pixel_length = None
+    # (7FE0,0010) is located in the raw bytes rather than through pydicom,
+    # because what matters here is the file offset, not the decoded value.
+    marker = struct.pack('<HH', 0x7FE0, 0x0010)
+    found = data.find(marker, PREAMBLE_LEN)
+    if found != -1:
+        pixel_offset = found
+        vr = data[found + 4:found + 6]
+        if vr in (b'OB', b'OW', b'UN'):
+            pixel_length = struct.unpack('<I', data[found + 8:found + 12])[0]
+        else:
+            pixel_length = struct.unpack('<H', data[found + 6:found + 8])[0]
+
+    return Carrier(
+        transfer_syntax=str(dataset.file_meta.TransferSyntaxUID),
+        sop_class_uid=str(dataset.file_meta.MediaStorageSOPClassUID),
+        sop_instance_uid=str(dataset.file_meta.MediaStorageSOPInstanceUID),
+        pixel_data_offset=pixel_offset,
+        pixel_data_length=pixel_length,
+        dataset_offset=dataset_offset(data),
+    )
+
+
+_EMBED_NONCE = b'\xc5\x3c\xa2\xe7C-SCARE-EMBED-SLOT\xe7\xa2\x3c\xc5'
+
+
+def embed_in_carrier(carrier: bytes, build_value, *,
+                     group: int = 0x0009,
+                     creator: str = 'C-SCARE POLYGLOT',
+                     block_element: int = 0x01,
+                     vr: str = 'OB',
+                     align: int = 4,
+                     preamble=None) -> Tuple[bytes, int]:
+    """Add a private element to ``carrier`` whose value knows its own offset.
+
+    ``build_value(offset)`` is called with the file offset its bytes will
+    occupy and returns them; ``preamble(offset)``, if given, is called with the
+    same offset and returns the 128 bytes to put in front of the file. That is
+    what lets a DOS header's ``e_lfanew`` point at a PE image which does not
+    exist until the offset is known.
+
+    Returns ``(file_bytes, payload_offset)``.
+
+    The offset is found rather than calculated. A private element's *value*
+    offset depends only on what precedes it, never on its own length, so a
+    first write with a short placeholder locates the slot exactly, and the
+    real value can be any size without moving it. Calculating instead would
+    mean re-deriving pydicom's encoder - element ordering, VR selection,
+    group-length recomputation, the odd-length pad - and being wrong silently.
+
+    Everything the carrier already had is preserved: the File Meta group, the
+    UID chain, the image module and the pixel data are written back by the
+    same encoder that read them. Only the preamble, which PS3.10 §7.1 leaves
+    without semantics, is replaced.
+    """
+    from io import BytesIO
+
+    info = inspect_carrier(carrier)
+    if group % 2 == 0:
+        raise ValueError(f'group 0x{group:04X} is not private (must be odd)')
+
+    def _write(value: bytes) -> bytes:
+        dataset = pydicom.dcmread(BytesIO(carrier), force=False)
+        block = dataset.private_block(group, creator, create=True)
+        block.add_new(block_element, vr, value)
+        if preamble is not None:
+            dataset.preamble = b'\x00' * PREAMBLE_LEN
+        buffer = BytesIO()
+        dataset.save_as(buffer, enforce_file_format=True)
+        return buffer.getvalue()
+
+    # Pass 1: locate the slot.
+    probe = _write(_EMBED_NONCE)
+    hits = probe.count(_EMBED_NONCE)
+    if hits != 1:
+        raise ValueError(f'embed slot marker found {hits} times, expected 1')
+    slot = probe.index(_EMBED_NONCE)
+
+    pad = -slot % align
+    payload_offset = slot + pad
+    payload = build_value(payload_offset)
+
+    # Pass 2: the real value. The slot cannot have moved - the element header
+    # is a fixed width for this VR - but that is checked rather than assumed.
+    final = _write(b'\x00' * pad + payload)
+    if final[payload_offset:payload_offset + len(payload)] != payload:
+        raise ValueError(
+            f'payload did not land at offset {payload_offset}; the encoder '
+            'moved the private element between passes')
+
+    if preamble is not None:
+        head = preamble(payload_offset)
+        if len(head) != PREAMBLE_LEN:
+            raise ValueError(f'preamble is {len(head)} bytes, must be '
+                             f'{PREAMBLE_LEN}')
+        final = head + final[PREAMBLE_LEN:]
+
+    after = inspect_carrier(final)
+    if after.pixel_data_offset is not None:
+        if payload_offset > after.pixel_data_offset:
+            raise ValueError('payload landed past the Pixel Data element; '
+                             'the private group must sort ahead of (7FE0,0010)')
+        if after.pixel_data_length != info.pixel_data_length:
+            raise ValueError('Pixel Data length changed during the embed')
+    return final, payload_offset
 
 
 # ---------------------------------------------------------------------------

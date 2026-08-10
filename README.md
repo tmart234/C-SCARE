@@ -11,7 +11,7 @@ C-SCARE is organised around *who* you test — a DICOM server (SCP) or a client 
 |                       | **Pentest workflows** | **DAST** (black-box) | **Fuzzing** (grey-box) |
 |-----------------------|-----------------------|----------------------|------------------------|
 | **What it does**      | Scripted recon → query/retrieve flows that reach a test's starting state | Deliver a static attack catalog at a live target, watch for anomalies | Coverage-guided mutation of instrumented binaries |
-| **Quantified**        | **5** workflows (W1–W5) | **11** attack categories · **211** payloads · **30** CVEs reproduced (DCMTK, GDCM, Orthanc, pydicom, dcm4che) (+ inspired-by & config-file CVEs) | **6** targets · **2** engines · **3** sanitizers |
+| **Quantified**        | **5** workflows (W1–W5) | **11** attack categories · **214** payloads · **30** CVEs reproduced (DCMTK, GDCM, Orthanc, pydicom, dcm4che) (+ inspired-by & config-file CVEs) | **6** targets · **2** engines · **3** sanitizers |
 | **Targets**           | SCP and SCU | SCP (server) and SCU (client, via rogue server) | SCP (file/parser/network) and SCU (experimental) |
 | **Instrumentation**   | None | None — works on real devices / prebuilt binaries | Required (recompiled, QEMU, or SAND) |
 | **Engine**            | C-SCARE (scapy-based) | C-SCARE (scapy-based via catalog + monitors) | AFL++ / AFLNet (C-SCARE bridges + triages) |

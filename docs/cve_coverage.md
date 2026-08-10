@@ -172,6 +172,38 @@ signature before `execve` will touch an image, which cannot be synthesised
 inertly; that payload therefore tests whether a scanner *recognises* an
 embedded Mach-O, not whether the host would load one.
 
+*What the payload rides on* decides whether an archive ever reads it. Payloads
+1–15 build their own minimal Part-10 file, which establishes the structure and
+stops there: a Secondary Capture with no Pixel Data, no Study or Series UID and
+no image geometry is an incomplete object, so a PACS rejects it against the IOD
+before any private element is parsed, and the result says nothing about whether
+the archive would accept an executable. `metadata['carrier']` marks the
+payloads that ride a complete Secondary Capture built with pydicom — full UID
+chain, Image Pixel module, and Pixel Data whose length matches
+`Rows × Columns × SamplesPerPixel × BitsAllocated / 8`. The embed lands in the
+private group, which sorts ahead of `(7FE0,0010)`, so the object still renders
+the image it rendered before and a refusal is attributable to the payload.
+
+Those carriers also fix a conformance problem in the published construction.
+The V3GAS talk puts its payload directly in `(0009,0000)` or `(0009,0010)` —
+a Group Length tag and the private creator slot respectively, neither of which
+may hold an OB value. C-SCARE emits a real private block: an LO creator at
+`(0009,0010)` claiming block `10xx`, with the carrier at `(0009,1001)`. A
+validator can reject the published shape for a reason unrelated to what it is
+hiding; it cannot reject this one.
+
+Alongside the executable polyglots, `metadata['container_format']` marks a
+second embedding shape from the same talk: a length-prefixed blob —
+`[magic 8B][size uint32 LE][body]` — in a private element after the File Meta
+group and ahead of the pixel data. The framing is the durable signal, since the
+talk states the magic string is regenerated per engagement, so the catalog
+ships the same container under the published example magic and under a
+different one. A detector keyed on the literal string catches one and misses
+the other; a detector keyed on the structure catches both. The body is an inert
+marker — this catalog builds detection tests, not loaders, so the shellcode and
+the sideloaded-DLL execution chain that the talk pairs with the format are
+deliberately absent.
+
 The payloads are structurally complete on both sides — `validate_polyglot`
 dispatches on the magic at offset 0 and confirms a loader can walk every
 header (`validate_pe`, `validate_elf`, `validate_macho`) while pydicom reads
