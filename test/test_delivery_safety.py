@@ -642,3 +642,100 @@ class TestCorpusFilesAreConformantPart10:
             runner._save_corpus_file(result, str(tmp_path))).read_bytes()
         assert blob == result.payload
         assert blob[:2] == b'MZ'
+
+
+class TestStorageAcceptanceIsADetection:
+    """For some payloads, the target complying is the finding.
+
+    Most of the catalog looks for the peer to misbehave, so an orderly answer
+    is a pass. The polyglot family looks for the peer to *comply* — "an archive
+    should not store an executable" — and a clean DIMSE Success there means it
+    did not. That used to report as "C-STORE completed with DIMSE status
+    0x0000", detected=False: the run said nothing happened at the moment the
+    thing the test exists to catch had just happened.
+    """
+
+    def _report(self, status, finding_on):
+        from c_scare.monitor import ProtocolMonitor
+        monitor = ProtocolMonitor()
+        monitor.pre_test(0)
+        monitor.set_response(bytes([(status >> 8) & 0xFF, status & 0xFF]),
+                             error='cstore_status', finding_on=finding_on)
+        return monitor.post_test()
+
+    @pytest.mark.parametrize('status', [0x0000, 0xB000, 0xB007])
+    def test_a_stored_object_is_a_finding(self, status):
+        """Success and the 0xBxxx warnings all mean the object was kept."""
+        from c_scare.monitor import ProtocolMonitor
+        report = self._report(status, ProtocolMonitor.FINDING_ON_STORE)
+        assert report.detected is True
+        assert report.finding_type == 'storage:payload_accepted'
+        assert 'retrieve' in report.description, (
+            'the report must say what acceptance does not prove')
+
+    @pytest.mark.parametrize('status', [0xA700, 0xA900, 0xC000])
+    def test_a_refusal_is_not_a_finding(self, status):
+        """The archive did the right thing; saying otherwise is a false alarm."""
+        from c_scare.monitor import ProtocolMonitor
+        assert self._report(status, ProtocolMonitor.FINDING_ON_STORE).detected \
+            is False
+
+    @pytest.mark.parametrize('status', [0x0000, 0xA900])
+    def test_untagged_payloads_are_unaffected(self, status):
+        assert self._report(status, None).detected is False
+
+    def test_only_payloads_that_reach_the_archive_are_scored(self):
+        """Scoring a payload whose mechanism never arrives is a false alarm.
+
+        C-STORE carries a Data Set, not a file: the preamble and anything past
+        the final Data Element are never transmitted. A payload whose foreign
+        content lives there arrives as an ordinary image, so acceptance says
+        nothing about it.
+        """
+        from c_scare.attacks import CVEAttacks
+        from c_scare.monitor import ProtocolMonitor
+        family = [r for r in CVEAttacks.all()
+                  if r.metadata.get('cve') == 'CVE-2019-11687']
+        assert family
+        for result in family:
+            scored = (result.metadata.get('finding_on')
+                      == ProtocolMonitor.FINDING_ON_STORE)
+            assert scored == result.metadata['survives_cstore'], (
+                f'{result.name}: scored={scored} but '
+                f'survives_cstore={result.metadata["survives_cstore"]}')
+        assert any(r.metadata['survives_cstore'] for r in family)
+        assert any(not r.metadata['survives_cstore'] for r in family)
+
+    def test_file_only_payloads_say_so(self):
+        """An operator needs to know to deliver these as files instead."""
+        from c_scare.attacks import CVEAttacks
+        for result in CVEAttacks.all():
+            if result.metadata.get('survives_cstore') is False:
+                assert result.metadata.get('delivery_scope') == 'file'
+                assert 'finding_on' not in result.metadata
+
+    def test_the_runner_passes_the_expectation_through(self, monkeypatch):
+        """The wiring, not just the monitor: metadata has to reach set_response."""
+        from c_scare import deliver as deliver_mod
+        from c_scare.monitor import ProtocolMonitor
+
+        result = AttackResult(
+            name='polyglot', category='cve', payload=b'\x00' * 8,
+            description='d', expected_behavior='e',
+            metadata={'delivery_hint': 'cstore',
+                      'finding_on': ProtocolMonitor.FINDING_ON_STORE})
+        args = argparse.Namespace(
+            delivery='cstore', mutate=None, ae_title='PACS', calling_ae='SCU',
+            dry_run=None, max_associations=None, cstore_file=None,
+            store_sop=None, store_transfer_syntax=None, timeout=1.0,
+            monitors=None)
+        monkeypatch.setattr(
+            runner.deliver, 'send_cstore_outcome',
+            lambda *a, **k: deliver_mod.CStoreOutcome(0x0000, None))
+
+        monitor = ProtocolMonitor()
+        monkeypatch.setattr(runner, '_get_monitors', lambda _a: [monitor])
+        runner._run_monitored_test(args, result, ('127.0.0.1', 11112), 1.0)
+
+        assert result.success is True, 'a stored polyglot did not raise a finding'
+        assert result.monitor_reports[0].finding_type == 'storage:payload_accepted'

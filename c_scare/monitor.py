@@ -19,7 +19,24 @@ __all__ = [
     'ProcessMonitor',
     'SanitizerFinding',
     'parse_sanitizer_output',
+    'stored_successfully',
 ]
+
+
+def stored_successfully(status: Optional[int]) -> bool:
+    """True if a DIMSE status means the SCP kept the object (PS3.7 Annex C).
+
+    ``0x0000`` is Success. The ``0xBxxx`` warning class - coercion of data
+    elements, elements discarded, data set does not match SOP class - all mean
+    the object was stored anyway, with a note. ``0xAxxx`` and ``0xCxxx`` are
+    refusals and errors, where it was not.
+
+    The distinction matters because for some payloads storage *is* the
+    finding, and a warning status is still storage.
+    """
+    if status is None:
+        return False
+    return status == 0x0000 or (status & 0xF000) == 0xB000
 
 
 SIGNAL_NAMES = {
@@ -292,18 +309,35 @@ class ProtocolMonitor(BaseMonitor):
 
     NORMAL_ASSOCIATION_RESPONSES = (PDU_ASSOCIATE_AC, PDU_ASSOCIATE_RJ, PDU_ABORT)
 
+    #: ``metadata['finding_on']`` value meaning the payload is testing whether
+    #: the peer *accepts* it, so a successful store is the detection rather
+    #: than the absence of one.
+    FINDING_ON_STORE = 'store_accepted'
+
     def __init__(self):
         self._response: Optional[bytes] = None
         self._error: Optional[str] = None
+        self._finding_on: Optional[str] = None
 
     def pre_test(self, test_number: int):
         self._response = None
         self._error = None
+        self._finding_on = None
 
-    def set_response(self, response: Optional[bytes], error: Optional[str] = None):
-        """Called by test runner after delivery, before post_test()."""
+    def set_response(self, response: Optional[bytes], error: Optional[str] = None,
+                     finding_on: Optional[str] = None):
+        """Called by test runner after delivery, before post_test().
+
+        ``finding_on`` carries the payload's own expectation. Most payloads
+        are looking for the peer to misbehave, so an orderly answer is a pass.
+        A few are looking for the peer to *comply* - "the archive should not
+        store an executable" - and for those a clean DIMSE Success is the
+        result worth reporting. Without it the monitor has no way to tell the
+        two apart and calls a stored payload a normal response.
+        """
         self._response = response
         self._error = error
+        self._finding_on = finding_on
 
     def post_test(self) -> MonitorReport:
         if self._error == 'dry_run':
@@ -333,6 +367,25 @@ class ProtocolMonitor(BaseMonitor):
             if self._response and len(self._response) >= 2:
                 status = (self._response[0] << 8) | self._response[1]
             status_text = f'0x{status:04x}' if status is not None else 'unknown'
+            if (self._finding_on == self.FINDING_ON_STORE
+                    and stored_successfully(status)):
+                # The payload asked whether the peer would accept it, and the
+                # peer did. Reporting that as a normal response is the wrong
+                # way round: for an object carrying an embedded executable, a
+                # clean store is the outcome the test exists to catch.
+                return MonitorReport(
+                    detected=True,
+                    finding_type='storage:payload_accepted',
+                    description=(
+                        f'SCP stored the object (DIMSE {status_text}), '
+                        'including attacker-controlled bytes in a region a '
+                        'conforming reader traverses without inspecting. '
+                        'C-STORE does not carry the 128-byte preamble, so a '
+                        'preamble-resident header is not what reached the '
+                        'archive — retrieve the stored instance and compare '
+                        'to establish what did.'),
+                    evidence=status_text,
+                )
             return MonitorReport(
                 detected=False,
                 description=f'C-STORE completed with DIMSE status {status_text}',

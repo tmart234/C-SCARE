@@ -204,6 +204,40 @@ marker — this catalog builds detection tests, not loaders, so the shellcode an
 the sideloaded-DLL execution chain that the talk pairs with the format are
 deliberately absent.
 
+### Which half survives the wire
+
+Measured against a pynetdicom Storage SCP, not assumed. C-STORE carries a Data
+Set; the 128-byte preamble is a *file* construct PS3.10 defines outside it, and
+so is anything past the final Data Element. Neither is transmitted — the
+receiving SCP writes its own zeroed preamble.
+
+The consequence is worth stating plainly: **no executable polyglot survives
+C-STORE as a loadable image.** `MZ`, `\x7fELF` and the Mach-O magic all sit at
+offset 0, and `e_lfanew` at 0x3C. What does survive is whatever lives inside a
+Data Element — the PE headers and section data in a private element, the
+container blob, the padding-tail payload — and that arrives intact.
+
+`metadata['survives_cstore']` records which is which, and only the payloads
+whose mechanism actually arrives are scored on acceptance. The rest carry
+`delivery_scope: 'file'`: deliver them with `c-scare corpus -o ./out` through
+an import path, media or a DICOMDIR, where the file itself moves. Scoring them
+over an association would report a finding against an archive that received an
+ordinary image.
+
+| Zone | Reaches the archive over C-STORE |
+|------|----------------------------------|
+| Private (odd-group) `OB` element | yes — the value is a Data Element |
+| Padding tail of a Data Element | yes — inside the declared length |
+| Preamble DOS header / DOS stub | no — never transmitted |
+| Space after the final Data Element | no — outside the Data Set |
+| Fragmented across zones | no — the trailing piece is lost and the object fails to decode |
+
+When a payload whose content *does* arrive is stored, `ProtocolMonitor` reports
+`storage:payload_accepted` rather than a clean result. That inversion matters:
+for most of the catalog an orderly answer is a pass, but here the archive
+complying — keeping attacker-controlled bytes in a region conforming readers
+never inspect — is the outcome the test exists to catch.
+
 The payloads are structurally complete on both sides — `validate_polyglot`
 dispatches on the magic at offset 0 and confirms a loader can walk every
 header (`validate_pe`, `validate_elf`, `validate_macho`) while pydicom reads

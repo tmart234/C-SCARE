@@ -84,6 +84,12 @@ def foreign_body_offset(payload):
     if fmt == "pe":
         return struct.unpack("<I", payload[60:64])[0]
     if fmt == "elf":
+        # e_phoff sits at a different offset and width per ELF class: byte 32
+        # as a 64-bit value in Elf64_Ehdr, byte 28 as a 32-bit one in
+        # Elf32_Ehdr. Reading the 64-bit field out of a 32-bit header is the
+        # exact mistake payload 19 exists to catch a scanner making.
+        if payload[4] == 1:                      # EI_CLASS = ELFCLASS32
+            return struct.unpack("<I", payload[28:32])[0]
         return struct.unpack("<Q", payload[32:40])[0]
     if fmt == "macho":
         pos = polyglot.MACHO_HEADER_LEN[64]
@@ -460,9 +466,13 @@ class TestCarriedPayloadsRideAStorableObject:
     @pytest.mark.parametrize("result", CARRIED, ids=lambda r: r.name)
     def test_the_payload_sits_ahead_of_the_pixel_data(self, result):
         """Group 0009 sorts before (7FE0,0010), and the bytes must agree."""
-        offset = (result.metadata.get("pe_offset")
-                  or result.metadata["container_offset"])
-        assert offset < result.metadata["carrier_pixel_data_offset"]
+        offsets = [result.metadata[key]
+                   for key in ("pe_offset", "ph_offset", "container_offset")
+                   if key in result.metadata]
+        assert len(offsets) == 1, (
+            f"{result.name} declares {len(offsets)} payload offsets; each "
+            "carried payload names exactly one")
+        assert offsets[0] < result.metadata["carrier_pixel_data_offset"]
         assert result.metadata["carrier_pixel_data_intact"] is True
 
     @pytest.mark.parametrize("result", CARRIED, ids=lambda r: r.name)

@@ -89,6 +89,11 @@ __all__ = [
     'pe_headers_len',
     'elf_header',
     'elf_image',
+    'elf_fragments',
+    'ELF_TYPE_EXEC',
+    'ELF_TYPE_DYN',
+    'ELF_HEADER_LEN',
+    'ELF_PHDR_LEN',
     'macho_header',
     'macho_image',
     'dataset_offset',
@@ -142,8 +147,10 @@ ELF_IMAGE_BASE = 0x00400000
 _ELFCLASS = {32: 1, 64: 2}                   # EI_CLASS
 _ELFDATA2LSB = 1                             # EI_DATA: two's complement, LE
 _EV_CURRENT = 1
-_ET_EXEC = 2
-_ET_DYN = 3
+ELF_TYPE_EXEC = 2
+ELF_TYPE_DYN = 3
+_ET_EXEC = ELF_TYPE_EXEC
+_ET_DYN = ELF_TYPE_DYN
 _EM = {32: 0x03, 64: 0x3E}                   # EM_386, EM_X86_64
 _PT_LOAD = 1
 _PF_R = 4                                    # deliberately not PF_X (1)
@@ -553,7 +560,7 @@ def pe_image(pe_offset: int, bits: int = 64, section_size: int = 0x200,
 # ---------------------------------------------------------------------------
 
 def elf_header(ph_offset: int = 0, ph_count: int = 0, bits: int = 64,
-               entry: int = 0) -> bytes:
+               entry: int = 0, elf_type: int = _ET_EXEC) -> bytes:
     """A complete ``Elf64_Ehdr`` (64 bytes) or ``Elf32_Ehdr`` (52 bytes).
 
     Unlike PE, this cannot be relocated: ``readelf``, the kernel's ``binfmt_elf``
@@ -569,7 +576,9 @@ def elf_header(ph_offset: int = 0, ph_count: int = 0, bits: int = 64,
 
     ``entry`` defaults to 0, which makes the image inert - execution would
     transfer to an unmapped address 0 rather than to anything this module
-    emitted.
+    emitted. ``elf_type`` selects ``ET_EXEC`` or ``ET_DYN``; modern Linux
+    toolchains emit PIE executables as ``ET_DYN``, and a scanner whose ELF
+    check keys on ``ET_EXEC`` alone misses every one of them.
     """
     if bits not in ELF_HEADER_LEN:
         raise ValueError(f'bits must be 32 or 64, got {bits}')
@@ -579,10 +588,14 @@ def elf_header(ph_offset: int = 0, ph_count: int = 0, bits: int = 64,
                b'\x00' * 7)               # EI_OSABI/ABIVERSION 0, EI_PAD
     assert len(e_ident) == 16, len(e_ident)
 
+    if elf_type not in (_ET_EXEC, _ET_DYN):
+        raise ValueError(f'elf_type must be ET_EXEC ({_ET_EXEC}) or '
+                         f'ET_DYN ({_ET_DYN}), got {elf_type}')
+
     if bits == 64:
         rest = struct.pack(
             '<HHIQQQIHHHHHH',
-            _ET_EXEC, _EM[64], _EV_CURRENT,
+            elf_type, _EM[64], _EV_CURRENT,
             entry,                        # e_entry - no entry point
             ph_offset,                    # e_phoff - the relocatable pointer
             0,                            # e_shoff - no section headers
@@ -592,7 +605,7 @@ def elf_header(ph_offset: int = 0, ph_count: int = 0, bits: int = 64,
     else:
         rest = struct.pack(
             '<HHIIIIIHHHHHH',
-            _ET_EXEC, _EM[32], _EV_CURRENT,
+            elf_type, _EM[32], _EV_CURRENT,
             entry, ph_offset, 0, 0,
             ELF_HEADER_LEN[32], ELF_PHDR_LEN[32], ph_count,
             0, 0, 0)
@@ -600,6 +613,67 @@ def elf_header(ph_offset: int = 0, ph_count: int = 0, bits: int = 64,
     header = e_ident + rest
     assert len(header) == ELF_HEADER_LEN[bits], len(header)
     return header
+
+
+def elf_fragments(ph_offset: int, placements: Sequence[Tuple[int, int]],
+                  bits: int = 64, fill: str = 'zeros', seed: int = 0,
+                  image_base: int = ELF_IMAGE_BASE
+                  ) -> Tuple[bytes, List[bytes]]:
+    """Build an ELF whose ``PT_LOAD`` segments live at chosen file offsets.
+
+    ``placements`` is a sequence of ``(file_offset, size)``, one per segment.
+    Returns ``(program_header_table, [segment_data, ...])``: the table goes at
+    ``ph_offset`` and segment *i* at ``placements[i][0]``.
+
+    The ELF counterpart of :func:`pe_fragments`, and markedly *less*
+    constrained - which is the point worth knowing before assuming the two
+    fragment alike. A ``PT_LOAD`` may begin at any file offset at all, so long
+    as ``p_vaddr`` agrees with it modulo ``p_align``; PE demands an absolute
+    ``FileAlignment`` boundary at or past ``SizeOfHeaders``. An ELF payload
+    can therefore be scattered into whatever gaps a Data Set happens to leave,
+    including ones too small or too badly aligned to hold a PE section - the
+    64-byte DOS-stub zone being the example that defeated the PE version.
+
+    Virtual addresses are assigned ascending and non-overlapping, because the
+    kernel requires ``PT_LOAD`` entries sorted by ``p_vaddr`` and rejects
+    images whose mappings collide. Each is chosen to satisfy the congruence
+    for whatever file offset the caller picked.
+    """
+    if bits not in ELF_PHDR_LEN:
+        raise ValueError(f'bits must be 32 or 64, got {bits}')
+    if not placements:
+        raise ValueError('an ELF image needs at least one PT_LOAD segment')
+    if image_base % ELF_PAGE_SIZE:
+        raise ValueError(f'image_base 0x{image_base:X} is not page-aligned')
+
+    table = b''
+    payloads: List[bytes] = []
+    cursor = image_base
+    for index, (file_offset, size) in enumerate(placements):
+        if file_offset < 0 or size < 0:
+            raise ValueError(f'segment {index} has a negative offset or size')
+        # The congruence, solved for p_vaddr: a page-aligned base plus the
+        # segment's offset within its page.
+        p_vaddr = cursor + (file_offset % ELF_PAGE_SIZE)
+        if bits == 64:
+            table += struct.pack('<IIQQQQQQ',
+                                 _PT_LOAD, _PF_R,
+                                 file_offset, p_vaddr, p_vaddr,
+                                 size, size, ELF_PAGE_SIZE)
+        else:
+            table += struct.pack('<IIIIIIII',
+                                 _PT_LOAD,
+                                 file_offset, p_vaddr, p_vaddr,
+                                 size, size,
+                                 _PF_R,          # p_flags is last in Elf32
+                                 ELF_PAGE_SIZE)
+        payloads.append(filler(fill, size, seed + index))
+        # Advance past this mapping and leave a page of slack, so the next
+        # segment's address cannot collide however its offset falls.
+        cursor = align_up(p_vaddr + max(size, 1), ELF_PAGE_SIZE) + ELF_PAGE_SIZE
+
+    assert len(table) == len(placements) * ELF_PHDR_LEN[bits], len(table)
+    return table, payloads
 
 
 def elf_image(ph_offset: int, bits: int = 64, segment_size: int = 0x200,
@@ -633,32 +707,13 @@ def elf_image(ph_offset: int, bits: int = 64, segment_size: int = 0x200,
     """
     if bits not in ELF_PHDR_LEN:
         raise ValueError(f'bits must be 32 or 64, got {bits}')
-    if image_base % ELF_PAGE_SIZE:
-        raise ValueError(f'image_base 0x{image_base:X} is not page-aligned')
 
-    phdr_len = ELF_PHDR_LEN[bits]
-    p_offset = ph_offset + phdr_len
-    # The congruence, solved for p_vaddr: any page-aligned base plus the
-    # segment's offset within its page.
-    p_vaddr = image_base + (p_offset % ELF_PAGE_SIZE)
-
-    if bits == 64:
-        phdr = struct.pack('<IIQQQQQQ',
-                           _PT_LOAD, _PF_R,
-                           p_offset, p_vaddr, p_vaddr,
-                           segment_size,          # p_filesz
-                           segment_size,          # p_memsz
-                           ELF_PAGE_SIZE)         # p_align
-    else:
-        phdr = struct.pack('<IIIIIIII',
-                           _PT_LOAD,
-                           p_offset, p_vaddr, p_vaddr,
-                           segment_size, segment_size,
-                           _PF_R,                 # p_flags is last in Elf32
-                           ELF_PAGE_SIZE)
-    assert len(phdr) == phdr_len, (len(phdr), phdr_len)
-
-    return phdr + filler(fill, segment_size, seed)
+    # The contiguous, single-segment case of elf_fragments: the segment
+    # immediately follows the one-entry program header table.
+    table, (segment,) = elf_fragments(
+        ph_offset, [(ph_offset + ELF_PHDR_LEN[bits], segment_size)],
+        bits=bits, fill=fill, seed=seed, image_base=image_base)
+    return table + segment
 
 
 # ---------------------------------------------------------------------------
@@ -1247,6 +1302,7 @@ def validate_elf(data: bytes) -> List[str]:
                         'the end of the file')
         return problems
 
+    previous_end = None
     for i in range(e_phnum):
         base = e_phoff + i * phdr_len
         if bits == 64:
@@ -1273,6 +1329,13 @@ def validate_elf(data: bytes) -> List[str]:
                 problems.append(
                     f'PT_LOAD {i} p_offset={p_offset} is not congruent to '
                     f'p_vaddr=0x{p_vaddr:X} modulo p_align={p_align}')
+        # The kernel walks PT_LOAD entries in order and maps each in turn, so
+        # it requires them sorted by p_vaddr with no overlapping mappings.
+        if previous_end is not None and p_vaddr < previous_end:
+            problems.append(
+                f'PT_LOAD {i} p_vaddr=0x{p_vaddr:X} overlaps or precedes the '
+                f'previous segment, which ends at 0x{previous_end:X}')
+        previous_end = p_vaddr + p_memsz
     return problems
 
 

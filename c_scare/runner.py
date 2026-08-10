@@ -894,7 +894,8 @@ def _run_monitored_test(args, result: AttackResult, target, timeout: float):
 
     for monitor in monitors:
         if isinstance(monitor, ProtocolMonitor):
-            monitor.set_response(response, error=error)
+            monitor.set_response(response, error=error,
+                                 finding_on=result.metadata.get('finding_on'))
 
     if any(isinstance(m, SanitizerMonitor) for m in monitors):
         time.sleep(SANITIZER_FLUSH_DELAY)
@@ -1432,6 +1433,27 @@ def _print_undelivered(results: list) -> None:
     print("         Those tests concluded nothing about the target.")
 
 
+def _print_file_only(results: list) -> None:
+    """Note payloads whose mechanism cannot survive an association.
+
+    C-STORE carries a Data Set, so a payload whose foreign content lives in
+    the 128-byte preamble or past the final Data Element arrives as an
+    ordinary object — the archive is being asked a question the wire cannot
+    put to it. Delivering them anyway is harmless, but reporting the result as
+    if it meant something is not, so the run says which ones need a file path
+    instead.
+    """
+    file_only = [r for r in results
+                 if r.metadata.get('delivery_scope') == 'file'
+                 and r.metadata.get('delivery') in ('cstore', 'pdu')]
+    if not file_only:
+        return
+    print(f"NOTE: {len(file_only)} payload(s) carry their content in the "
+          "preamble or past the Data Set,")
+    print("      which C-STORE does not transmit. Deliver those as files —")
+    print("      `c-scare corpus -o ./out` — through an import path or media.")
+
+
 def _run_catalog(args, catalog, label: str, note: Optional[str] = None) -> int:
     """Run one static attack catalog: deliver each payload to a monitored live
     target, print results, collect findings, and optionally write the payloads
@@ -1457,6 +1479,7 @@ def _run_catalog(args, catalog, label: str, note: Optional[str] = None) -> int:
 
     print(f"\nTotal {label.lower()} tests: {len(results)}")
     _print_undelivered(results)
+    _print_file_only(results)
     if note:
         print(note)
     _collect_results(args, results)

