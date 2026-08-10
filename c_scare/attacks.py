@@ -4943,46 +4943,87 @@ class CVEAttacks:
                       'zone': 'preamble_dos_header', 'elf_bits': 64}
         ))
 
-        # Test 3: Shell script in preamble
-        script = b'#!/bin/sh\necho "pwned"\n#'
+        # Test 3: Shell script in preamble.
+        #
+        # The `exit 0` is load-bearing. A shebang and a comment marker are not
+        # enough: `#` comments to the end of its line only, so without an exit
+        # the interpreter runs on into the Data Set and parses DICOM bytes as
+        # shell. `sh -n` rejected the earlier version with "EOF in backquote
+        # substitution" — it was a file that *looked* like a script polyglot
+        # and was not one. Hetzel et al. Fig. 2 shows the same construction
+        # with "a proper exit from the script" for this reason.
+        script = b'#!/bin/sh\nexit 0\n#'
         script += b'\x00' * (128 - len(script))
-        
-        file_data = CVEAttacks._polyglot_part10(script)
-        
+
         results.append(AttackResult(
             name='cve_2019_11687_03_script_preamble',
             category='cve',
-            payload=file_data,
-            description='Shell script in DICOM preamble',
-            expected_behavior='Scanner should detect script',
+            payload=CVEAttacks._polyglot_part10(script),
+            description='POSIX shell script in the DICOM preamble that exits '
+                        'before the Data Set',
+            expected_behavior='Scanner should detect the shebang; a file that '
+                              'is both a rendered image and a script the '
+                              'shell will run is the point',
             metadata={'cve': 'CVE-2019-11687', 'polyglot': 'shell',
                       'zone': 'preamble_dos_header'}
         ))
-        
-        # Test 4: Batch script in preamble
-        batch = b'@echo off\r\necho pwned\r\nREM '
+
+        # Test 4: Batch script in preamble. `EXIT /B` for the same reason
+        # `exit 0` is there in test 3 — REM comments one line, and cmd.exe
+        # would otherwise keep reading the Data Set as batch commands.
+        batch = b'@echo off\r\nEXIT /B 0\r\nREM '
         batch += b' ' * (128 - len(batch))
-        
-        file_data = CVEAttacks._polyglot_part10(batch)
-        
+
         results.append(AttackResult(
             name='cve_2019_11687_04_batch_preamble',
             category='cve',
-            payload=file_data,
-            description='Batch script in DICOM preamble',
-            expected_behavior='Scanner should detect batch script',
+            payload=CVEAttacks._polyglot_part10(batch),
+            description='Windows batch script in the DICOM preamble that '
+                        'exits before the Data Set',
+            expected_behavior='Scanner should detect batch content in the '
+                              'preamble',
             metadata={'cve': 'CVE-2019-11687', 'polyglot': 'batch',
                       'zone': 'preamble_dos_header'}
         ))
 
-        # Test 5: TIFF header in preamble (dual-purpose TIFF/DICOM)
-        # The CVE explicitly cites whole-slide-imaging TIFF/DICOM polyglots
-        # as a real-world dual-purpose case.
-        tiff = b'II*\x00'                     # TIFF little-endian (Intel) magic
-        tiff += struct.pack('<I', 8)          # offset to first IFD
-        tiff += struct.pack('<H', 0)          # IFD with 0 directory entries
+        # Test 5: a complete 1x1 TIFF inside the preamble.
+        #
+        # Whole-slide imaging really does ship TIFF/DICOM dual-purpose files,
+        # so this one has to open as an image, not just carry the magic. The
+        # earlier version declared an IFD with zero directory entries: `file`
+        # reported "TIFF image data, direntries=0" while Pillow refused it
+        # with UnidentifiedImageError, which made it a magic probe wearing a
+        # dual-purpose label.
+        #
+        # Eight tags is the minimum a reader needs, and at 12 bytes each the
+        # whole structure plus one pixel fits the 128-byte preamble with room
+        # to spare.
+        _tiff_ifd_offset = 8
+        _tiff_entries = [
+            (0x0100, 3, 1, 1),        # ImageWidth  = 1
+            (0x0101, 3, 1, 1),        # ImageLength = 1
+            (0x0102, 3, 1, 8),        # BitsPerSample = 8
+            (0x0103, 3, 1, 1),        # Compression = none
+            (0x0106, 3, 1, 1),        # PhotometricInterpretation = BlackIsZero
+            (0x0111, 4, 1, 0),        # StripOffsets — patched below
+            (0x0116, 3, 1, 1),        # RowsPerStrip = 1
+            (0x0117, 4, 1, 1),        # StripByteCounts = 1
+        ]
+        _tiff_pixel_offset = (_tiff_ifd_offset + 2
+                              + len(_tiff_entries) * 12 + 4)
+        tiff = b'II*\x00' + struct.pack('<I', _tiff_ifd_offset)
+        tiff += struct.pack('<H', len(_tiff_entries))
+        for tag, field_type, count, value in _tiff_entries:
+            if tag == 0x0111:
+                value = _tiff_pixel_offset
+            # Values <= 4 bytes live in the value field itself, left-aligned.
+            tiff += struct.pack('<HHI', tag, field_type, count)
+            tiff += (struct.pack('<H', value) + b'\x00\x00'
+                     if field_type == 3 else struct.pack('<I', value))
         tiff += struct.pack('<I', 0)          # no next IFD
-        tiff += b'\x00' * (128 - len(tiff))   # pad out the 128-byte preamble
+        tiff += b'\x80'                       # the single mid-grey pixel
+        assert len(tiff) == _tiff_pixel_offset + 1, len(tiff)
+        tiff = tiff.ljust(128, b'\x00')       # pad out the 128-byte preamble
 
         file_data = CVEAttacks._polyglot_part10(tiff)
 
