@@ -34,10 +34,12 @@ from typing import List, Optional, Tuple
 __all__ = [
     'BUNDLED_IMAGES',
     'DOWNLOADABLE_IMAGES',
+    'ENCODING_REPRESENTATIVES',
     'NONCONFORMANT_IMAGES',
     'TRUNCATED_IMAGES',
     'bundled_paths',
     'downloaded_paths',
+    'encoding_paths',
     'corpus_paths',
     'downloads_enabled',
     'image_id',
@@ -115,6 +117,18 @@ NONCONFORMANT_IMAGES = frozenset({
     'no_meta.dcm',          # a stray leading byte shifts every element by one
 })
 
+#: One image per distinct Data Set encoding, for the tests whose variable is
+#: framework logic rather than the image. Sweeping the whole corpus there buys
+#: nothing: whether a payload survives a splice depends on the *encoder*, and
+#: the encoder has four cases, not twenty-eight. The full corpus is still swept
+#: by the fidelity tests, where the image genuinely is the variable.
+ENCODING_REPRESENTATIVES = (
+    'CT_small.dcm',            # Explicit VR Little Endian
+    'MR_small_implicit.dcm',   # Implicit VR Little Endian
+    'MR_small_bigendian.dcm',  # Explicit VR Big Endian
+    'JPEG2000.dcm',            # encapsulated Pixel Data
+)
+
 _DOWNLOAD_ENV = 'CSCARE_TEST_DOWNLOAD'
 
 
@@ -191,3 +205,13 @@ def downloaded_paths() -> List[str]:
 def corpus_paths() -> List[str]:
     """The full corpus: bundled images, plus downloaded ones when enabled."""
     return bundled_paths() + downloaded_paths()
+
+
+def encoding_paths() -> List[str]:
+    """One image per Data Set encoding -- see :data:`ENCODING_REPRESENTATIVES`."""
+    directory = _bundled_dir()
+    if directory is None:
+        return []
+    return [os.path.join(directory, name)
+            for name in ENCODING_REPRESENTATIVES
+            if os.path.exists(os.path.join(directory, name))]

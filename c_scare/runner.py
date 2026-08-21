@@ -30,7 +30,6 @@ import os
 import argparse
 import datetime as dt
 import time
-import struct
 import hashlib
 import re
 from typing import Dict, List, NamedTuple, Optional, Tuple
@@ -44,7 +43,7 @@ try:
         PathTraversalAttacks, StateMachineAttacks, CVEAttacks,
         NegotiationAttacks, DimseNAttacks,
         ProtocolFuzzer, AttackResult, SCAPY_AVAILABLE,
-        DICM_PREFIX, EXPLICIT_VR_LE_UID, PART10_PREAMBLE_LEN,
+        DICM_PREFIX, EXPLICIT_VR_LE_UID,
         part10_file, standard_file_meta,
     )
     from . import client, deliver, transport
@@ -62,7 +61,7 @@ except ImportError:
         PathTraversalAttacks, StateMachineAttacks, CVEAttacks,
         NegotiationAttacks, DimseNAttacks,
         ProtocolFuzzer, AttackResult, SCAPY_AVAILABLE,
-        DICM_PREFIX, EXPLICIT_VR_LE_UID, PART10_PREAMBLE_LEN,
+        DICM_PREFIX, EXPLICIT_VR_LE_UID,
         part10_file, standard_file_meta,
     )
     import client
@@ -134,9 +133,6 @@ DATASET_CATEGORIES = frozenset({
 # a clinical outage, so they require --allow-availability.
 AVAILABILITY_CATEGORIES = frozenset({'memory', 'storage_abuse', 'state_machine'})
 
-_LONG_EXPLICIT_VR = frozenset({
-    b'OB', b'OD', b'OF', b'OL', b'OV', b'OW', b'SQ', b'UC', b'UR', b'UT', b'UN',
-})
 
 # Fallback storage SOP class for C-STORE delivery when an attack does not name
 # one. Secondary Capture accepts arbitrary datasets and is what the
@@ -893,58 +889,36 @@ def _dataset_from_part10(payload: bytes) -> Tuple[bytes, Dict[str, str]]:
     stored as complete Part-10 files so they are useful as file-parser seeds;
     when those same payloads are delivered over C-STORE, remove the preamble
     and group-0002 file meta header while preserving the malformed data set.
+
+    The split itself lives in :func:`c_scare.carrier.split_part10` so the
+    carrier and the delivery path cannot disagree about where a Data Set
+    begins — they used to have separate implementations of the same walk, and
+    a payload that straddled the difference was framed one way and spliced the
+    other.
     """
+    _preamble, file_meta, dataset, elements = carrier_mod.split_part10(payload)
     meta: Dict[str, str] = {}
-    if not is_part10(payload):
+    if not carrier_mod.is_part10(payload):
         return payload, meta
 
-    pos = PART10_PREAMBLE_LEN + len(DICM_PREFIX)
-    end = len(payload)
-    while pos + 8 <= end:
-        group, elem = struct.unpack_from('<HH', payload, pos)
-        if group != 0x0002:
-            break
-
-        vr = payload[pos + 4:pos + 6]
-        if vr in _LONG_EXPLICIT_VR:
-            if pos + 12 > end:
-                break
-            length = struct.unpack_from('<I', payload, pos + 8)[0]
-            value_start = pos + 12
-        else:
-            length = struct.unpack_from('<H', payload, pos + 6)[0]
-            value_start = pos + 8
-
-        value_end = value_start + length
-        if length == 0xFFFFFFFF or value_end > end:
-            break
-
-        value = payload[value_start:value_end]
-        if elem == 0x0002:
+    for elem in elements:
+        value = file_meta[elem.value_start:elem.end]
+        if elem.tag == 0x00020002:
             meta['sop_class_uid'] = _decode_uid_value(value)
-        elif elem == 0x0003:
+        elif elem.tag == 0x00020003:
             meta['sop_instance_uid'] = _decode_uid_value(value)
-        elif elem == 0x0010:
+        elif elem.tag == 0x00020010:
             meta['transfer_syntax'] = _decode_uid_value(value)
-        pos = value_end
 
-    if pos > 132:
+    if len(payload) - len(dataset) > 132:
         meta['part10_stripped'] = 'true'
-        return payload[pos:], meta
+        return dataset, meta
     return payload, meta
 
 
-def is_part10(payload: bytes) -> bool:
-    """True if ``payload`` is a complete Part-10 file.
-
-    PS3.10 §7.1 fixes the shape: a 128-byte File Preamble followed by the
-    four-byte ``DICM`` prefix. Nothing else the catalog produces looks like
-    that, so it is a reliable structural answer to "is this a dataset to be
-    stored, or bytes to be framed as a PDU?"
-    """
-    return (len(payload) > PART10_PREAMBLE_LEN + len(DICM_PREFIX)
-            and payload[PART10_PREAMBLE_LEN:
-                        PART10_PREAMBLE_LEN + len(DICM_PREFIX)] == DICM_PREFIX)
+#: Re-exported so callers (and the delivery-safety tests) keep one answer to
+#: "is this a file or a Data Set".
+is_part10 = carrier_mod.is_part10
 
 
 def _delivery_kind(args, result: AttackResult) -> str:

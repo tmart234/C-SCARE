@@ -283,6 +283,19 @@ Cascading property measured rather than assumed:
 The retrieve is skipped when the store was refused — fetching an instance that
 was never accepted would report `stripped` for an object that was never there.
 
+The comparison only means something if the framework leaves the payload alone
+on the way past, so what comes back off the association is kept as bytes: the
+Data Set the peer sent, wrapped in a File Meta group here and otherwise
+untouched. Re-serialising a parse of it would answer a different question —
+"what would a conformant writer emit?" — and answer it wrong in a way that
+lands as a finding. pydicom's writer alone drops every retired `(gggg,0000)`
+group length, and the catalog parks a polyglot in exactly one of those
+(`cve_2019_11687_23_published_group_length_tag`), so that payload used to come
+back `pipeline:stripped` from an archive that had done nothing to it. Only
+group 0002 is ours to build, and PS3.10 puts that outside the Data Set anyway:
+C-STORE transmits a Data Set, so the preamble and the File Meta group were
+never the peer's to send.
+
 **What this does not measure is execution, deliberately.** These images are
 inert by construction — entry point 0, no `PF_X`, no `IMAGE_SCN_MEM_EXECUTE` —
 and a polyglot never executes itself in any case. Activation is a separate

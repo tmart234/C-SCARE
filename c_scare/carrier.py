@@ -62,7 +62,9 @@ __all__ = [
     'MAX_NESTING_DEPTH',
     'empty_basic_offset_table',
     'encapsulate_items',
+    'is_part10',
     'scan_dataset',
+    'split_part10',
     'split_encapsulated',
     'sniff_encoding',
     'transcode_element_header',
@@ -117,6 +119,65 @@ _SNIFFED_SYNTAX = {
     (False, True): EXPLICIT_VR_LITTLE_ENDIAN,
     (False, False): EXPLICIT_VR_BIG_ENDIAN,
 }
+
+
+def is_part10(blob: bytes) -> bool:
+    """True if ``blob`` is a complete Part-10 file.
+
+    PS3.10 Section 7.1 fixes the shape: a 128-byte File Preamble followed by
+    the four-byte ``DICM`` prefix. Nothing a Data Set can start with looks like
+    that, so it is a reliable structural answer to "is this a file, or bytes to
+    be framed?".
+    """
+    return (len(blob) > PREAMBLE_LEN + len(DICM_PREFIX)
+            and blob[PREAMBLE_LEN:PREAMBLE_LEN + len(DICM_PREFIX)]
+            == DICM_PREFIX)
+
+
+def split_part10(blob: bytes) -> Tuple[bytes, bytes, bytes,
+                                       List['CarrierElement']]:
+    """Split a Part-10 file into ``(preamble, file_meta, dataset, elements)``.
+
+    The group-0002 elements are returned with spans relative to ``file_meta``.
+    Bounded by the elements themselves rather than by (0002,0000) File Meta
+    Information Group Length: a file whose group length disagrees with its
+    contents is a thing the catalog deliberately builds, and trusting the
+    declared value would make the split depend on the very field under test.
+
+    Never raises. A blob that is not a Part-10 file is all Data Set, which is
+    what a C-STORE payload is.
+    """
+    if not is_part10(blob):
+        return b'', b'', blob, []
+
+    start = PREAMBLE_LEN + len(DICM_PREFIX)
+    elements: List[CarrierElement] = []
+    pos = start
+    end = len(blob)
+    while pos + 8 <= end:
+        group, element = struct.unpack_from('<HH', blob, pos)
+        if group != 0x0002:
+            break
+        vr = bytes(blob[pos + 4:pos + 6])
+        if vr in _LONG_FORM_VRS:
+            if pos + 12 > end:
+                break
+            length = struct.unpack_from('<I', blob, pos + 8)[0]
+            value_start = pos + 12
+            long_form = True
+        else:
+            length = struct.unpack_from('<H', blob, pos + 6)[0]
+            value_start = pos + 8
+            long_form = False
+        value_end = value_start + length
+        if length == UNDEFINED_LENGTH or value_end > end:
+            break
+        elements.append(CarrierElement(
+            tag=(group << 16) | element, vr=vr, declared_length=length,
+            start=pos - start, value_start=value_start - start,
+            end=value_end - start, long_form=long_form))
+        pos = value_end
+    return blob[:PREAMBLE_LEN], blob[start:pos], blob[pos:], elements
 
 
 class CarrierError(Exception):
@@ -409,16 +470,12 @@ class Carrier:
         self.file_meta = b''
         self.dataset = blob
         self._file_meta_values: Dict[int, bytes] = {}
-        self.file_meta_elements: List[CarrierElement] = []
 
-        if (len(blob) > PREAMBLE_LEN + len(DICM_PREFIX)
-                and blob[PREAMBLE_LEN:PREAMBLE_LEN + len(DICM_PREFIX)]
-                == DICM_PREFIX):
-            self.preamble = blob[:PREAMBLE_LEN]
-            meta_start = PREAMBLE_LEN + len(DICM_PREFIX)
-            meta_end = self._scan_file_meta(blob, meta_start)
-            self.file_meta = blob[meta_start:meta_end]
-            self.dataset = blob[meta_end:]
+        self.preamble, self.file_meta, self.dataset, self.file_meta_elements = \
+            split_part10(blob)
+        for elem in self.file_meta_elements:
+            self._file_meta_values[elem.tag] = \
+                self.file_meta[elem.value_start:elem.end]
 
         self.sniffed_encoding = False
         self.transfer_syntax = _uid_from_bytes(
@@ -463,45 +520,38 @@ class Carrier:
     def from_bytes(cls, blob: bytes, path: Optional[str] = None) -> 'Carrier':
         return cls(blob, path=path)
 
-    def _scan_file_meta(self, blob: bytes, start: int) -> int:
-        """Walk the group-0002 elements, recording their values.
+    @classmethod
+    def from_dataset(cls, blob: bytes, transfer_syntax: str,
+                     path: Optional[str] = None) -> 'Carrier':
+        """A bare Data Set whose encoding is already known.
 
-        Bounded by the elements themselves rather than by (0002,0000) File Meta
-        Information Group Length: a carrier whose group length disagrees with
-        its contents is a thing the catalog deliberately builds, and trusting
-        the declared value would make the split depend on the very field under
-        test.
+        A Data Set that arrived over an association carries no File Meta
+        Information -- C-STORE transmits a Data Set, not a file -- but the
+        encoding is not in doubt either: the presentation context said what it
+        is. Sniffing here would be guessing at something already known, and a
+        guess that lands wrong on a deliberately malformed object turns the
+        receiver's bytes into nonsense before anything has looked at them.
         """
-        pos = start
-        end = len(blob)
-        while pos + 8 <= end:
-            group, element = struct.unpack_from('<HH', blob, pos)
-            if group != 0x0002:
-                break
-            vr = bytes(blob[pos + 4:pos + 6])
-            if vr in _LONG_FORM_VRS:
-                if pos + 12 > end:
-                    break
-                length = struct.unpack_from('<I', blob, pos + 8)[0]
-                value_start = pos + 12
-                long_form = True
-            else:
-                length = struct.unpack_from('<H', blob, pos + 6)[0]
-                value_start = pos + 8
-                long_form = False
-            value_end = value_start + length
-            if length == UNDEFINED_LENGTH or value_end > end:
-                break
-            tag = (group << 16) | element
-            self._file_meta_values[tag] = blob[value_start:value_end]
-            # Spans are relative to the File Meta Information, not the file, so
-            # they stay valid against ``self.file_meta``.
-            self.file_meta_elements.append(CarrierElement(
-                tag=tag, vr=vr, declared_length=length, start=pos - start,
-                value_start=value_start - start, end=value_end - start,
-                long_form=long_form))
-            pos = value_end
-        return pos
+        carrier = cls.__new__(cls)
+        carrier.path = path
+        carrier.raw = blob
+        carrier.preamble = b''
+        carrier.file_meta = b''
+        carrier.dataset = blob
+        carrier._file_meta_values = {}
+        carrier.file_meta_elements = []
+        carrier.sniffed_encoding = False
+        carrier.transfer_syntax = transfer_syntax or IMPLICIT_VR_LITTLE_ENDIAN
+        carrier.implicit_vr = (
+            carrier.transfer_syntax == IMPLICIT_VR_LITTLE_ENDIAN)
+        carrier.little_endian = (
+            carrier.transfer_syntax != EXPLICIT_VR_BIG_ENDIAN)
+        if carrier.transfer_syntax in _OPAQUE_DATASET_SYNTAXES:
+            carrier.elements, carrier.tail_offset = [], 0
+        else:
+            carrier.elements, carrier.tail_offset = scan_dataset(
+                blob, carrier.implicit_vr, carrier.little_endian)
+        return carrier
 
     # -- reading ---------------------------------------------------------
 

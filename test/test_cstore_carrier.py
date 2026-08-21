@@ -27,7 +27,8 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from dicom_corpus import (  # noqa: E402
-    bundled_paths, corpus_paths, image_id, is_nonconformant, is_truncated,
+    bundled_paths, corpus_paths, encoding_paths, image_id, is_nonconformant,
+    is_truncated,
 )
 
 import c_scare.runner as runner  # noqa: E402
@@ -40,6 +41,9 @@ from c_scare.carrier import (  # noqa: E402
 pydicom = pytest.importorskip('pydicom')
 
 CORPUS = corpus_paths()
+#: One image per Data Set encoding. Used wherever the variable under test is
+#: framework logic and the image only has to supply an encoding to exercise it.
+ENCODINGS = encoding_paths()
 TAG_STUDY_INSTANCE_UID = 0x0020000D
 TAG_NUMBER_OF_FRAMES = 0x00280008
 
@@ -129,7 +133,7 @@ def test_carried_attack_keeps_every_untouched_element(path):
             f'({elem.group:04X},{elem.element:04X}) was dropped')
 
 
-@pytest.mark.parametrize('path', CORPUS, ids=image_id)
+@pytest.mark.parametrize('path', ENCODINGS, ids=image_id)
 def test_carried_attack_keeps_the_pixel_volume(path):
     """The image survives the attack that rides it.
 
@@ -146,7 +150,7 @@ def test_carried_attack_keeps_the_pixel_volume(path):
     assert original in _carry(path, result).dataset
 
 
-@pytest.mark.parametrize('path', CORPUS, ids=image_id)
+@pytest.mark.parametrize('path', ENCODINGS, ids=image_id)
 def test_carried_object_reparses_in_the_negotiated_syntax(path):
     """The target can read back what we sent, in the syntax we negotiated."""
     result = attack_catalog.PathTraversalAttacks.sop_instance_uid_traversal(
@@ -162,7 +166,7 @@ def test_carried_object_reparses_in_the_negotiated_syntax(path):
 # The attack is still the attack
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize('path', CORPUS, ids=image_id)
+@pytest.mark.parametrize('path', ENCODINGS, ids=image_id)
 @pytest.mark.parametrize('payload_id', [
     p[0] for p in attack_catalog.PathTraversalAttacks._TRAVERSAL_PAYLOADS])
 def test_every_sop_traversal_payload_reaches_the_wire(path, payload_id):
@@ -185,7 +189,7 @@ def test_every_sop_traversal_payload_reaches_the_wire(path, payload_id):
     assert result.metadata['cstore_file_mutation'] == 'sop_instance_uid'
 
 
-@pytest.mark.parametrize('path', CORPUS, ids=image_id)
+@pytest.mark.parametrize('path', ENCODINGS, ids=image_id)
 @pytest.mark.parametrize('factory,expected', [
     ('study_instance_uid_traversal', 'study_instance_uid'),
     ('patient_name_traversal', 'patient_name'),
@@ -199,7 +203,7 @@ def test_other_traversal_targets_reach_the_wire(path, factory, expected):
     assert result.metadata['cstore_file_mutation'] == expected
 
 
-@pytest.mark.parametrize('path', CORPUS, ids=image_id)
+@pytest.mark.parametrize('path', ENCODINGS, ids=image_id)
 def test_traversal_value_is_mirrored_into_operator_visible_fields(path):
     """The path also lands where a human browsing the archive will see it."""
     result = attack_catalog.PathTraversalAttacks.study_instance_uid_traversal(
@@ -209,11 +213,9 @@ def test_traversal_value_is_mirrored_into_operator_visible_fields(path):
     assert carried.dataset.count(value.encode('latin-1')) >= 2
 
 
-@pytest.mark.parametrize('name', ['CT_small.dcm', 'MR_small_implicit.dcm',
-                                  'MR_small_bigendian.dcm'])
-def test_command_and_dataset_uids_can_be_split(name):
+@pytest.mark.parametrize('path', ENCODINGS, ids=image_id)
+def test_command_and_dataset_uids_can_be_split(path):
     """An attack that deliberately disagrees with itself still does."""
-    path = os.path.join(os.path.dirname(bundled_paths()[0]), name)
     result = attack_catalog.AttackResult(
         name='split', category='storage_abuse', payload=b'x', description='d',
         expected_behavior='e', metadata={
@@ -230,7 +232,7 @@ def test_command_and_dataset_uids_can_be_split(name):
 # Transfer syntax
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize('path', CORPUS, ids=image_id)
+@pytest.mark.parametrize('path', ENCODINGS, ids=image_id)
 def test_negotiated_syntax_matches_the_carriers_own_encoding(path):
     """We negotiate what the bytes are, because we never re-encode them."""
     carrier = Carrier.from_file(path)
@@ -239,7 +241,7 @@ def test_negotiated_syntax_matches_the_carriers_own_encoding(path):
     assert _carry(path, result).transfer_syntax == carrier.transfer_syntax
 
 
-@pytest.mark.parametrize('path', CORPUS, ids=image_id)
+@pytest.mark.parametrize('path', ENCODINGS, ids=image_id)
 def test_an_attacks_declared_syntax_overrides_the_carriers(path):
     """An attack whose mechanism *is* the syntax keeps its syntax.
 
@@ -254,7 +256,7 @@ def test_an_attacks_declared_syntax_overrides_the_carriers(path):
     assert _carry(path, result).transfer_syntax == '1.2.840.10008.1.2'
 
 
-@pytest.mark.parametrize('path', CORPUS, ids=image_id)
+@pytest.mark.parametrize('path', ENCODINGS, ids=image_id)
 def test_store_transfer_syntax_flag_wins_over_everything(path):
     result = attack_catalog.AttackResult(
         name='mismatch', category='logic', payload=b'x', description='d',
@@ -279,16 +281,14 @@ def test_catalog_syntax_declarations_are_all_honoured():
 # Merging attack elements into the carrier
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize('name', ['CT_small.dcm', 'MR_small_implicit.dcm',
-                                  'MR_small_bigendian.dcm', 'JPEG2000.dcm'])
-def test_attack_elements_are_merged_ahead_of_pixel_data(name):
+@pytest.mark.parametrize('path', ENCODINGS, ids=image_id)
+def test_attack_elements_are_merged_ahead_of_pixel_data(path):
     """An attack with no declared placement goes into the object, not behind it.
 
     Appending a second Data Set after (7FE0,0010) makes the tags run backwards.
     A conformant SCP may stop at the end of the object, so the malformation
     never reaches the parser -- and the run reads clean.
     """
-    path = os.path.join(os.path.dirname(bundled_paths()[0]), name)
     result = attack_catalog.AttackResult(
         name='invalid_vr', category='parser',
         payload=(struct.pack('<HH', 0x0010, 0x0010) + b'XX'
@@ -448,16 +448,14 @@ def test_grown_encapsulated_pixel_data_is_still_decodable(name):
 # The catalog as a whole
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize('name', ['CT_small.dcm', 'MR_small_implicit.dcm',
-                                  'MR_small_bigendian.dcm', 'JPEG2000.dcm'])
-def test_every_cstore_attack_renders_on_every_encoding(name):
+@pytest.mark.parametrize('path', ENCODINGS, ids=image_id)
+def test_every_cstore_attack_renders_on_every_encoding(path):
     """No attack in the catalog raises while being placed on a carrier.
 
     A sequence-depth bomb used to raise RecursionError inside the framework, so
     the payload never left the machine and the operator saw a traceback where a
     finding belonged.
     """
-    path = os.path.join(os.path.dirname(bundled_paths()[0]), name)
     for result in _cstore_attacks():
         carried = _carry(path, result)
         assert carried.dataset, result.name
@@ -474,8 +472,8 @@ def _attack_declares(result, tag):
     return any(elem.tag == tag for elem in elements)
 
 
-@pytest.mark.parametrize('name', ['CT_small.dcm', 'MR_small_implicit.dcm'])
-def test_every_cstore_attack_keeps_the_carriers_pixel_data(name):
+@pytest.mark.parametrize('path', ENCODINGS, ids=image_id)
+def test_every_cstore_attack_keeps_the_carriers_pixel_data(path):
     """Only attacks that are *about* the image are allowed to touch it.
 
     An attack that writes its own (7FE0,0010) -- a geometry-versus-data
@@ -483,7 +481,6 @@ def test_every_cstore_attack_keeps_the_carriers_pixel_data(name):
     keeps that mechanism while leaving the rest of the operator's object in
     place. Everything else must find the image where it left it.
     """
-    path = os.path.join(os.path.dirname(bundled_paths()[0]), name)
     carrier = Carrier.from_file(path)
     original = carrier.value_of(TAG_PIXEL_DATA)
     assert original
@@ -578,7 +575,7 @@ def test_part10_rendering_opens_as_a_file(path):
     assert blob[128:132] == b'DICM'
 
 
-@pytest.mark.parametrize('path', CORPUS, ids=image_id)
+@pytest.mark.parametrize('path', ENCODINGS, ids=image_id)
 def test_part10_file_meta_agrees_with_the_data_set(path):
     """(0002,0003) and (0008,0018) name the same instance.
 
@@ -598,7 +595,7 @@ def test_part10_file_meta_agrees_with_the_data_set(path):
             == result.metadata['cstore_file_base_sop_instance_uid'])
 
 
-@pytest.mark.parametrize('path', CORPUS, ids=image_id)
+@pytest.mark.parametrize('path', ENCODINGS, ids=image_id)
 def test_part10_group_length_is_repaired_after_a_file_meta_edit(path):
     """(0002,0000) still says how many bytes the group holds."""
     result = attack_catalog.AttackResult(

@@ -136,3 +136,69 @@ def test_hostile_cget_pushes_malicious_store():
         assert out['num_objects'] == 1
     finally:
         responder.stop()
+
+
+def test_cget_hands_back_the_peers_raw_dataset_bytes():
+    """C-GET keeps the Data Set the peer sent, not just a parse of it.
+
+    ``--verify-retrieval`` asks whether the *archive* altered a payload. It can
+    only answer from the bytes that arrived: a decoded object re-serialised on
+    the way out answers "what would pydicom write?", and pydicom writes
+    conformant DICOM, which is not what a malformed object is. So c_get carries
+    the raw Data Set alongside the decoded one, paired with the transfer syntax
+    its presentation context negotiated.
+
+    Driven with the hostile responder on purpose -- the object it pushes is a
+    path-traversal C-STORE sub-operation, which is exactly the shape a writer
+    would tidy up.
+    """
+    from c_scare import WorkflowResponder, build_query, DICOMSession
+    from c_scare.carrier import split_part10
+    from c_scare.client import render_retrieved
+    from c_scare.scapy_dicom import (
+        PATIENT_ROOT_QR_GET_SOP_CLASS_UID, CT_IMAGE_STORAGE_SOP_CLASS_UID,
+        DEFAULT_TRANSFER_SYNTAX_UID)
+
+    responder = WorkflowResponder(host='127.0.0.1', port=11573,
+                                  ae_title='C_SCARE_SCP', echo_roles=True)
+
+    @responder.on_c_get
+    def _get(resp, conn, ctx_id, cmd, data):
+        resp.serve_cget_hostile(conn, ctx_id, cmd, mode='path-traversal')
+        return None
+
+    responder.start(blocking=False)
+    try:
+        query = build_query(level='study',
+                            match_keys={(0x0020, 0x000D, 'UI'): '1.2.3'})
+        contexts = {
+            PATIENT_ROOT_QR_GET_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID],
+            CT_IMAGE_STORAGE_SOP_CLASS_UID: [DEFAULT_TRANSFER_SYNTAX_UID],
+        }
+        with DICOMSession('127.0.0.1', 11573, 'C_SCARE_SCP', 'C_SCARE',
+                          read_timeout=5) as sock:
+            assert sock.associate(contexts)
+            out = sock.c_get(query,
+                             sop_class_uid=PATIENT_ROOT_QR_GET_SOP_CLASS_UID)
+    finally:
+        responder.stop()
+
+    raw_objects = out['raw_objects']
+    assert len(raw_objects) == out['num_objects'] == 1
+    raw, transfer_syntax = raw_objects[0]
+    assert raw, 'the Data Set the peer sent was not kept'
+    assert transfer_syntax == DEFAULT_TRANSFER_SYNTAX_UID
+
+    # The traversal value the responder put in the SOP Instance UID is what a
+    # comparison has to see, and it has to see it as bytes: pydicom warns on
+    # this value and a writer would coerce it. (Note the responder sends the
+    # catalog's explicit-VR bytes on an implicit-VR context, so this object
+    # does not parse cleanly either -- all the more reason not to route it
+    # through a parser on the way to a comparison.)
+    assert b'../../../../../../tmp/c-scare-traversal' in raw
+
+    # And the render step adds a File Meta group without touching the Data Set.
+    rendered = render_retrieved(raw, transfer_syntax)
+    _preamble, file_meta, dataset, _elements = split_part10(rendered)
+    assert dataset == raw
+    assert file_meta, 'no File Meta Information was built for the file'

@@ -157,19 +157,6 @@ def test_pixel_data_survives_a_splice(path):
     assert original in edit.to_bytes()
 
 
-@pytest.mark.parametrize('path', CORPUS, ids=image_id)
-def test_spliced_value_reaches_the_wire_verbatim(path):
-    """A payload no VR permits is still the payload that gets sent.
-
-    pydicom warns on an invalid UI and coerces a backslash into a multi-value.
-    The carrier writes bytes.
-    """
-    carrier = Carrier.from_file(path)
-    edit = carrier.edit()
-    edit.set_text(TAG_SOP_INSTANCE_UID, 'UI', TRAVERSAL, 'sop')
-    assert TRAVERSAL.encode('ascii') in edit.to_bytes()
-
-
 @pytest.mark.parametrize('payload', [
     '../../../../../../etc/passwd',
     '../../../../../../tmp/attacker-controlled.attacker\x00.DCM',
@@ -181,6 +168,9 @@ def test_spliced_value_reaches_the_wire_verbatim(path):
 ], ids=['posix', 'nul', 'windows', 'unc', 'drive', 'overlong', 'multivalue'])
 def test_every_traversal_shape_survives_the_splice(payload):
     """No traversal payload is normalised, truncated or split on its way out.
+
+    This is the value-fidelity statement for the whole module; it varies the
+    payload rather than the image because that is the axis the encoder sees.
 
     The over-64-character value, the embedded NUL and the backslash are the
     three a validating writer changes: it warns and truncates, it strips, or it

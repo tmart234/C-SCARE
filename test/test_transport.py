@@ -15,6 +15,7 @@ adding a transport does not touch the catalog.
 
 import io
 import re
+import struct
 import threading
 import warnings
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,6 +26,9 @@ pytest.importorskip("pydicom")
 import pydicom  # noqa: E402
 
 from c_scare import dicomweb, transport  # noqa: E402
+
+#: The transfer syntax the catalog encodes its Part-10 payloads in.
+EXPLICIT_VR_LE = '1.2.840.10008.1.2.1'
 
 warnings.filterwarnings("ignore")
 
@@ -283,3 +287,163 @@ class TestMonitorReadsAcceptanceNotADimseStatus:
         monitor.set_response(b"\x00\x00", error="cstore_status",
                              finding_on=ProtocolMonitor.FINDING_ON_STORE)
         assert monitor.post_test().finding_type == "storage:payload_accepted"
+
+
+class TestDimseRetrievalFidelity:
+    """What ``--verify-retrieval`` reports about a DIMSE archive.
+
+    ``retrieve_instance`` exists to answer one question: did the archive alter
+    the payload? The framework can only answer it by leaving the payload alone
+    on the way past. It used to parse the returned Data Set with pydicom and
+    write it back with pydicom, which drops every retired group length -- so a
+    payload parked in one came back as "the receiver removed the embedded
+    content", a finding against a target that had done nothing.
+
+    These tests run the render step with no archive in the loop: any verdict
+    below the best one available is the framework accusing itself.
+    """
+
+    @staticmethod
+    def _polyglot_payloads():
+        """Catalog payloads with a private element the pipeline can track."""
+        from c_scare import attacks, polyglot
+        from c_scare.carrier import split_part10
+
+        for result in attacks.CVEAttacks.all():
+            if not result.payload:
+                continue
+            _pre, _meta, dataset, _els = split_part10(result.payload)
+            if not dataset or not polyglot._private_values(result.payload):
+                continue
+            yield result, dataset
+
+    def test_a_passthrough_archive_is_never_reported_as_sanitising(self):
+        from c_scare import polyglot
+        from c_scare.client import render_retrieved
+
+        checked = 0
+        for result, dataset in self._polyglot_payloads():
+            back = render_retrieved(dataset, EXPLICIT_VR_LE)
+            verdict = polyglot.compare_after_pipeline(result.payload, back)
+            assert verdict.outcome != polyglot.SURVIVED_STRIPPED, result.name
+            assert verdict.outcome != polyglot.SURVIVED_ALTERED, result.name
+            checked += 1
+        assert checked > 10, 'the polyglot corpus went missing'
+
+    def test_a_payload_in_a_group_length_element_is_not_reported_stripped(self):
+        """The case that used to fail, named.
+
+        PS3.5 retires ``(gggg,0000)`` and pydicom's writer skips it. A payload
+        that lives in one is invisible to a writer and perfectly visible to a
+        parser, which is exactly why the catalog puts one there.
+        """
+        from c_scare import polyglot
+        from c_scare.client import render_retrieved
+
+        result, dataset = next(
+            (r, d) for r, d in self._polyglot_payloads()
+            if 'group_length_tag' in r.name)
+        back = render_retrieved(dataset, EXPLICIT_VR_LE)
+        verdict = polyglot.compare_after_pipeline(result.payload, back)
+        assert verdict.outcome == polyglot.SURVIVED_PAYLOAD, verdict.detail
+        assert verdict.carrier_bytes_returned == verdict.carrier_bytes_sent
+
+    def test_the_render_returns_the_peers_data_set_byte_for_byte(self):
+        from c_scare.carrier import split_part10
+        from c_scare.client import render_retrieved
+
+        for _result, dataset in self._polyglot_payloads():
+            back = render_retrieved(dataset, EXPLICIT_VR_LE)
+            _pre, _meta, returned, _els = split_part10(back)
+            assert returned == dataset
+
+    @pytest.mark.parametrize('transfer_syntax', [
+        '1.2.840.10008.1.2', '1.2.840.10008.1.2.1', '1.2.840.10008.1.2.2',
+    ], ids=['implicit_le', 'explicit_le', 'explicit_be'])
+    def test_the_render_honours_the_negotiated_syntax(self, transfer_syntax):
+        """The presentation context already said how the Data Set is encoded.
+
+        Guessing here would misread a big-endian object as little-endian and
+        turn the peer's bytes into nonsense before anything looked at them.
+        """
+        import pydicom
+
+        from c_scare.client import render_retrieved
+        from c_scare.element import Dataset, Element
+
+        implicit = transfer_syntax == '1.2.840.10008.1.2'
+        little = transfer_syntax != '1.2.840.10008.1.2.2'
+        dataset = (Dataset()
+                   / Element(0x0008, 0x0016, 'UI', '1.2.840.10008.5.1.4.1.1.7')
+                   / Element(0x0008, 0x0018, 'UI', '1.2.3.4.5')
+                   / Element(0x0010, 0x0010, 'PN', 'Real^Patient')
+                   ).encode(implicit_vr=implicit, little_endian=little)
+
+        back = render_retrieved(dataset, transfer_syntax)
+        parsed = pydicom.dcmread(io.BytesIO(back), force=True)
+        assert str(parsed.file_meta.TransferSyntaxUID) == transfer_syntax
+        assert str(parsed.SOPInstanceUID) == '1.2.3.4.5'
+        assert str(parsed.PatientName) == 'Real^Patient'
+
+    def test_an_archive_that_really_strips_still_reads_as_stripped(self):
+        """The fix must not have made every verdict optimistic."""
+        from c_scare import polyglot
+        from c_scare.carrier import Carrier
+        from c_scare.client import render_retrieved
+
+        result, dataset = next(iter(self._polyglot_payloads()))
+        carrier = Carrier.from_dataset(dataset, EXPLICIT_VR_LE)
+        edit = carrier.edit()
+        for element in carrier.elements:
+            if element.group % 2 == 1 and element.element != 0x0010:
+                edit.delete(element.tag, 'sanitise')
+        sanitised = render_retrieved(edit.to_bytes(), EXPLICIT_VR_LE)
+
+        verdict = polyglot.compare_after_pipeline(result.payload, sanitised)
+        assert verdict.outcome == polyglot.SURVIVED_STRIPPED
+
+    def test_an_archive_that_rewrites_the_payload_reads_as_altered(self):
+        from c_scare import polyglot
+        from c_scare.carrier import Carrier
+        from c_scare.client import render_retrieved
+
+        result, dataset = next(iter(self._polyglot_payloads()))
+        carrier = Carrier.from_dataset(dataset, EXPLICIT_VR_LE)
+        edit = carrier.edit()
+        for element in carrier.elements:
+            if element.group % 2 == 1 and element.element != 0x0010:
+                value = carrier.value_of(element.tag) or b''
+                edit.set_value(element.tag, 'OB', b'\x00' * len(value),
+                               'rewrite')
+        rewritten = render_retrieved(edit.to_bytes(), EXPLICIT_VR_LE)
+
+        verdict = polyglot.compare_after_pipeline(result.payload, rewritten)
+        assert verdict.outcome == polyglot.SURVIVED_ALTERED
+
+    def test_an_unconvertible_element_costs_that_element_not_the_verdict(self):
+        """A retrieved object may be worse-formed than the one we sent.
+
+        ``for element in dataset`` converts each raw element on the way past,
+        and one value pydicom cannot convert used to raise straight out of the
+        monitor -- no verdict at all for the payload most likely to produce one.
+        """
+        from c_scare import polyglot
+
+        payload = (b'\x00' * 128 + b'DICM'
+                   + _explicit(0x0002, 0x0010, b'UI',
+                               b'1.2.840.10008.1.2.1\x00')
+                   + _explicit(0x0009, 0x0010, b'LO', b'C-SCARE\x00')
+                   + _explicit(0x0009, 0x1001, b'OB', b'MZ\x90\x00')
+                   # A Sequence Delimitation Item with nothing to delimit:
+                   # structurally present, semantically unconvertible.
+                   + struct.pack('<HHI', 0xFFFE, 0xE0DD, 0))
+        values = polyglot._private_values(payload)
+        assert values.get(0x00091001) == b'MZ\x90\x00'
+
+
+def _explicit(group, element, vr, value):
+    """One explicit-VR little-endian element, long form for OB."""
+    head = struct.pack('<HH', group, element) + vr
+    if vr in (b'OB', b'OW', b'SQ', b'UN', b'UT'):
+        return head + b'\x00\x00' + struct.pack('<I', len(value)) + value
+    return head + struct.pack('<H', len(value)) + value

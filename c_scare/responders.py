@@ -301,17 +301,17 @@ def _encode_ds(ds, implicit_vr=True):
         return bytes(ds)
     if hasattr(ds, "encode"):  # c_scare Dataset
         return ds.encode(implicit_vr=implicit_vr, little_endian=True)
-    # pydicom Dataset
-    try:
-        from pydicom.filebase import DicomBytesIO
-        from pydicom.filewriter import write_dataset
-        buf = DicomBytesIO()
-        buf.is_implicit_VR = implicit_vr
-        buf.is_little_endian = True
-        write_dataset(buf, ds)
-        return buf.getvalue()
-    except Exception:
-        return b""
+    # pydicom Dataset. Unguarded on purpose: a responder that answers with an
+    # empty Data Set because its identifier would not encode is a rogue server
+    # that quietly stopped testing the client. Build malformed responses as a
+    # c_scare Dataset (encoded above, without validation) or as raw bytes.
+    from pydicom.filebase import DicomBytesIO
+    from pydicom.filewriter import write_dataset
+    buf = DicomBytesIO()
+    buf.is_implicit_VR = implicit_vr
+    buf.is_little_endian = True
+    write_dataset(buf, ds)
+    return buf.getvalue()
 
 
 def build_cfind_rsp(ctx_id, message_id, status, identifier=None,

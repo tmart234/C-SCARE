@@ -1226,10 +1226,20 @@ def _private_values(data: bytes) -> Dict[int, bytes]:
     except Exception:
         return {}
     values: Dict[int, bytes] = {}
-    for element in dataset:
-        if element.tag.group % 2 == 0 or element.tag.element == 0x0010:
+    # Iterate the raw keys rather than the Dataset: `for element in dataset`
+    # converts each raw element on the way past, and a value pydicom cannot
+    # convert raises out of the loop. These are deliberately malformed objects
+    # and the retrieved copy may be worse, so one unconvertible element must
+    # cost that element, not the whole verdict.
+    try:
+        tags = sorted(dataset.keys())
+    except Exception:
+        return {}
+    for tag in tags:
+        if tag.group % 2 == 0 or tag.element == 0x0010:
             continue          # even groups are public; xx10 is the creator
         try:
+            element = dataset[tag]
             raw = element.value
         except Exception:
             continue
