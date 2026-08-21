@@ -39,15 +39,18 @@ flowchart LR
     subgraph CRAFT [Crafting and corruption]
         PYDICOM[pydicom<br/>parse real objects]
         CORRUPTOR[corruptor.py<br/>re-emit as invalid]
+        CARRIER[carrier.py<br/>splice into a real image]
         ELEMENT[element.py<br/>dataset + shared encoder]
         PIXEL[pixel.py<br/>encapsulated pixel data]
         FILE[file.py<br/>Part 10 file]
         SCAPY[scapy_dicom.py<br/>malformed PDUs/DIMSE]
         PYDICOM --> CORRUPTOR
+        ELEMENT --> CARRIER
         ELEMENT --> CORRUPTOR & PIXEL & FILE
     end
 
     REALDCM -->|pydicom bridge| PYDICOM
+    REALDCM -->|--cstore-file: bytes, not a parse| CARRIER
 
     CATALOG[attacks.py<br/>static catalog + seed generators]
     CRAFT --> CATALOG

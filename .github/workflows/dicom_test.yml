@@ -28,6 +28,17 @@ jobs:
         run: |
           pytest test/ -v -k "not integration"
 
+      # The carrier tests run against the real DICOM objects pydicom bundles,
+      # which covers every transfer syntax that matters and needs no network.
+      # This step adds the larger images pydicom hosts but does not ship —
+      # multi-frame colour JPEG, enhanced CT, an ultrasound with a big private
+      # block. It needs GitHub raw over HTTPS, so it must never fail the build.
+      - name: Carrier tests against downloaded DICOM images
+        run: |
+          CSCARE_TEST_DOWNLOAD=1 pytest test/test_carrier.py \
+            test/test_cstore_carrier.py -q
+        continue-on-error: true
+
   # Integration tests against real DICOM servers
   integration-tests:
     runs-on: ubuntu-latest

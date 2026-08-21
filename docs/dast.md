@@ -207,10 +207,24 @@ c-scare --ip 192.0.2.10 --port 104 \
   -v
 ```
 
-C-SCARE reads the Part-10 file with pydicom, strips the file wrapper for network
-C-STORE delivery, and takes the association baseline (SOP Class UID, Transfer
-Syntax UID) from the file. Each dataset-shaped attack is then overlaid on its
-own copy of that object, driven entirely by the attack's declared metadata:
+C-SCARE reads the file as **bytes**, not as a parse. The Part-10 wrapper is
+split off for network C-STORE delivery, the association baseline (SOP Class
+UID, Transfer Syntax UID) is taken from the file, and each dataset-shaped
+attack is then *spliced* into its own copy of the Data Set. Elements the attack
+does not name come off the wire exactly as they went in.
+
+That distinction is load-bearing. Reading with pydicom and writing with pydicom
+looks equivalent and is not: pydicom is a conformant writer, and conformance
+here is loss. It skips every retired `(gggg,0000)` Group Length element, emits
+`sorted(dataset.keys())` rather than the order the object was written in,
+re-reads a `UN` element holding an implicit-VR sequence as `SQ` and re-emits it
+with different bytes, repairs truncated elements, resolves ambiguous VRs and
+normalises padding. Every one of those is a difference between the object the
+operator watched their target accept and the object the target is now asked to
+parse — and the difference shows up as a rejection that reads like a clean
+result.
+
+Placement is driven entirely by the attack's declared metadata:
 
 | Attack declares | Overlay on the carrier |
 |---|---|
@@ -218,13 +232,84 @@ own copy of that object, driven entirely by the attack's declared metadata:
 | `command_*_uid` / `dataset_*_uid` | the named half of the C-STORE is rewritten |
 | `cstore_field_overrides` | the listed elements are rewritten |
 | `coverage_scope: identity-validation` | Patient Name/ID are blanked |
-| `coverage_scope: storage-quota-disk-pressure` | Pixel Data is replaced (see `CSCARE_CSTORE_RSS_PRESSURE_BYTES`) |
-| none of the above | the attack's own dataset is appended to the carrier |
+| `coverage_scope: storage-quota-disk-pressure` | the image is *grown*, not replaced (see `CSCARE_CSTORE_RSS_PRESSURE_BYTES`) |
+| none of the above | the attack's own elements are merged into the carrier in tag order |
 
-Every delivered copy gets a fresh Study/Series/SOP Instance UID and a
-`C-SCARE^<attack>` Patient Name, so one attack's object cannot collide with or
-overwrite another's, and a stored object can be traced back to the test that
-sent it. Set `CSCARE_DAST_RUN_ID` to make those UIDs deterministic per run.
+Four properties the carrier path holds, each of which the run reports:
+
+**The payload arrives as written.** A traversal path in a UID, an over-64-character
+value, a backslash, an embedded NUL: no validation, no coercion to a
+multi-value, no truncation. `cstore_file_mutation` names which overlay was
+applied, and `cstore_file_refused` names any that could not be — an overlay
+that silently does nothing would report an attack as delivered that the target
+never saw.
+
+**Attack elements go where a parser will read them.** They are merged into the
+Data Set in tag order rather than appended behind Pixel Data, because an
+appended Data Set makes the tags run backwards and a conformant SCP may stop
+at the end of the object — so the parser under test never reaches the
+malformation. `cstore_file_merged_elements` counts what was placed;
+`cstore_file_appended_bytes` counts what could not be (a payload whose
+malformation *is* the element stream — a truncated header, a delimiter with no
+sequence — has no per-element position to occupy, and rides at the end).
+
+**Merged elements are framed for the carrier's own encoding.** The catalog
+writes explicit VR little endian; a carrier may be implicit VR, or big endian.
+Only the header is re-framed — the declared length and the value bytes go
+through untouched, so a length that lies still lies. Dropped in verbatim
+instead, `(0010,0010) XX 0x000C` reads under implicit VR as a four-byte length
+of 0x000C5858, and a VR test arrives as an accidental truncation error.
+
+**The transfer syntax is the carrier's, unless the attack says otherwise.**
+`--store-transfer-syntax` wins, then the attack's own declared
+`transfer_syntax`, then the syntax the carrier is encoded in. The middle term
+matters for the handful of attacks whose entire mechanism is a mismatch between
+the negotiated syntax and the bytes on the wire.
+
+The image itself is never collateral damage. Disk-pressure attacks grow the
+volume the way a longer acquisition would — native Pixel Data gains whole
+repeated frames with Number of Frames raised to match, so
+`rows x columns x samples x bytes x frames` stays exactly consistent, and
+encapsulated Pixel Data gains repeated fragments that each still decode.
+Overwriting Pixel Data with filler instead leaves the geometry describing an
+image that is no longer there, and the SCP answers with a validator rather than
+a parser.
+
+A carrier with no File Meta Information is read too: its encoding is recovered
+by trying each candidate and keeping the one that reads furthest, and a minimal
+group 0002 is synthesised for the Part-10 rendering that `--dry-run` and
+STOW-RS need. Group 0002 is outside the Data Set and never crosses a C-STORE
+association, so nothing the target parses changes.
+
+Bytes that do not scan as Data Elements are kept as an opaque tail and
+delivered unchanged — a carrier that is already malformed stays exactly as
+malformed as the operator made it — and the run says how many
+(`cstore_file_opaque_tail_bytes`), because those are also bytes no attack can
+be spliced into.
+
+#### Checking the carrier against real images
+
+The carrier path is tested against real scanner-derived objects rather than a
+synthetic stub, because every one of the defects it was rewritten to fix showed
+up only on a real file: group lengths a scanner emitted, an implicit-VR object,
+a big-endian one, a `UN` element holding a sequence, encapsulated Pixel Data
+split across fragments, an acquisition truncated on the way to disk.
+
+The default corpus is the set of objects pydicom ships inside the package, so
+`pytest test/test_carrier.py test/test_cstore_carrier.py` runs offline and
+deterministically and covers every transfer syntax that matters. pydicom also
+indexes a larger set hosted in `pydicom/pydicom-data` — multi-frame colour
+JPEG, enhanced CT, an ultrasound with a large private block. Those need the
+network, so they are opt-in:
+
+```bash
+CSCARE_TEST_DOWNLOAD=1 pytest test/test_carrier.py test/test_cstore_carrier.py
+```
+
+Point it at your own objects by adding them to `BUNDLED_IMAGES` in
+`test/dicom_corpus.py` — the corpus filters out anything the installed pydicom
+does not have, so an entry that is not present shrinks the corpus rather than
+breaking the suite.
 
 Raw PDU and state-machine attacks stay byte-level protocol tests; they have no
 meaningful representation as a C-STORE object and are delivered unchanged.

@@ -31,10 +31,9 @@ import argparse
 import datetime as dt
 import time
 import struct
-import copy
 import hashlib
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 import tempfile
 
 # Import attack modules
@@ -49,6 +48,8 @@ try:
         part10_file, standard_file_meta,
     )
     from . import client, deliver, transport
+    from . import carrier as carrier_mod
+    from .carrier import Carrier, CarrierError, merge_dataset
     from .monitor import (
         BaseMonitor, MonitorReport, SanitizerMonitor,
         ProtocolMonitor, ProcessMonitor, PipelineMonitor,
@@ -67,6 +68,8 @@ except ImportError:
     import client
     import deliver
     import transport
+    import carrier as carrier_mod
+    from carrier import Carrier, CarrierError, merge_dataset
     from monitor import (
         BaseMonitor, MonitorReport, SanitizerMonitor,
         ProtocolMonitor, ProcessMonitor, PipelineMonitor,
@@ -141,6 +144,18 @@ _LONG_EXPLICIT_VR = frozenset({
 # without scapy; delivery itself (send_cstore) requires scapy at call time.
 _DEFAULT_STORE_SOP = "1.2.840.10008.5.1.4.1.1.7"  # Secondary Capture Image Storage
 _DEFAULT_STORE_TRANSFER_SYNTAX = "1.2.840.10008.1.2"  # Implicit VR Little Endian
+
+# How the catalog encodes an attack's own Data Set unless the attack says
+# otherwise in `encoded_transfer_syntax`. Needed to re-frame those elements
+# into a carrier's syntax without disturbing their values.
+_DEFAULT_ENCODED_TRANSFER_SYNTAX = "1.2.840.10008.1.2.1"  # Explicit VR LE
+
+# Sequence Delimitation Item (FFFE,E0DD) with a zero length, both byte orders.
+# Encapsulated Pixel Data ends with one; growing the fragment run means
+# splitting it off, repeating the fragments, and putting it back.
+_SEQUENCE_DELIMITER_LE = b'\xfe\xff\xdd\xe0\x00\x00\x00\x00'
+_SEQUENCE_DELIMITER_BE = b'\xff\xfe\xe0\xdd\x00\x00\x00\x00'
+
 _ASSOCIATE_RQ_PDU_TYPE = 0x01
 _PDATA_PDU_TYPE = 0x04
 _ABORT_PDU_TYPE = 0x07
@@ -259,75 +274,39 @@ def _sequence_expectations(steps: List[bytes]) -> List[bool]:
     return expectations
 
 
-def _uid_str(value) -> Optional[str]:
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
+class CarriedPayload(NamedTuple):
+    """One attack rendered onto the operator's carrier object.
+
+    ``dataset`` is what C-STORE puts on the wire; ``part10`` is the same object
+    as a complete file, for ``--dry-run`` and for any transport that carries
+    whole instances. They are two renderings of one edit, never two edits.
+    """
+
+    dataset: bytes
+    sop_class_uid: str
+    sop_instance_uid: str
+    transfer_syntax: str
+    part10: bytes
 
 
-def _encode_pydicom_dataset(dataset, transfer_syntax: str) -> bytes:
-    try:
-        from pydicom.filebase import DicomBytesIO
-        from pydicom.filewriter import write_dataset
-        from pydicom.uid import UID
-    except ImportError as exc:
-        raise RuntimeError("--cstore-file requires pydicom") from exc
+def _get_cstore_file_context(args) -> Optional[Carrier]:
+    """Load ``--cstore-file`` as a byte-faithful carrier, cached on ``args``.
 
-    ts_uid = UID(transfer_syntax)
-    dataset.is_implicit_VR = bool(ts_uid.is_implicit_VR)
-    dataset.is_little_endian = bool(ts_uid.is_little_endian)
-    buffer = DicomBytesIO()
-    buffer.is_implicit_VR = dataset.is_implicit_VR
-    buffer.is_little_endian = dataset.is_little_endian
-    write_dataset(buffer, dataset)
-    return buffer.getvalue()
-
-
-def _get_cstore_file_context(args) -> Optional[Dict[str, object]]:
+    The carrier is read once and never mutated: every attack takes an edit
+    against the same immutable bytes, so no attack can leak state into the
+    next one and the object the operator validated is the object each test
+    starts from.
+    """
     path = getattr(args, 'cstore_file', None)
     if not path:
         return None
     path = os.path.abspath(os.fspath(path))
     cached = getattr(args, '_cstore_file_context', None)
-    if cached and cached.get('path') == path:
+    if cached is not None and cached.path == path:
         return cached
-
-    try:
-        import pydicom
-    except ImportError as exc:
-        raise RuntimeError("--cstore-file requires pydicom") from exc
-
-    dataset = pydicom.dcmread(path)
-    file_meta = getattr(dataset, 'file_meta', None)
-    transfer_syntax = _uid_str(getattr(file_meta, 'TransferSyntaxUID', None))
-    if transfer_syntax is None:
-        transfer_syntax = _DEFAULT_STORE_TRANSFER_SYNTAX
-
-    sop_class = (_uid_str(getattr(dataset, 'SOPClassUID', None))
-                 or _uid_str(getattr(file_meta, 'MediaStorageSOPClassUID', None))
-                 or getattr(args, 'store_sop', None)
-                 or _DEFAULT_STORE_SOP)
-    sop_instance = (_uid_str(getattr(dataset, 'SOPInstanceUID', None))
-                    or _uid_str(getattr(file_meta, 'MediaStorageSOPInstanceUID', None))
-                    or f"1.2.826.0.1.3680043.10.543.{int(time.time())}.4")
-
-    context = {
-        'path': path,
-        'dataset': dataset,
-        'transfer_syntax': transfer_syntax,
-        'sop_class_uid': sop_class,
-        'sop_instance_uid': sop_instance,
-    }
-    args._cstore_file_context = context
-    return context
-
-
-def _set_dataset_attr(dataset, keyword: str, value: str) -> None:
-    try:
-        setattr(dataset, keyword, value)
-    except Exception:
-        pass
+    carrier = Carrier.from_file(path)
+    args._cstore_file_context = carrier
+    return carrier
 
 
 def _unique_uid(suffix: int) -> str:
@@ -346,25 +325,80 @@ def _series_uid_for_result(result: AttackResult, suffix: int) -> str:
     return f"1.2.826.0.1.3680043.10.543.{_uid_hash(run_id)}.{_uid_hash(result.name)}.{suffix}"
 
 
-def _slice_uid_for_result(result: AttackResult, context: Dict[str, object], suffix: int) -> str:
+def _slice_uid_for_result(result: AttackResult, carrier: Carrier,
+                          suffix: int) -> str:
     run_id = os.environ.get('CSCARE_DAST_RUN_ID')
     if not run_id:
         return _unique_uid(suffix)
-    source_id = str(context.get('sop_instance_uid') or context.get('path') or time.time_ns())
+    source_id = str(carrier.sop_instance_uid or carrier.path or time.time_ns())
     return (
         f"1.2.826.0.1.3680043.10.543.{_uid_hash(run_id)}."
         f"{_uid_hash(result.name)}.{_uid_hash(source_id)}.{suffix}"
     )
 
 
-def _apply_field_overrides(dataset, overrides: Dict[str, str]) -> None:
+# Tags the overlay writes by name, with the VR to use when the carrier does
+# not already carry the element. When it does, the carrier's own VR wins —
+# an object that stored Patient ID as something unusual keeps it.
+_TAG_SOP_CLASS_UID = 0x00080016
+_TAG_SOP_INSTANCE_UID = 0x00080018
+_TAG_STUDY_INSTANCE_UID = 0x0020000D
+_TAG_SERIES_INSTANCE_UID = 0x0020000E
+_TAG_PATIENT_NAME = 0x00100010
+_TAG_PATIENT_ID = 0x00100020
+_TAG_STUDY_DESCRIPTION = 0x00081030
+_TAG_SERIES_DESCRIPTION = 0x0008103E
+_TAG_PATIENT_COMMENTS = 0x00104000
+_TAG_PIXEL_DATA = 0x7FE00010
+_TAG_NUMBER_OF_FRAMES = 0x00280008
+
+_KEYWORD_TAGS = {
+    'SOPClassUID': (_TAG_SOP_CLASS_UID, 'UI'),
+    'SOPInstanceUID': (_TAG_SOP_INSTANCE_UID, 'UI'),
+    'StudyInstanceUID': (_TAG_STUDY_INSTANCE_UID, 'UI'),
+    'SeriesInstanceUID': (_TAG_SERIES_INSTANCE_UID, 'UI'),
+    'PatientName': (_TAG_PATIENT_NAME, 'PN'),
+    'PatientID': (_TAG_PATIENT_ID, 'LO'),
+    'StudyDescription': (_TAG_STUDY_DESCRIPTION, 'LO'),
+    'SeriesDescription': (_TAG_SERIES_DESCRIPTION, 'LO'),
+    'PatientComments': (_TAG_PATIENT_COMMENTS, 'LT'),
+    'AccessionNumber': (0x00080050, 'SH'),
+    'StudyID': (0x00200010, 'SH'),
+    'Modality': (0x00080060, 'CS'),
+}
+
+
+def _edit_set(edit, keyword: str, value: str, label: Optional[str] = None) -> bool:
+    """Write one named element onto a carrier edit.
+
+    Returns whether the write happened. A keyword this table does not know is
+    refused out loud rather than dropped, because an overlay that silently
+    does nothing reports an attack as delivered that the target never saw.
+    """
+    entry = _KEYWORD_TAGS.get(keyword)
+    if entry is None:
+        edit.refuse(label or keyword, f'no tag mapping for {keyword}')
+        return False
+    tag, vr = entry
+    edit.set_text(tag, vr, value, label or keyword)
+    return True
+
+
+def _apply_field_overrides(edit, overrides: Dict[str, str]) -> None:
     for keyword, value in overrides.items():
-        _set_dataset_attr(dataset, keyword, value)
+        _edit_set(edit, keyword, value, 'cstore_field_overrides')
 
 
-def _stamp_cstore_file_identity(dataset, result: AttackResult,
-                                context: Dict[str, object]) -> str:
-    sop_instance = _slice_uid_for_result(result, context, 1)
+def _stamp_cstore_file_identity(edit, result: AttackResult,
+                                carrier: Carrier) -> str:
+    """Give this delivery its own identity so attacks cannot collide.
+
+    Every copy of the carrier gets a fresh Study/Series/SOP Instance UID and a
+    per-attack Patient identity, so one attack's object cannot overwrite
+    another's on the target and the operator can tell from the archive which
+    test produced which stored instance.
+    """
+    sop_instance = _slice_uid_for_result(result, carrier, 1)
     study_instance = _series_uid_for_result(result, 2)
     series_instance = _series_uid_for_result(result, 3)
     run_id = os.environ.get('CSCARE_DAST_RUN_ID')
@@ -372,11 +406,15 @@ def _stamp_cstore_file_identity(dataset, result: AttackResult,
     patient_id = f"CSCARE-{patient_suffix:x}"
     patient_name = f"C-SCARE^{result.name[:48]}"
 
-    _set_dataset_attr(dataset, 'SOPInstanceUID', sop_instance)
-    _set_dataset_attr(dataset, 'StudyInstanceUID', study_instance)
-    _set_dataset_attr(dataset, 'SeriesInstanceUID', series_instance)
-    _set_dataset_attr(dataset, 'PatientName', patient_name)
-    _set_dataset_attr(dataset, 'PatientID', patient_id)
+    _edit_set(edit, 'SOPInstanceUID', sop_instance, 'identity')
+    # Keep the Part-10 rendering self-consistent: (0002,0003) names the same
+    # instance as (0008,0018). Nothing of group 0002 crosses a C-STORE
+    # association, so this is purely for the file an operator inspects.
+    edit.set_file_meta(0x00020003, 'UI', sop_instance, 'identity')
+    _edit_set(edit, 'StudyInstanceUID', study_instance, 'identity')
+    _edit_set(edit, 'SeriesInstanceUID', series_instance, 'identity')
+    _edit_set(edit, 'PatientName', patient_name, 'identity')
+    _edit_set(edit, 'PatientID', patient_id, 'identity')
 
     result.metadata['cstore_file_base_sop_instance_uid'] = sop_instance
     result.metadata['cstore_file_base_study_instance_uid'] = study_instance
@@ -393,12 +431,11 @@ def _path_display_marker(value: str) -> str:
     return marker[:64] or 'C-SCARE-PATH'
 
 
-def _set_path_display_markers(dataset, value: str) -> None:
+def _set_path_display_markers(edit, value: str) -> None:
     marker = _path_display_marker(value)
-    _set_dataset_attr(dataset, 'PatientID', marker)
-    _set_dataset_attr(dataset, 'StudyDescription', marker)
-    _set_dataset_attr(dataset, 'SeriesDescription', marker)
-    _set_dataset_attr(dataset, 'PatientComments', marker)
+    for keyword in ('PatientID', 'StudyDescription', 'SeriesDescription',
+                    'PatientComments'):
+        _edit_set(edit, keyword, marker, 'path_display_marker')
 
 
 def _attack_dataset_payload(result: AttackResult) -> bytes:
@@ -406,10 +443,26 @@ def _attack_dataset_payload(result: AttackResult) -> bytes:
     return payload
 
 
-# DICOM element name (as attacks write it in `target_field`) -> pydicom
-# keyword, and the metadata key an attack uses to carry that element's value.
-# An attack names the element it corrupts; this table says where to put it on
-# the carrier object. Nothing here knows individual attack names.
+def _attack_dataset_encoding(result: AttackResult) -> Tuple[bool, bool]:
+    """How the attack encoded its own Data Set: ``(implicit_vr, little_endian)``.
+
+    The catalog writes explicit VR little endian unless an attack says
+    otherwise, and an attack that is *about* an encoding says so in
+    ``encoded_transfer_syntax``. Getting this right is what lets the attack's
+    elements be re-framed into the carrier's syntax without touching their
+    values.
+    """
+    encoded = (result.metadata.get('encoded_transfer_syntax')
+               or _DEFAULT_ENCODED_TRANSFER_SYNTAX)
+    return (encoded == carrier_mod.IMPLICIT_VR_LITTLE_ENDIAN,
+            encoded != carrier_mod.EXPLICIT_VR_BIG_ENDIAN)
+
+
+# DICOM element name (as attacks write it in `target_field`) -> the keyword
+# the overlay writes, and the metadata key an attack uses to carry that
+# element's value. An attack names the element it corrupts; this table says
+# where to put it on the carrier object. Nothing here knows individual attack
+# names.
 _CSTORE_TARGET_FIELDS = {
     '(0008,0018) SOP Instance UID': ('SOPInstanceUID', 'sop_instance_uid'),
     '(0020,000D) Study Instance UID': ('StudyInstanceUID', 'study_instance_uid'),
@@ -427,16 +480,102 @@ _SCOPE_IDENTITY_VALIDATION = 'identity-validation'
 _SCOPE_DISK_PRESSURE = 'storage-quota-disk-pressure'
 
 
-def _cstore_file_overlay(dataset, result: AttackResult,
-                         command_sop_class: str,
-                         command_sop_instance: str) -> Tuple[str, str, bytes]:
-    """Overlay one attack onto a copy of the carrier object's data set.
+def _grow_pixel_data(edit, carrier: Carrier, result: AttackResult,
+                     size: int) -> None:
+    """Make the carrier's image bigger without making it stop being an image.
 
-    Returns the (possibly rewritten) command-set SOP Class/Instance UIDs and
-    any extra data set bytes to append after the carrier. Placement is driven
-    entirely by ``result.metadata``, so adding an attack never requires editing
-    this function: an attack that declares nothing recognizable here has its
-    own data set appended to the carrier instead.
+    Disk-pressure attacks need bulk, and the obvious way to get it — assign a
+    few hundred kilobytes to Pixel Data — throws the operator's volume away and
+    leaves Rows, Columns, Bits Allocated and Number of Frames describing an
+    image that is no longer there. An SCP that checks pixel length against
+    geometry then rejects the object on arrival, and the quota was never
+    tested. On an encapsulated carrier it is worse: native bytes land in an
+    element the transfer syntax says holds JPEG, so nothing downstream can
+    decode it.
+
+    So grow it the way a longer acquisition would. Native Pixel Data gains
+    whole repeated frames and Number of Frames rises to match, keeping
+    ``rows x columns x samples x bytes x frames`` exactly consistent.
+    Encapsulated Pixel Data gains repeated fragment Items — each one a
+    complete copy of a codestream the carrier already held, so every frame
+    still decodes — and the Basic Offset Table is emptied rather than left
+    pointing at boundaries that have moved.
+    """
+    pixel = carrier.pixel_data()
+    if pixel is None:
+        # No image to grow. Say so and add the bulk as a private element
+        # rather than inventing a Pixel Data element the geometry cannot back.
+        edit.set_value(0x00091001, 'OB', b'X' * size, 'bulk_private_element')
+        result.metadata['cstore_file_effective_pixel_bytes'] = size
+        result.metadata['cstore_file_bulk_placement'] = 'private_element'
+        return
+
+    original = carrier.value_of(_TAG_PIXEL_DATA) or b''
+    if not original:
+        result.metadata['cstore_file_bulk_placement'] = 'skipped_empty_pixel_data'
+        return
+
+    frames = _carrier_frame_count(carrier)
+
+    if pixel.undefined_length:
+        parts = carrier_mod.split_encapsulated(original, carrier.little_endian)
+        if parts is None:
+            result.metadata['cstore_file_bulk_placement'] = 'skipped_unparsable_fragments'
+            return
+        _bot, fragments, delimiter = parts
+        if not fragments:
+            result.metadata['cstore_file_bulk_placement'] = 'skipped_empty_pixel_data'
+            return
+        run = b''.join(fragments)
+        repeats = max(1, -(-size // max(len(run), 1)))
+        grown = carrier_mod.encapsulate_items(
+            carrier_mod.empty_basic_offset_table(carrier.little_endian),
+            fragments * (repeats + 1),
+            delimiter or _sequence_delimiter(carrier))
+        edit.set_value(_TAG_PIXEL_DATA, pixel.vr.decode('ascii', 'replace')
+                       if pixel.vr else 'OB', grown, 'pixel_data_pressure',
+                       declared_length=carrier_mod.UNDEFINED_LENGTH)
+        if len(fragments) == frames:
+            # One fragment per frame, so each repeat is another whole frame.
+            edit.set_value(_TAG_NUMBER_OF_FRAMES, 'IS',
+                           str(frames * (repeats + 1)), 'pixel_data_pressure')
+        result.metadata['cstore_file_effective_pixel_bytes'] = len(grown)
+        result.metadata['cstore_file_bulk_placement'] = 'encapsulated_fragments'
+        return
+
+    frame_bytes = max(1, len(original) // frames)
+    extra_frames = max(1, -(-size // frame_bytes))
+    grown = original + original[:frame_bytes] * extra_frames
+    vr = carrier.vr_of(_TAG_PIXEL_DATA) or 'OW'
+    edit.set_value(_TAG_PIXEL_DATA, vr, grown, 'pixel_data_pressure')
+    edit.set_value(_TAG_NUMBER_OF_FRAMES, 'IS', str(frames + extra_frames),
+                   'pixel_data_pressure')
+    result.metadata['cstore_file_effective_pixel_bytes'] = len(grown)
+    result.metadata['cstore_file_bulk_placement'] = 'native_frames'
+
+
+def _carrier_frame_count(carrier: Carrier) -> int:
+    """(0028,0008) Number of Frames, defaulting to the single-frame case."""
+    raw = (carrier.text_of(_TAG_NUMBER_OF_FRAMES) or '').strip()
+    if not raw.isdigit():
+        return 1
+    return max(1, int(raw))
+
+
+def _sequence_delimiter(carrier: Carrier) -> bytes:
+    return (_SEQUENCE_DELIMITER_LE if carrier.little_endian
+            else _SEQUENCE_DELIMITER_BE)
+
+
+def _cstore_file_overlay(edit, carrier: Carrier, result: AttackResult,
+                         command_sop_class: str,
+                         command_sop_instance: str) -> Tuple[str, str]:
+    """Overlay one attack onto an edit of the carrier object's data set.
+
+    Returns the (possibly rewritten) command-set SOP Class/Instance UIDs.
+    Placement is driven entirely by ``result.metadata``, so adding an attack
+    never requires editing this function: an attack that declares nothing
+    recognizable here has its own elements merged into the carrier instead.
     """
     metadata = result.metadata or {}
     scope = metadata.get('coverage_scope')
@@ -447,19 +586,23 @@ def _cstore_file_overlay(dataset, result: AttackResult,
         command_sop_class = metadata['command_sop_class_uid']
         applied.append('command_sop_class_uid')
     if isinstance(metadata.get('dataset_sop_class_uid'), str):
-        _set_dataset_attr(dataset, 'SOPClassUID', metadata['dataset_sop_class_uid'])
+        _edit_set(edit, 'SOPClassUID', metadata['dataset_sop_class_uid'],
+                  'dataset_sop_class_uid')
+        edit.set_file_meta(0x00020002, 'UI', metadata['dataset_sop_class_uid'],
+                           'dataset_sop_class_uid')
         applied.append('dataset_sop_class_uid')
     if isinstance(metadata.get('command_sop_instance_uid'), str):
         command_sop_instance = metadata['command_sop_instance_uid']
         applied.append('command_sop_instance_uid')
     if isinstance(metadata.get('dataset_sop_instance_uid'), str):
-        _set_dataset_attr(dataset, 'SOPInstanceUID', metadata['dataset_sop_instance_uid'])
+        _edit_set(edit, 'SOPInstanceUID', metadata['dataset_sop_instance_uid'],
+                  'dataset_sop_instance_uid')
         applied.append('dataset_sop_instance_uid')
 
     # An attack may spell out exactly which elements to rewrite.
     overrides = metadata.get('cstore_field_overrides')
     if isinstance(overrides, dict):
-        _apply_field_overrides(dataset, overrides)
+        _apply_field_overrides(edit, overrides)
         applied.append('cstore_field_overrides')
         # Command and data set must agree on the SOP Instance UID unless the
         # attack explicitly split them, or an SCP that names the stored file
@@ -476,13 +619,13 @@ def _cstore_file_overlay(dataset, result: AttackResult,
         command_sop_instance = payload_value
         applied.append('command_sop_instance_uid')
     elif scope == _SCOPE_DATASET_UID_ONLY and isinstance(payload_value, str):
-        _set_dataset_attr(dataset, 'SOPInstanceUID', payload_value)
+        _edit_set(edit, 'SOPInstanceUID', payload_value, 'dataset_sop_instance_uid')
         applied.append('dataset_sop_instance_uid')
     elif target is not None:
         keyword, value_key = target
         value = payload_value if isinstance(payload_value, str) else metadata.get(value_key)
         if isinstance(value, str):
-            _set_dataset_attr(dataset, keyword, value)
+            _edit_set(edit, keyword, value, value_key)
             applied.append(value_key)
             if keyword == 'SOPInstanceUID':
                 command_sop_instance = value
@@ -490,23 +633,111 @@ def _cstore_file_overlay(dataset, result: AttackResult,
     if isinstance(payload_value, str) and applied:
         # Mirror the path string into human-visible fields so an operator
         # browsing the target's UI or storage tree can spot where it landed.
-        _set_path_display_markers(dataset, payload_value)
+        _set_path_display_markers(edit, payload_value)
 
     if scope == _SCOPE_IDENTITY_VALIDATION:
-        _set_dataset_attr(dataset, 'PatientName', '')
-        _set_dataset_attr(dataset, 'PatientID', '')
+        _edit_set(edit, 'PatientName', '', 'empty_identity')
+        _edit_set(edit, 'PatientID', '', 'empty_identity')
         applied.append('empty_identity')
 
     if scope == _SCOPE_DISK_PRESSURE:
         size = max(int(metadata.get('size', 0)), _cstore_rss_pressure_bytes())
-        dataset.PixelData = b'X' * size
-        result.metadata['cstore_file_effective_pixel_bytes'] = size
+        _grow_pixel_data(edit, carrier, result, size)
         applied.append('pixel_data_pressure')
 
-    append_payload = b'' if applied else _attack_dataset_payload(result)
-    result.metadata['cstore_file_mutation'] = (
-        '+'.join(applied) if applied else 'append_attack_dataset')
-    return command_sop_class, command_sop_instance, append_payload
+    if not applied:
+        # Nothing in the metadata said where this attack goes, so fold the
+        # attack's own Data Set into the carrier element by element. Merging
+        # beats appending: an appended Data Set sits past Pixel Data with tags
+        # that run backwards, which a conformant SCP is entitled to stop at —
+        # so the parser under test never reaches the malformation.
+        merged, skipped, appended = _merge_attack_dataset(edit, carrier, result)
+        applied.append('merge_attack_dataset' if merged else 'append_attack_dataset')
+        result.metadata['cstore_file_merged_elements'] = merged
+        if skipped:
+            result.metadata['cstore_file_kept_carrier_identity'] = skipped
+        if appended:
+            result.metadata['cstore_file_appended_bytes'] = appended
+
+    result.metadata['cstore_file_mutation'] = '+'.join(applied)
+    if edit.refused:
+        result.metadata['cstore_file_refused'] = '; '.join(edit.refused)
+    return command_sop_class, command_sop_instance
+
+
+#: Elements the carrier stamps with a per-delivery identity. An attack's own
+#: Data Set carries placeholders for these because every Data Set needs them,
+#: not because the attack is about them.
+_IDENTITY_TAGS = frozenset({
+    _TAG_SOP_INSTANCE_UID, _TAG_STUDY_INSTANCE_UID, _TAG_SERIES_INSTANCE_UID,
+})
+
+_UID_CHARACTERS = frozenset('0123456789.')
+
+
+def _is_placeholder_uid(raw: bytes) -> bool:
+    """True for a value that is an ordinary, conformant UID.
+
+    The question this answers is "could this element be the attack?". A UID of
+    nothing but digits and dots, within the 64-character limit, is not testing
+    anything — it is the placeholder every catalog Data Set needs to be a Data
+    Set at all. A traversal path, an embedded NUL, an over-long value or a
+    backslash is the payload, and goes through untouched.
+    """
+    text = raw.decode('ascii', errors='replace').rstrip('\x00')
+    if not text or len(text) > 64:
+        return False
+    return set(text) <= _UID_CHARACTERS
+
+
+def _merge_attack_dataset(edit, carrier: Carrier,
+                          result: AttackResult) -> Tuple[int, int, int]:
+    """Fold an attack's own elements into the carrier, values untouched.
+
+    Each element is re-framed for the carrier's transfer syntax — a VR appears
+    or disappears, the tag and length fields change endianness — while its
+    declared length and value bytes go through exactly as the attack wrote
+    them. That is the difference between delivering a length that lies and
+    delivering a length a writer has helpfully corrected.
+
+    The one thing that does not come across is a placeholder identifier. Half
+    the catalog writes ``1.2.3.4.5`` as its SOP Instance UID; merging that
+    would undo the per-delivery identity the carrier was stamped with, and two
+    attacks would land on the target as one instance overwriting the other.
+    A *malformed* identifier is a different thing entirely and is merged, since
+    that is the attack.
+    """
+    blob = _attack_dataset_payload(result)
+    if not blob:
+        return 0, 0, 0
+    implicit, little = _attack_dataset_encoding(result)
+
+    def _skip_placeholder_identity(elem, value) -> bool:
+        return elem.tag in _IDENTITY_TAGS and _is_placeholder_uid(value)
+
+    return merge_dataset(edit, blob, implicit_vr=implicit,
+                         little_endian=little, label='merge_attack_dataset',
+                         skip=_skip_placeholder_identity)
+
+
+def _cstore_transfer_syntax(args, carrier: Carrier,
+                            result: Optional[AttackResult]) -> str:
+    """The transfer syntax to negotiate for one carried attack.
+
+    ``--store-transfer-syntax`` wins, then the attack's own declared syntax,
+    then the syntax the carrier is actually encoded in. The middle term is the
+    one that used to be missing: an attack whose whole mechanism is a mismatch
+    between the negotiated syntax and the bytes on the wire has nothing left
+    once the carrier's syntax silently overrides it.
+    """
+    override = getattr(args, 'store_transfer_syntax', None)
+    if override:
+        return override
+    if result is not None:
+        declared = result.metadata.get('transfer_syntax')
+        if isinstance(declared, str) and declared:
+            return declared
+    return carrier.transfer_syntax or _DEFAULT_STORE_TRANSFER_SYNTAX
 
 
 def _cstore_file_payload_for_result(args, result: Optional[AttackResult]):
@@ -514,32 +745,42 @@ def _cstore_file_payload_for_result(args, result: Optional[AttackResult]):
 
     Without ``--cstore-file`` this returns ``None`` and the caller falls back
     to the attack's own synthetic payload. With it, the attack is overlaid on
-    a copy of a real object read from the target, so payloads survive SCPs
-    that reject datasets missing device-specific required elements.
+    the operator's own object — spliced into the bytes that were on disk, not
+    re-encoded from a parse of them — so payloads survive SCPs that reject
+    datasets missing device-specific required elements, and the object the
+    target opens is the one the operator already proved it accepts.
     """
-    context = _get_cstore_file_context(args)
-    if context is None:
+    carrier = _get_cstore_file_context(args)
+    if carrier is None:
         return None
 
-    dataset = copy.deepcopy(context['dataset'])
-    transfer_syntax = (getattr(args, 'store_transfer_syntax', None)
-                       or context['transfer_syntax']
-                       or _DEFAULT_STORE_TRANSFER_SYNTAX)
-    command_sop_class = context['sop_class_uid'] or _DEFAULT_STORE_SOP
-    command_sop_instance = context['sop_instance_uid']
-    append_payload = b''
+    edit = carrier.edit()
+    transfer_syntax = _cstore_transfer_syntax(args, carrier, result)
+    command_sop_class = (carrier.sop_class_uid
+                         or getattr(args, 'store_sop', None)
+                         or _DEFAULT_STORE_SOP)
+    command_sop_instance = (carrier.sop_instance_uid
+                            or f"1.2.826.0.1.3680043.10.543.{int(time.time())}.4")
 
     if result is not None:
-        result.metadata['cstore_file'] = context['path']
+        result.metadata['cstore_file'] = carrier.path
         result.metadata['cstore_file_transfer_syntax'] = transfer_syntax
+        result.metadata['cstore_file_encoding'] = carrier.transfer_syntax
+        if carrier.has_tail:
+            # Bytes the scan could not read as elements are still delivered;
+            # say so, because they are also bytes no splice can reach.
+            result.metadata['cstore_file_opaque_tail_bytes'] = (
+                len(carrier.dataset) - carrier.tail_offset)
         # Every delivered object gets a fresh identity so one attack's object
         # cannot collide with, or overwrite, another's on the target.
-        command_sop_instance = _stamp_cstore_file_identity(dataset, result, context)
-        command_sop_class, command_sop_instance, append_payload = _cstore_file_overlay(
-            dataset, result, command_sop_class, command_sop_instance)
+        command_sop_instance = _stamp_cstore_file_identity(edit, result, carrier)
+        command_sop_class, command_sop_instance = _cstore_file_overlay(
+            edit, carrier, result, command_sop_class, command_sop_instance)
 
-    payload = _encode_pydicom_dataset(dataset, transfer_syntax) + append_payload
-    return payload, command_sop_class, command_sop_instance, transfer_syntax
+    return CarriedPayload(edit.to_bytes(), command_sop_class,
+                          command_sop_instance, transfer_syntax,
+                          edit.to_part10())
+
 
 
 def _cstore_rss_pressure_bytes() -> int:
@@ -600,7 +841,10 @@ def _run_cstore_smoke(args, target) -> int:
     """
     file_payload = _cstore_file_payload_for_result(args, None)
     if file_payload is not None:
-        payload, sop_class, sop_instance, transfer_syntax = file_payload
+        payload = file_payload.dataset
+        sop_class = file_payload.sop_class_uid
+        sop_instance = file_payload.sop_instance_uid
+        transfer_syntax = file_payload.transfer_syntax
     else:
         sop_class = getattr(args, 'store_sop', None) or _DEFAULT_STORE_SOP
         transfer_syntax = (getattr(args, 'store_transfer_syntax', None)
@@ -831,8 +1075,16 @@ def _deliver(args, result: AttackResult, target, timeout: float):
         if kind == 'cstore':
             carrier = _transport_for(args, target)
             file_payload = _cstore_file_payload_for_result(args, result)
+            dry_run_blob = None
             if file_payload is not None:
-                cstore_payload, sop_class, sop_inst, transfer_syntax = file_payload
+                sop_class = file_payload.sop_class_uid
+                sop_inst = file_payload.sop_instance_uid
+                transfer_syntax = file_payload.transfer_syntax
+                # STOW-RS posts complete instances; C-STORE carries a Data Set.
+                cstore_payload = (file_payload.part10
+                                  if carrier.carries_whole_file
+                                  else file_payload.dataset)
+                dry_run_blob = file_payload.part10
             elif carrier.carries_whole_file:
                 # STOW-RS posts complete instances, so the Part-10 wrapper is
                 # what goes up — stripping it here would throw away the
@@ -859,7 +1111,12 @@ def _deliver(args, result: AttackResult, target, timeout: float):
                 if part10_meta.get('part10_stripped'):
                     result.metadata['cstore_stripped_part10'] = True
             if getattr(args, 'dry_run', None):
-                _dry_run_write(args, result, kind, [cstore_payload])
+                # Write the whole file when there is one. A bare Data Set with
+                # a .dcm name opens in nothing, and --dry-run exists so an
+                # operator can look at what a run would send before it sends it.
+                _dry_run_write(args, result, kind,
+                               [dry_run_blob if dry_run_blob is not None
+                                else cstore_payload])
                 return None, 'dry_run'
             outcome = carrier.store(
                 cstore_payload, sop_class_uid=sop_class,
@@ -2523,6 +2780,27 @@ def main(argv: Optional[List[str]] = None):
     args._monitors = []
     args._managed_process = None
     args._associations_used = 0
+
+    # Load --cstore-file up front. A carrier that cannot be read is an
+    # operator error, and finding out about it on the first delivery buries it
+    # under a wall of per-attack output.
+    if args.cstore_file:
+        try:
+            carrier = _get_cstore_file_context(args)
+        except CarrierError as exc:
+            print(f"ERROR: --cstore-file: {exc}")
+            return 1
+        print(f"Carrier: {carrier.path}")
+        print(f"  Encoding: {carrier.transfer_syntax}"
+              + ("  (sniffed - the file has no File Meta Information)"
+                 if carrier.sniffed_encoding else ""))
+        print(f"  Data Set: {len(carrier.dataset)} bytes, "
+              f"{len(carrier.elements)} top-level elements")
+        if carrier.has_tail:
+            print(f"  WARNING: {len(carrier.dataset) - carrier.tail_offset} "
+                  "trailing bytes did not parse as Data Elements; they are "
+                  "delivered unchanged but no attack can be placed in them.")
+        print()
 
     if args.dry_run:
         print(f"DRY RUN: writing payloads to {os.path.abspath(args.dry_run)} "
