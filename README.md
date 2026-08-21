@@ -39,18 +39,27 @@ flowchart LR
     subgraph CRAFT [Crafting and corruption]
         PYDICOM[pydicom<br/>parse real objects]
         CORRUPTOR[corruptor.py<br/>re-emit as invalid]
+        CARRIER[carrier.py<br/>a real object, as bytes]
         ELEMENT[element.py<br/>dataset + shared encoder]
         PIXEL[pixel.py<br/>encapsulated pixel data]
         FILE[file.py<br/>Part 10 file]
         SCAPY[scapy_dicom.py<br/>malformed PDUs/DIMSE]
         PYDICOM --> CORRUPTOR
+        ELEMENT --> CARRIER
         ELEMENT --> CORRUPTOR & PIXEL & FILE
     end
 
     REALDCM -->|pydicom bridge| PYDICOM
+    REALDCM -->|--cstore-file: bytes, not a parse| CARRIER
 
     CATALOG[attacks.py<br/>static catalog + seed generators]
     CRAFT --> CATALOG
+
+    %% The seam: an attack plus a real object, spliced into one storable
+    %% payload. Neither side knows the other's vocabulary.
+    OVERLAY[overlay.py<br/>attack onto carrier]
+    CATALOG --> OVERLAY
+    CARRIER --> OVERLAY
 
     %% ---- Three testing pillars ----
     subgraph WF [Pentest workflows]
@@ -71,6 +80,7 @@ flowchart LR
 
     OP --> CATALOG & WF & ROGUE & GB
     CATALOG -->|live delivery| DELIVER
+    OVERLAY -->|carried C-STORE payload| DELIVER
     CATALOG -->|seed corpus + dict| AFL
     CFG -->|config-file CVEs| AFL
 

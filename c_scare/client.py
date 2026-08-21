@@ -36,6 +36,7 @@ from .scapy_dicom import (
     iter_user_info_subitems,
     iter_variable_items,
 )
+from .carrier import Carrier
 
 log = logging.getLogger("scapy.contrib.dicom")
 
@@ -454,18 +455,25 @@ class DICOMSession:
                 return query_ds.encode(implicit_vr=implicit_vr, little_endian=True)
             except TypeError:
                 pass
-        # pydicom Dataset fallback
-        try:
-            from io import BytesIO
-            from pydicom.filewriter import write_dataset
-            from pydicom.filebase import DicomBytesIO
-            buf = DicomBytesIO()
-            buf.is_implicit_VR = implicit_vr
-            buf.is_little_endian = True
-            write_dataset(buf, query_ds)
-            return buf.getvalue()
-        except Exception:
-            return b""
+        # pydicom Dataset fallback. Note the asymmetry: a c_scare Dataset is
+        # encoded without validation, a pydicom one is not, so a query key that
+        # is itself the test (an over-long value, an embedded NUL, a traversal
+        # path in a matching key) is normalised on this path. Build sculpted
+        # identifiers with workflows.build_query, which returns a c_scare
+        # Dataset, and keep this for ordinary well-formed queries.
+        from io import BytesIO  # noqa: F401  (kept for callers patching it)
+        from pydicom.filewriter import write_dataset
+        from pydicom.filebase import DicomBytesIO
+        buf = DicomBytesIO()
+        buf.is_implicit_VR = implicit_vr
+        buf.is_little_endian = True
+        # Deliberately unguarded: an identifier that will not encode must not
+        # become an empty one. A C-FIND with an empty identifier is a valid
+        # request that matches everything, so swallowing the error here turned
+        # "this query could not be built" into "the archive returned the whole
+        # database".
+        write_dataset(buf, query_ds)
+        return buf.getvalue()
 
     @staticmethod
     def _decode_identifier(data_bytes, implicit_vr):
@@ -671,11 +679,18 @@ class DICOMSession:
         Returns the final status, sub-op counts, the granted role map, and a
         list of decoded objects (pydicom Datasets) — parse both metadata *and*
         pixels from these."""
+        raw_objects = []  # type: List[Tuple[bytes, Optional[str]]]
+
         def _result(status, objects, aborted=False, reason=None):
             # type: (Optional[int], List[Any], bool, Optional[str]) -> Dict[str, Any]
             out = {
                 "status": status,
                 "objects": objects,
+                # The Data Set exactly as the peer sent it, paired with the
+                # transfer syntax its presentation context negotiated. A
+                # decoded object cannot answer "did the archive change this?"
+                # -- re-serialising it answers "what would pydicom write?".
+                "raw_objects": list(raw_objects),
                 "num_objects": len(objects),
                 "negotiated_roles": dict(self.negotiated_roles),
                 "aborted": aborted,
@@ -725,6 +740,9 @@ class DICOMSession:
                         return _result(None, objects, aborted=True,
                                        reason="scp_role_not_granted")
                 store_implicit = self._ctx_is_implicit_vr(cid) if cid else implicit
+                store_ts = (self.accepted_contexts.get(cid, (None, None))[1]
+                            if cid else None)
+                raw_objects.append((bytes(rdata or b''), store_ts))
                 objects.append(self._decode_identifier(rdata, store_implicit))
                 self._send_cstore_rsp(cid, rcmd)
                 continue
@@ -846,6 +864,33 @@ class RetrieveOutcome(NamedTuple):
     reason: Optional[str]
 
 
+def render_retrieved(dataset_bytes, transfer_syntax, sop_class_uid=None,
+                     sop_instance_uid=None):
+    # type: (bytes, Optional[str], Optional[str], Optional[str]) -> bytes
+    """Wrap a Data Set a peer sent back into a Part-10 file, bytes intact.
+
+    Separated from the association so it can be tested without one, because
+    what it does not do is the point. The caller compares this against what was
+    sent to decide whether the *archive* altered the payload, so the Data Set
+    has to arrive here and leave here unchanged.
+
+    Re-serialising a parse instead answers a different question and answers it
+    wrong. pydicom's writer drops every retired ``(gggg,0000)`` group length,
+    so a payload parked in one comes back as "the receiver removed the embedded
+    content" when the receiver never touched it -- the framework accusing the
+    target of its own edit. Only the File Meta group is ours, and PS3.10 puts
+    that outside the Data Set anyway: C-STORE transmits a Data Set, so the
+    preamble and group 0002 were never the peer's to send.
+    """
+    carrier = Carrier.from_dataset(dataset_bytes, transfer_syntax)
+    edit = carrier.edit()
+    edit.set_file_meta(0x00020002, 'UI',
+                       carrier.sop_class_uid or sop_class_uid or '')
+    edit.set_file_meta(0x00020003, 'UI',
+                       carrier.sop_instance_uid or sop_instance_uid or '')
+    return edit.to_part10()
+
+
 def retrieve_instance(target: Tuple[str, int],
                       sop_class_uid: str,
                       sop_instance_uid: str,
@@ -864,15 +909,16 @@ def retrieve_instance(target: Tuple[str, int],
     The SCU proposes the Storage SCP role for ``sop_class_uid``, without which
     the archive has nowhere to send the sub-operation.
 
-    Note what the returned bytes are: a re-serialisation of the Data Set the
-    archive sent, not the file on its disk. C-GET moves Data Sets, so the
-    128-byte preamble is ours, not theirs — which is exactly why
+    Note what the returned bytes are: the Data Set the archive sent, wrapped
+    in a File Meta group here. C-GET moves Data Sets, so the 128-byte preamble
+    is ours, not theirs — which is exactly why
     :func:`~c_scare.polyglot.compare_after_pipeline` reports the offset-0
-    header separately from the private-element content.
+    header separately from the private-element content. Everything inside the
+    Data Set, though, is the peer's own bytes: the caller is asking what the
+    *archive* did to the payload, and a round trip through a validating writer
+    would answer for the framework instead.
     """
     try:
-        from io import BytesIO
-
         import pydicom
 
         from .scapy_dicom import (
@@ -900,22 +946,15 @@ def retrieve_instance(target: Tuple[str, int],
             result = sock.c_get(
                 query, sop_class_uid=STUDY_ROOT_QR_GET_SOP_CLASS_UID)
 
-            objects = result.get('objects') or []
-            if not objects:
+            raw_objects = result.get('raw_objects') or []
+            if not raw_objects:
                 return RetrieveOutcome(
                     None, f'no_objects:status={result.get("status")}')
 
-            retrieved = objects[0]
-            if not hasattr(retrieved, 'file_meta') or not retrieved.file_meta:
-                meta = pydicom.dataset.FileMetaDataset()
-                meta.MediaStorageSOPClassUID = sop_class_uid
-                meta.MediaStorageSOPInstanceUID = sop_instance_uid
-                meta.TransferSyntaxUID = ts
-                retrieved.file_meta = meta
-            retrieved.preamble = b'\x00' * 128
-            buffer = BytesIO()
-            retrieved.save_as(buffer, enforce_file_format=True)
-            return RetrieveOutcome(buffer.getvalue(), None)
+            raw, store_ts = raw_objects[0]
+            return RetrieveOutcome(
+                render_retrieved(raw, store_ts or ts, sop_class_uid,
+                                 sop_instance_uid), None)
     except ConnectionRefusedError:
         return RetrieveOutcome(None, ASSOC_REFUSED)
     except ConnectionResetError:

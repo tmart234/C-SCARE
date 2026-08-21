@@ -4710,8 +4710,6 @@ class CVEAttacks:
             'carrier_sop_instance_uid': after.sop_instance_uid,
             'study_instance_uid': after.study_instance_uid,
             'series_instance_uid': after.series_instance_uid,
-            'study_instance_uid': after.study_instance_uid,
-            'series_instance_uid': after.series_instance_uid,
             'carrier_pixel_data_offset': after.pixel_data_offset,
             'carrier_pixel_data_bytes': after.pixel_data_length,
             'carrier_pixel_data_intact':
@@ -4830,8 +4828,6 @@ class CVEAttacks:
             'carrier_sop_instance_uid': after.sop_instance_uid,
             'study_instance_uid': after.study_instance_uid,
             'series_instance_uid': after.series_instance_uid,
-            'study_instance_uid': after.study_instance_uid,
-            'series_instance_uid': after.series_instance_uid,
             'carrier_pixel_data_offset': after.pixel_data_offset,
             'carrier_pixel_data_bytes': after.pixel_data_length,
             'carrier_pixel_data_intact':
@@ -4884,8 +4880,6 @@ class CVEAttacks:
             'container_offset': offset,
             'container_magic': magic.rstrip(b'\x00').decode('ascii'),
             'carrier_sop_instance_uid': after.sop_instance_uid,
-            'study_instance_uid': after.study_instance_uid,
-            'series_instance_uid': after.series_instance_uid,
             'study_instance_uid': after.study_instance_uid,
             'series_instance_uid': after.series_instance_uid,
             'container_body_bytes': len(marker),

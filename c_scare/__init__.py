@@ -159,6 +159,17 @@ from .polyglot import (
     validate_pe, validate_dicom, validate_polyglot,
 )
 
+# A real DICOM object held as the bytes it was stored as, edited by splicing
+# (the counterpart to Corruptor: nothing is re-encoded on the way out)
+from .carrier import (
+    Carrier, CarrierEdit, CarrierElement, CarrierError,
+    dataset_from_part10, is_part10, scan_dataset, split_part10,
+)
+
+# Rendering one catalog attack onto a carrier — the seam between attacks.py
+# and carrier.py, used by the C-STORE delivery path
+from .overlay import CarriedPayload, carry, smoke_dataset
+
 # pydicom-bridged surgical corruption (parse with pydicom, emit invalid bytes)
 from .corruptor import (
     Corruptor, InjectionPoint, Override, Injection, SequencePath,
@@ -347,6 +358,10 @@ __all__ = [
     "SafeZone", "dos_header", "pe_image", "dataset_offset",
     "enumerate_safe_zones", "validate_pe", "validate_dicom",
     "validate_polyglot",
+    # Byte-faithful carriers, and rendering an attack onto one
+    "Carrier", "CarrierEdit", "CarrierElement", "CarrierError",
+    "dataset_from_part10", "is_part10", "scan_dataset", "split_part10",
+    "CarriedPayload", "carry", "smoke_dataset",
     # Surgical corruption
     "Corruptor", "InjectionPoint", "Override", "Injection", "SequencePath",
     "corrupt_vr", "corrupt_length", "duplicate_tag",

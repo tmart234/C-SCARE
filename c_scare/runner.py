@@ -30,11 +30,8 @@ import os
 import argparse
 import datetime as dt
 import time
-import struct
-import copy
-import hashlib
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
 import tempfile
 
 # Import attack modules
@@ -45,10 +42,13 @@ try:
         PathTraversalAttacks, StateMachineAttacks, CVEAttacks,
         NegotiationAttacks, DimseNAttacks,
         ProtocolFuzzer, AttackResult, SCAPY_AVAILABLE,
-        DICM_PREFIX, EXPLICIT_VR_LE_UID, PART10_PREAMBLE_LEN,
+        DICM_PREFIX, EXPLICIT_VR_LE_UID,
         part10_file, standard_file_meta,
     )
     from . import client, deliver, transport
+    from . import carrier as carrier_mod
+    from . import overlay
+    from .carrier import Carrier, CarrierError
     from .monitor import (
         BaseMonitor, MonitorReport, SanitizerMonitor,
         ProtocolMonitor, ProcessMonitor, PipelineMonitor,
@@ -61,12 +61,15 @@ except ImportError:
         PathTraversalAttacks, StateMachineAttacks, CVEAttacks,
         NegotiationAttacks, DimseNAttacks,
         ProtocolFuzzer, AttackResult, SCAPY_AVAILABLE,
-        DICM_PREFIX, EXPLICIT_VR_LE_UID, PART10_PREAMBLE_LEN,
+        DICM_PREFIX, EXPLICIT_VR_LE_UID,
         part10_file, standard_file_meta,
     )
     import client
     import deliver
     import transport
+    import carrier as carrier_mod
+    import overlay
+    from carrier import Carrier, CarrierError
     from monitor import (
         BaseMonitor, MonitorReport, SanitizerMonitor,
         ProtocolMonitor, ProcessMonitor, PipelineMonitor,
@@ -131,16 +134,25 @@ DATASET_CATEGORIES = frozenset({
 # a clinical outage, so they require --allow-availability.
 AVAILABILITY_CATEGORIES = frozenset({'memory', 'storage_abuse', 'state_machine'})
 
-_LONG_EXPLICIT_VR = frozenset({
-    b'OB', b'OD', b'OF', b'OL', b'OV', b'OW', b'SQ', b'UC', b'UR', b'UT', b'UN',
-})
 
 # Fallback storage SOP class for C-STORE delivery when an attack does not name
 # one. Secondary Capture accepts arbitrary datasets and is what the
 # path-traversal payloads already target. Hard-coded so this module imports
 # without scapy; delivery itself (send_cstore) requires scapy at call time.
-_DEFAULT_STORE_SOP = "1.2.840.10008.5.1.4.1.1.7"  # Secondary Capture Image Storage
-_DEFAULT_STORE_TRANSFER_SYNTAX = "1.2.840.10008.1.2"  # Implicit VR Little Endian
+overlay.DEFAULT_STORE_SOP = "1.2.840.10008.5.1.4.1.1.7"  # Secondary Capture Image Storage
+overlay.DEFAULT_STORE_TRANSFER_SYNTAX = "1.2.840.10008.1.2"  # Implicit VR Little Endian
+
+# How the catalog encodes an attack's own Data Set unless the attack says
+# otherwise in `encoded_transfer_syntax`. Needed to re-frame those elements
+# into a carrier's syntax without disturbing their values.
+_DEFAULT_ENCODED_TRANSFER_SYNTAX = "1.2.840.10008.1.2.1"  # Explicit VR LE
+
+# Sequence Delimitation Item (FFFE,E0DD) with a zero length, both byte orders.
+# Encapsulated Pixel Data ends with one; growing the fragment run means
+# splitting it off, repeating the fragments, and putting it back.
+_SEQUENCE_DELIMITER_LE = b'\xfe\xff\xdd\xe0\x00\x00\x00\x00'
+_SEQUENCE_DELIMITER_BE = b'\xff\xfe\xe0\xdd\x00\x00\x00\x00'
+
 _ASSOCIATE_RQ_PDU_TYPE = 0x01
 _PDATA_PDU_TYPE = 0x04
 _ABORT_PDU_TYPE = 0x07
@@ -259,336 +271,40 @@ def _sequence_expectations(steps: List[bytes]) -> List[bool]:
     return expectations
 
 
-def _uid_str(value) -> Optional[str]:
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
+def _get_cstore_file_context(args) -> Optional[Carrier]:
+    """Load ``--cstore-file`` as a byte-faithful carrier, cached on ``args``.
 
-
-def _encode_pydicom_dataset(dataset, transfer_syntax: str) -> bytes:
-    try:
-        from pydicom.filebase import DicomBytesIO
-        from pydicom.filewriter import write_dataset
-        from pydicom.uid import UID
-    except ImportError as exc:
-        raise RuntimeError("--cstore-file requires pydicom") from exc
-
-    ts_uid = UID(transfer_syntax)
-    dataset.is_implicit_VR = bool(ts_uid.is_implicit_VR)
-    dataset.is_little_endian = bool(ts_uid.is_little_endian)
-    buffer = DicomBytesIO()
-    buffer.is_implicit_VR = dataset.is_implicit_VR
-    buffer.is_little_endian = dataset.is_little_endian
-    write_dataset(buffer, dataset)
-    return buffer.getvalue()
-
-
-def _get_cstore_file_context(args) -> Optional[Dict[str, object]]:
+    The carrier is read once and never mutated: every attack takes an edit
+    against the same immutable bytes, so no attack can leak state into the
+    next one and the object the operator validated is the object each test
+    starts from.
+    """
     path = getattr(args, 'cstore_file', None)
     if not path:
         return None
     path = os.path.abspath(os.fspath(path))
     cached = getattr(args, '_cstore_file_context', None)
-    if cached and cached.get('path') == path:
+    if cached is not None and cached.path == path:
         return cached
-
-    try:
-        import pydicom
-    except ImportError as exc:
-        raise RuntimeError("--cstore-file requires pydicom") from exc
-
-    dataset = pydicom.dcmread(path)
-    file_meta = getattr(dataset, 'file_meta', None)
-    transfer_syntax = _uid_str(getattr(file_meta, 'TransferSyntaxUID', None))
-    if transfer_syntax is None:
-        transfer_syntax = _DEFAULT_STORE_TRANSFER_SYNTAX
-
-    sop_class = (_uid_str(getattr(dataset, 'SOPClassUID', None))
-                 or _uid_str(getattr(file_meta, 'MediaStorageSOPClassUID', None))
-                 or getattr(args, 'store_sop', None)
-                 or _DEFAULT_STORE_SOP)
-    sop_instance = (_uid_str(getattr(dataset, 'SOPInstanceUID', None))
-                    or _uid_str(getattr(file_meta, 'MediaStorageSOPInstanceUID', None))
-                    or f"1.2.826.0.1.3680043.10.543.{int(time.time())}.4")
-
-    context = {
-        'path': path,
-        'dataset': dataset,
-        'transfer_syntax': transfer_syntax,
-        'sop_class_uid': sop_class,
-        'sop_instance_uid': sop_instance,
-    }
-    args._cstore_file_context = context
-    return context
-
-
-def _set_dataset_attr(dataset, keyword: str, value: str) -> None:
-    try:
-        setattr(dataset, keyword, value)
-    except Exception:
-        pass
-
-
-def _unique_uid(suffix: int) -> str:
-    return f"1.2.826.0.1.3680043.10.543.{time.time_ns()}.{suffix}"
-
-
-def _uid_hash(value: str) -> int:
-    digest = hashlib.sha1(value.encode('utf-8', errors='replace')).hexdigest()
-    return int(digest[:8], 16) % 100000000
-
-
-def _series_uid_for_result(result: AttackResult, suffix: int) -> str:
-    run_id = os.environ.get('CSCARE_DAST_RUN_ID')
-    if not run_id:
-        return _unique_uid(suffix)
-    return f"1.2.826.0.1.3680043.10.543.{_uid_hash(run_id)}.{_uid_hash(result.name)}.{suffix}"
-
-
-def _slice_uid_for_result(result: AttackResult, context: Dict[str, object], suffix: int) -> str:
-    run_id = os.environ.get('CSCARE_DAST_RUN_ID')
-    if not run_id:
-        return _unique_uid(suffix)
-    source_id = str(context.get('sop_instance_uid') or context.get('path') or time.time_ns())
-    return (
-        f"1.2.826.0.1.3680043.10.543.{_uid_hash(run_id)}."
-        f"{_uid_hash(result.name)}.{_uid_hash(source_id)}.{suffix}"
-    )
-
-
-def _apply_field_overrides(dataset, overrides: Dict[str, str]) -> None:
-    for keyword, value in overrides.items():
-        _set_dataset_attr(dataset, keyword, value)
-
-
-def _stamp_cstore_file_identity(dataset, result: AttackResult,
-                                context: Dict[str, object]) -> str:
-    sop_instance = _slice_uid_for_result(result, context, 1)
-    study_instance = _series_uid_for_result(result, 2)
-    series_instance = _series_uid_for_result(result, 3)
-    run_id = os.environ.get('CSCARE_DAST_RUN_ID')
-    patient_suffix = _uid_hash(f"{run_id}:{result.name}") if run_id else time.time_ns() & 0xFFFFFFFF
-    patient_id = f"CSCARE-{patient_suffix:x}"
-    patient_name = f"C-SCARE^{result.name[:48]}"
-
-    _set_dataset_attr(dataset, 'SOPInstanceUID', sop_instance)
-    _set_dataset_attr(dataset, 'StudyInstanceUID', study_instance)
-    _set_dataset_attr(dataset, 'SeriesInstanceUID', series_instance)
-    _set_dataset_attr(dataset, 'PatientName', patient_name)
-    _set_dataset_attr(dataset, 'PatientID', patient_id)
-
-    result.metadata['cstore_file_base_sop_instance_uid'] = sop_instance
-    result.metadata['cstore_file_base_study_instance_uid'] = study_instance
-    result.metadata['cstore_file_base_series_instance_uid'] = series_instance
-    result.metadata['cstore_file_base_patient_id'] = patient_id
-    return sop_instance
-
-
-def _path_display_marker(value: str) -> str:
-    marker = str(value).replace('\x00', '')
-    run_id = os.environ.get('CSCARE_DAST_RUN_ID')
-    if run_id:
-        marker = f"{marker}-{_uid_hash(run_id):08d}"
-    return marker[:64] or 'C-SCARE-PATH'
-
-
-def _set_path_display_markers(dataset, value: str) -> None:
-    marker = _path_display_marker(value)
-    _set_dataset_attr(dataset, 'PatientID', marker)
-    _set_dataset_attr(dataset, 'StudyDescription', marker)
-    _set_dataset_attr(dataset, 'SeriesDescription', marker)
-    _set_dataset_attr(dataset, 'PatientComments', marker)
-
-
-def _attack_dataset_payload(result: AttackResult) -> bytes:
-    payload, _meta = _dataset_from_part10(result.payload)
-    return payload
-
-
-# DICOM element name (as attacks write it in `target_field`) -> pydicom
-# keyword, and the metadata key an attack uses to carry that element's value.
-# An attack names the element it corrupts; this table says where to put it on
-# the carrier object. Nothing here knows individual attack names.
-_CSTORE_TARGET_FIELDS = {
-    '(0008,0018) SOP Instance UID': ('SOPInstanceUID', 'sop_instance_uid'),
-    '(0020,000D) Study Instance UID': ('StudyInstanceUID', 'study_instance_uid'),
-    '(0020,000E) Series Instance UID': ('SeriesInstanceUID', 'series_instance_uid'),
-    '(0010,0010) Patient Name': ('PatientName', 'patient_name'),
-    '(0010,0020) Patient ID': ('PatientID', 'patient_id'),
-}
-
-# `coverage_scope` values that change how a payload is placed rather than
-# where. The two traversal scopes split one value across the C-STORE command
-# set and the data set to prove which half the target actually consumes.
-_SCOPE_COMMAND_UID_ONLY = 'command-sop-instance-uid-only'
-_SCOPE_DATASET_UID_ONLY = 'dataset-sop-instance-uid-only'
-_SCOPE_IDENTITY_VALIDATION = 'identity-validation'
-_SCOPE_DISK_PRESSURE = 'storage-quota-disk-pressure'
-
-
-def _cstore_file_overlay(dataset, result: AttackResult,
-                         command_sop_class: str,
-                         command_sop_instance: str) -> Tuple[str, str, bytes]:
-    """Overlay one attack onto a copy of the carrier object's data set.
-
-    Returns the (possibly rewritten) command-set SOP Class/Instance UIDs and
-    any extra data set bytes to append after the carrier. Placement is driven
-    entirely by ``result.metadata``, so adding an attack never requires editing
-    this function: an attack that declares nothing recognizable here has its
-    own data set appended to the carrier instead.
-    """
-    metadata = result.metadata or {}
-    scope = metadata.get('coverage_scope')
-    applied: List[str] = []
-
-    # Command-vs-dataset consistency attacks name each half explicitly.
-    if isinstance(metadata.get('command_sop_class_uid'), str):
-        command_sop_class = metadata['command_sop_class_uid']
-        applied.append('command_sop_class_uid')
-    if isinstance(metadata.get('dataset_sop_class_uid'), str):
-        _set_dataset_attr(dataset, 'SOPClassUID', metadata['dataset_sop_class_uid'])
-        applied.append('dataset_sop_class_uid')
-    if isinstance(metadata.get('command_sop_instance_uid'), str):
-        command_sop_instance = metadata['command_sop_instance_uid']
-        applied.append('command_sop_instance_uid')
-    if isinstance(metadata.get('dataset_sop_instance_uid'), str):
-        _set_dataset_attr(dataset, 'SOPInstanceUID', metadata['dataset_sop_instance_uid'])
-        applied.append('dataset_sop_instance_uid')
-
-    # An attack may spell out exactly which elements to rewrite.
-    overrides = metadata.get('cstore_field_overrides')
-    if isinstance(overrides, dict):
-        _apply_field_overrides(dataset, overrides)
-        applied.append('cstore_field_overrides')
-        # Command and data set must agree on the SOP Instance UID unless the
-        # attack explicitly split them, or an SCP that names the stored file
-        # from the command set would never see the payload.
-        if 'SOPInstanceUID' in overrides and 'command_sop_instance_uid' not in applied:
-            command_sop_instance = overrides['SOPInstanceUID']
-
-    # The element named by `target_field` carries the payload. Its value comes
-    # from `traversal_payload` or from the per-element metadata key.
-    payload_value = metadata.get('traversal_payload')
-    target = _CSTORE_TARGET_FIELDS.get(metadata.get('target_field'))
-    if scope == _SCOPE_COMMAND_UID_ONLY and isinstance(payload_value, str):
-        # The data set keeps a benign UID; only the command set carries the payload.
-        command_sop_instance = payload_value
-        applied.append('command_sop_instance_uid')
-    elif scope == _SCOPE_DATASET_UID_ONLY and isinstance(payload_value, str):
-        _set_dataset_attr(dataset, 'SOPInstanceUID', payload_value)
-        applied.append('dataset_sop_instance_uid')
-    elif target is not None:
-        keyword, value_key = target
-        value = payload_value if isinstance(payload_value, str) else metadata.get(value_key)
-        if isinstance(value, str):
-            _set_dataset_attr(dataset, keyword, value)
-            applied.append(value_key)
-            if keyword == 'SOPInstanceUID':
-                command_sop_instance = value
-
-    if isinstance(payload_value, str) and applied:
-        # Mirror the path string into human-visible fields so an operator
-        # browsing the target's UI or storage tree can spot where it landed.
-        _set_path_display_markers(dataset, payload_value)
-
-    if scope == _SCOPE_IDENTITY_VALIDATION:
-        _set_dataset_attr(dataset, 'PatientName', '')
-        _set_dataset_attr(dataset, 'PatientID', '')
-        applied.append('empty_identity')
-
-    if scope == _SCOPE_DISK_PRESSURE:
-        size = max(int(metadata.get('size', 0)), _cstore_rss_pressure_bytes())
-        dataset.PixelData = b'X' * size
-        result.metadata['cstore_file_effective_pixel_bytes'] = size
-        applied.append('pixel_data_pressure')
-
-    append_payload = b'' if applied else _attack_dataset_payload(result)
-    result.metadata['cstore_file_mutation'] = (
-        '+'.join(applied) if applied else 'append_attack_dataset')
-    return command_sop_class, command_sop_instance, append_payload
+    carrier = Carrier.from_file(path)
+    args._cstore_file_context = carrier
+    return carrier
 
 
 def _cstore_file_payload_for_result(args, result: Optional[AttackResult]):
-    """Render an attack as a C-STORE payload carried by a real DICOM object.
+    """Render one attack onto ``--cstore-file``, or ``None`` without the flag.
 
-    Without ``--cstore-file`` this returns ``None`` and the caller falls back
-    to the attack's own synthetic payload. With it, the attack is overlaid on
-    a copy of a real object read from the target, so payloads survive SCPs
-    that reject datasets missing device-specific required elements.
+    The rendering itself lives in :mod:`c_scare.overlay`; all this does is
+    turn command-line options into its arguments.
     """
-    context = _get_cstore_file_context(args)
-    if context is None:
+    carrier = _get_cstore_file_context(args)
+    if carrier is None:
         return None
+    return overlay.carry(
+        carrier, result,
+        transfer_syntax=getattr(args, 'store_transfer_syntax', None),
+        store_sop=getattr(args, 'store_sop', None))
 
-    dataset = copy.deepcopy(context['dataset'])
-    transfer_syntax = (getattr(args, 'store_transfer_syntax', None)
-                       or context['transfer_syntax']
-                       or _DEFAULT_STORE_TRANSFER_SYNTAX)
-    command_sop_class = context['sop_class_uid'] or _DEFAULT_STORE_SOP
-    command_sop_instance = context['sop_instance_uid']
-    append_payload = b''
-
-    if result is not None:
-        result.metadata['cstore_file'] = context['path']
-        result.metadata['cstore_file_transfer_syntax'] = transfer_syntax
-        # Every delivered object gets a fresh identity so one attack's object
-        # cannot collide with, or overwrite, another's on the target.
-        command_sop_instance = _stamp_cstore_file_identity(dataset, result, context)
-        command_sop_class, command_sop_instance, append_payload = _cstore_file_overlay(
-            dataset, result, command_sop_class, command_sop_instance)
-
-    payload = _encode_pydicom_dataset(dataset, transfer_syntax) + append_payload
-    return payload, command_sop_class, command_sop_instance, transfer_syntax
-
-
-def _cstore_rss_pressure_bytes() -> int:
-    """Pixel Data size for disk/memory-pressure attacks, in bytes.
-
-    Defaults to 256 KiB. Raise it via ``CSCARE_CSTORE_RSS_PRESSURE_BYTES``
-    when the target only shows growth under a larger object; capped at 512 MiB
-    so a typo cannot try to allocate the test host's whole memory.
-    """
-    raw = os.environ.get('CSCARE_CSTORE_RSS_PRESSURE_BYTES')
-    if not raw:
-        return 256 * 1024
-    try:
-        size = int(raw, 0)
-    except ValueError:
-        return 256 * 1024
-    return max(0, min(size, 512 * 1024 * 1024))
-
-
-def _cstore_smoke_dataset(sop_class_uid: str, sop_instance_uid: str,
-                          transfer_syntax: str) -> bytes:
-    """Minimal but wholly valid Secondary Capture object for the smoke check."""
-    try:
-        from .element import Dataset, Element
-    except ImportError:
-        from element import Dataset, Element
-
-    study_uid = f"1.2.826.0.1.3680043.10.543.{int(time.time())}.1"
-    series_uid = f"1.2.826.0.1.3680043.10.543.{int(time.time())}.2"
-    ds = Dataset()
-    ds = ds / Element(0x0008, 0x0016, 'UI', sop_class_uid)
-    ds = ds / Element(0x0008, 0x0018, 'UI', sop_instance_uid)
-    ds = ds / Element(0x0008, 0x0020, 'DA', time.strftime('%Y%m%d'))
-    ds = ds / Element(0x0008, 0x0030, 'TM', time.strftime('%H%M%S'))
-    ds = ds / Element(0x0008, 0x0060, 'CS', 'OT')
-    ds = ds / Element(0x0010, 0x0010, 'PN', 'C-SCARE^Smoke')
-    ds = ds / Element(0x0010, 0x0020, 'LO', 'C-SCARE-SMOKE')
-    ds = ds / Element(0x0020, 0x000D, 'UI', study_uid)
-    ds = ds / Element(0x0020, 0x000E, 'UI', series_uid)
-    ds = ds / Element(0x0028, 0x0002, 'US', 1)       # Samples per Pixel
-    ds = ds / Element(0x0028, 0x0004, 'CS', 'MONOCHROME2')
-    ds = ds / Element(0x0028, 0x0010, 'US', 1)       # Rows
-    ds = ds / Element(0x0028, 0x0011, 'US', 1)       # Columns
-    ds = ds / Element(0x0028, 0x0100, 'US', 8)       # Bits Allocated
-    ds = ds / Element(0x0028, 0x0101, 'US', 8)       # Bits Stored
-    ds = ds / Element(0x0028, 0x0102, 'US', 7)       # High Bit
-    ds = ds / Element(0x0028, 0x0103, 'US', 0)       # Pixel Representation
-    ds = ds / Element(0x7FE0, 0x0010, 'OB', b'\x00')
-    return ds.encode(implicit_vr=(transfer_syntax == _DEFAULT_STORE_TRANSFER_SYNTAX))
 
 
 def _run_cstore_smoke(args, target) -> int:
@@ -600,13 +316,17 @@ def _run_cstore_smoke(args, target) -> int:
     """
     file_payload = _cstore_file_payload_for_result(args, None)
     if file_payload is not None:
-        payload, sop_class, sop_instance, transfer_syntax = file_payload
+        payload = file_payload.dataset
+        sop_class = file_payload.sop_class_uid
+        sop_instance = file_payload.sop_instance_uid
+        transfer_syntax = file_payload.transfer_syntax
     else:
-        sop_class = getattr(args, 'store_sop', None) or _DEFAULT_STORE_SOP
+        sop_class = getattr(args, 'store_sop', None) or overlay.DEFAULT_STORE_SOP
         transfer_syntax = (getattr(args, 'store_transfer_syntax', None)
-                           or _DEFAULT_STORE_TRANSFER_SYNTAX)
+                           or overlay.DEFAULT_STORE_TRANSFER_SYNTAX)
         sop_instance = f"1.2.826.0.1.3680043.10.543.{int(time.time())}.3"
-        payload = _cstore_smoke_dataset(sop_class, sop_instance, transfer_syntax)
+        payload = overlay.smoke_dataset(sop_class, sop_instance,
+                                        transfer_syntax)
     print("C-STORE smoke: sending known-good dataset")
     if getattr(args, 'cstore_file', None):
         print(f"  File: {os.path.abspath(os.fspath(args.cstore_file))}")
@@ -637,70 +357,15 @@ def _run_cstore_smoke(args, target) -> int:
     return 1
 
 
-def _decode_uid_value(value: bytes) -> str:
-    """Decode a DICOM UI value from file meta information."""
-    return value.rstrip(b'\x00 ').decode('ascii', errors='ignore')
+#: One implementation of "where does the Data Set start", shared with the
+#: carrier and the retrieval path. Re-exported here because the delivery paths
+#: and the delivery-safety tests have always called them by these names.
+_dataset_from_part10 = carrier_mod.dataset_from_part10
+is_part10 = carrier_mod.is_part10
+_decode_uid_value = carrier_mod.decode_uid_value
 
 
-def _dataset_from_part10(payload: bytes) -> Tuple[bytes, Dict[str, str]]:
-    """Strip a Part-10 file wrapper for C-STORE delivery.
-
-    C-STORE carries only a DICOM data set. Several catalog CVE payloads are
-    stored as complete Part-10 files so they are useful as file-parser seeds;
-    when those same payloads are delivered over C-STORE, remove the preamble
-    and group-0002 file meta header while preserving the malformed data set.
-    """
-    meta: Dict[str, str] = {}
-    if not is_part10(payload):
-        return payload, meta
-
-    pos = PART10_PREAMBLE_LEN + len(DICM_PREFIX)
-    end = len(payload)
-    while pos + 8 <= end:
-        group, elem = struct.unpack_from('<HH', payload, pos)
-        if group != 0x0002:
-            break
-
-        vr = payload[pos + 4:pos + 6]
-        if vr in _LONG_EXPLICIT_VR:
-            if pos + 12 > end:
-                break
-            length = struct.unpack_from('<I', payload, pos + 8)[0]
-            value_start = pos + 12
-        else:
-            length = struct.unpack_from('<H', payload, pos + 6)[0]
-            value_start = pos + 8
-
-        value_end = value_start + length
-        if length == 0xFFFFFFFF or value_end > end:
-            break
-
-        value = payload[value_start:value_end]
-        if elem == 0x0002:
-            meta['sop_class_uid'] = _decode_uid_value(value)
-        elif elem == 0x0003:
-            meta['sop_instance_uid'] = _decode_uid_value(value)
-        elif elem == 0x0010:
-            meta['transfer_syntax'] = _decode_uid_value(value)
-        pos = value_end
-
-    if pos > 132:
-        meta['part10_stripped'] = 'true'
-        return payload[pos:], meta
-    return payload, meta
-
-
-def is_part10(payload: bytes) -> bool:
-    """True if ``payload`` is a complete Part-10 file.
-
-    PS3.10 §7.1 fixes the shape: a 128-byte File Preamble followed by the
-    four-byte ``DICM`` prefix. Nothing else the catalog produces looks like
-    that, so it is a reliable structural answer to "is this a dataset to be
-    stored, or bytes to be framed as a PDU?"
-    """
-    return (len(payload) > PART10_PREAMBLE_LEN + len(DICM_PREFIX)
-            and payload[PART10_PREAMBLE_LEN:
-                        PART10_PREAMBLE_LEN + len(DICM_PREFIX)] == DICM_PREFIX)
+is_part10 = carrier_mod.is_part10
 
 
 def _delivery_kind(args, result: AttackResult) -> str:
@@ -831,8 +496,16 @@ def _deliver(args, result: AttackResult, target, timeout: float):
         if kind == 'cstore':
             carrier = _transport_for(args, target)
             file_payload = _cstore_file_payload_for_result(args, result)
+            dry_run_blob = None
             if file_payload is not None:
-                cstore_payload, sop_class, sop_inst, transfer_syntax = file_payload
+                sop_class = file_payload.sop_class_uid
+                sop_inst = file_payload.sop_instance_uid
+                transfer_syntax = file_payload.transfer_syntax
+                # STOW-RS posts complete instances; C-STORE carries a Data Set.
+                cstore_payload = (file_payload.part10
+                                  if carrier.carries_whole_file
+                                  else file_payload.dataset)
+                dry_run_blob = file_payload.part10
             elif carrier.carries_whole_file:
                 # STOW-RS posts complete instances, so the Part-10 wrapper is
                 # what goes up — stripping it here would throw away the
@@ -841,7 +514,7 @@ def _deliver(args, result: AttackResult, target, timeout: float):
                 _p10, part10_meta = _dataset_from_part10(payload)
                 sop_class = result.metadata.get('sop_class_uid') \
                     or part10_meta.get('sop_class_uid') \
-                    or getattr(args, 'store_sop', None) or _DEFAULT_STORE_SOP
+                    or getattr(args, 'store_sop', None) or overlay.DEFAULT_STORE_SOP
                 sop_inst = result.metadata.get('sop_instance_uid') \
                     or part10_meta.get('sop_instance_uid') or '1.2.3.4.5'
                 transfer_syntax = result.metadata.get('transfer_syntax') \
@@ -850,7 +523,7 @@ def _deliver(args, result: AttackResult, target, timeout: float):
                 cstore_payload, part10_meta = _dataset_from_part10(payload)
                 sop_class = result.metadata.get('sop_class_uid') \
                     or part10_meta.get('sop_class_uid') \
-                    or getattr(args, 'store_sop', None) or _DEFAULT_STORE_SOP
+                    or getattr(args, 'store_sop', None) or overlay.DEFAULT_STORE_SOP
                 sop_inst = result.metadata.get('sop_instance_uid') \
                     or part10_meta.get('sop_instance_uid') or '1.2.3.4.5'
                 transfer_syntax = result.metadata.get('transfer_syntax') \
@@ -859,7 +532,12 @@ def _deliver(args, result: AttackResult, target, timeout: float):
                 if part10_meta.get('part10_stripped'):
                     result.metadata['cstore_stripped_part10'] = True
             if getattr(args, 'dry_run', None):
-                _dry_run_write(args, result, kind, [cstore_payload])
+                # Write the whole file when there is one. A bare Data Set with
+                # a .dcm name opens in nothing, and --dry-run exists so an
+                # operator can look at what a run would send before it sends it.
+                _dry_run_write(args, result, kind,
+                               [dry_run_blob if dry_run_blob is not None
+                                else cstore_payload])
                 return None, 'dry_run'
             outcome = carrier.store(
                 cstore_payload, sop_class_uid=sop_class,
@@ -938,7 +616,7 @@ def _round_trip(args, result: AttackResult, target, timeout: float):
     """
     if not result.metadata.get('store_accepted'):
         return None, None, 'not_stored'
-    sop_class = (result.metadata.get('sop_class_uid') or _DEFAULT_STORE_SOP)
+    sop_class = (result.metadata.get('sop_class_uid') or overlay.DEFAULT_STORE_SOP)
     sop_instance = result.metadata.get('sop_instance_uid')
     if not sop_instance:
         return None, None, 'no_sop_instance_uid'
@@ -1402,7 +1080,7 @@ def _save_corpus_file(result: AttackResult, output_dir: str) -> str:
             file_data = part10_file(
                 standard_file_meta(
                     sop_class_uid=(result.metadata.get('sop_class_uid')
-                                   or _DEFAULT_STORE_SOP),
+                                   or overlay.DEFAULT_STORE_SOP),
                     sop_instance_uid=(result.metadata.get('sop_instance_uid')
                                       or '1.2.3.4.5'),
                     transfer_syntax=(result.metadata.get('transfer_syntax')
@@ -2523,6 +2201,27 @@ def main(argv: Optional[List[str]] = None):
     args._monitors = []
     args._managed_process = None
     args._associations_used = 0
+
+    # Load --cstore-file up front. A carrier that cannot be read is an
+    # operator error, and finding out about it on the first delivery buries it
+    # under a wall of per-attack output.
+    if args.cstore_file:
+        try:
+            carrier = _get_cstore_file_context(args)
+        except CarrierError as exc:
+            print(f"ERROR: --cstore-file: {exc}")
+            return 1
+        print(f"Carrier: {carrier.path}")
+        print(f"  Encoding: {carrier.transfer_syntax}"
+              + ("  (sniffed - the file has no File Meta Information)"
+                 if carrier.sniffed_encoding else ""))
+        print(f"  Data Set: {len(carrier.dataset)} bytes, "
+              f"{len(carrier.elements)} top-level elements")
+        if carrier.has_tail:
+            print(f"  WARNING: {len(carrier.dataset) - carrier.tail_offset} "
+                  "trailing bytes did not parse as Data Elements; they are "
+                  "delivered unchanged but no attack can be placed in them.")
+        print()
 
     if args.dry_run:
         print(f"DRY RUN: writing payloads to {os.path.abspath(args.dry_run)} "
