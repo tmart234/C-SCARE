@@ -224,7 +224,12 @@ operator watched their target accept and the object the target is now asked to
 parse — and the difference shows up as a rejection that reads like a clean
 result.
 
-Placement is driven entirely by the attack's declared metadata:
+Placement is driven entirely by the attack's declared metadata — the table
+below is the whole contract, and it lives in
+[`c_scare/overlay.py`](../c_scare/overlay.py) rather than in the CLI, because
+none of it is command-line work. Adding an attack never means editing that
+module; it means declaring, in the attack's metadata, where its payload
+belongs.
 
 | Attack declares | Overlay on the carrier |
 |---|---|

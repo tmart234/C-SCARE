@@ -64,6 +64,8 @@ __all__ = [
     'encapsulate_items',
     'is_part10',
     'scan_dataset',
+    'dataset_from_part10',
+    'decode_uid_value',
     'split_part10',
     'split_encapsulated',
     'sniff_encoding',
@@ -452,6 +454,44 @@ def transcode_element_header(elem: CarrierElement, value: bytes,
     out += encode_vr_length(vr, elem.declared_length, to_implicit, to_little,
                             raw_vr=elem.vr, long_form=long_form)
     return out + value
+
+
+def decode_uid_value(value: bytes) -> str:
+    """Decode a DICOM UI value from file meta information."""
+    return value.rstrip(b'\x00 ').decode('ascii', errors='ignore')
+
+
+def dataset_from_part10(payload: bytes) -> Tuple[bytes, Dict[str, str]]:
+    """Strip a Part-10 file wrapper for C-STORE delivery.
+
+    C-STORE carries only a DICOM data set. Several catalog CVE payloads are
+    stored as complete Part-10 files so they are useful as file-parser seeds;
+    when those same payloads are delivered over C-STORE, remove the preamble
+    and group-0002 file meta header while preserving the malformed data set.
+
+    Sits beside :func:`split_part10` so the carrier and the delivery path
+    cannot disagree about where a Data Set begins — they used to have separate
+    implementations of the same walk, and a payload that straddled the
+    difference was framed one way and spliced the other.
+    """
+    _preamble, file_meta, dataset, elements = split_part10(payload)
+    meta: Dict[str, str] = {}
+    if not is_part10(payload):
+        return payload, meta
+
+    for elem in elements:
+        value = file_meta[elem.value_start:elem.end]
+        if elem.tag == 0x00020002:
+            meta['sop_class_uid'] = decode_uid_value(value)
+        elif elem.tag == 0x00020003:
+            meta['sop_instance_uid'] = decode_uid_value(value)
+        elif elem.tag == 0x00020010:
+            meta['transfer_syntax'] = decode_uid_value(value)
+
+    if len(payload) - len(dataset) > 132:
+        meta['part10_stripped'] = 'true'
+        return dataset, meta
+    return payload, meta
 
 
 class Carrier:

@@ -6,7 +6,8 @@ The `c_scare` package. See the [project README](../README.md) for an overview an
 |--------|---------|
 | `element.py` | Dataset/Element building with Scapy-style `/` chaining |
 | `corruptor.py` | pydicom bridge — read with pydicom, re-emit *invalid* with our encoder |
-| `carrier.py` | Byte-faithful carrier objects for `--cstore-file` — scan a real image's Data Set structurally and splice attacks into the bytes that were on disk, so nothing the attack did not name is re-encoded |
+| `carrier.py` | A real DICOM object held as the bytes it was stored as — scan a Data Set structurally, splice edits into it, and hand back a file. Knows nothing about attacks; also used by the C-GET retrieval path |
+| `overlay.py` | Render one catalog attack onto a carrier — the seam between `attacks.py` and `carrier.py`. Driven entirely by an attack's declared metadata, so adding an attack never means editing it |
 | `pixel.py` | Encapsulated pixel data with fragment-level control + Scapy layers |
 | `file.py` | Part 10 file handling (preamble, meta header, transfer syntax via `pydicom.uid.UID`) |
 | `scapy_dicom.py` | DICOM wire-format layer — declarative Scapy `Packet` definitions for PDUs/DIMSE-C/N plus builders and dissection helpers. The `Packet`/`Field` definitions are pure and upstreamable; the module also bundles the thin TCP transport primitives (`DICOMSocket`, `read_dul_pdu`) that frame a byte stream into PDUs |

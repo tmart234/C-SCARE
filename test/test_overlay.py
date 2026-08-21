@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """
-``--cstore-file`` against real images: what the target actually receives.
+:mod:`c_scare.overlay` against real images: what the target actually receives.
 
-The flag exists so an attack can ride an object the operator has already
+``--cstore-file`` exists so an attack can ride an object the operator has already
 watched their target accept. That promise has two halves, and both are tested
 here on real scanner-derived files rather than a synthetic stub:
 
@@ -17,6 +17,7 @@ kind: the run reports a clean status for a test the target never ran.
 """
 
 import argparse
+import importlib
 import io
 import os
 import struct
@@ -33,8 +34,10 @@ from dicom_corpus import (  # noqa: E402
 
 import c_scare.runner as runner  # noqa: E402
 from c_scare import attacks as attack_catalog  # noqa: E402
+from c_scare import carrier as c_scare_carrier  # noqa: E402
+from c_scare import overlay  # noqa: E402
 from c_scare.carrier import (  # noqa: E402
-    Carrier, TAG_PIXEL_DATA, TAG_SOP_INSTANCE_UID,
+    Carrier, TAG_PIXEL_DATA, TAG_SOP_INSTANCE_UID, dataset_from_part10,
     empty_basic_offset_table, scan_dataset, split_encapsulated,
 )
 
@@ -61,16 +64,15 @@ CATALOGS = (
 )
 
 
-def _args(path, **overrides):
-    base = dict(cstore_file=str(path), store_sop=None,
-                store_transfer_syntax=None, delivery='auto')
-    base.update(overrides)
-    return argparse.Namespace(**base)
-
-
 def _carry(path, result, **overrides):
-    return runner._cstore_file_payload_for_result(_args(path, **overrides),
-                                                  result)
+    """Render one attack onto the image at ``path``.
+
+    Straight into :func:`c_scare.overlay.carry` — no argparse Namespace in
+    sight, which is the point of the overlay living outside the CLI. The
+    command-line plumbing that reaches it is covered separately, once, in
+    ``TestRunnerPlumbing``.
+    """
+    return overlay.carry(Carrier.from_file(path), result, **overrides)
 
 
 def _cstore_attacks():
@@ -80,6 +82,16 @@ def _cstore_attacks():
         for result in catalog.all():
             if runner._delivery_kind(routing, result) == 'cstore':
                 yield result
+
+
+def _attack_declares(result, tag):
+    """True when the attack's own Data Set writes ``tag``."""
+    blob, _meta = dataset_from_part10(result.payload)
+    if not blob:
+        return False
+    implicit, little = overlay._attack_dataset_encoding(result)
+    elements, _tail = scan_dataset(blob, implicit, little)
+    return any(elem.tag == tag for elem in elements)
 
 
 def _reference_image():
@@ -263,7 +275,7 @@ def test_store_transfer_syntax_flag_wins_over_everything(path):
         expected_behavior='e',
         metadata={'transfer_syntax': '1.2.840.10008.1.2'})
     carried = _carry(path, result,
-                     store_transfer_syntax='1.2.840.10008.1.2.1')
+                     transfer_syntax='1.2.840.10008.1.2.1')
     assert carried.transfer_syntax == '1.2.840.10008.1.2.1'
 
 
@@ -462,16 +474,6 @@ def test_every_cstore_attack_renders_on_every_encoding(path):
         assert result.metadata['cstore_file_mutation'], result.name
 
 
-def _attack_declares(result, tag):
-    """True when the attack's own Data Set writes ``tag``."""
-    blob = runner._attack_dataset_payload(result)
-    if not blob:
-        return False
-    implicit, little = runner._attack_dataset_encoding(result)
-    elements, _tail = scan_dataset(blob, implicit, little)
-    return any(elem.tag == tag for elem in elements)
-
-
 @pytest.mark.parametrize('path', ENCODINGS, ids=image_id)
 def test_every_cstore_attack_keeps_the_carriers_pixel_data(path):
     """Only attacks that are *about* the image are allowed to touch it.
@@ -605,3 +607,170 @@ def test_part10_group_length_is_repaired_after_a_file_meta_edit(path):
     declared = rebuilt._file_meta_values.get(0x00020000)
     assert declared is not None
     assert struct.unpack('<I', declared)[0] == len(rebuilt.file_meta) - 12
+
+
+# ---------------------------------------------------------------------------
+# The command line reaching the overlay
+# ---------------------------------------------------------------------------
+
+class TestRunnerPlumbing:
+    """The thin part: turning options into :func:`overlay.carry` arguments.
+
+    Everything above this line tests the overlay directly, because that is
+    where the DICOM decisions are. What is left for the runner is argv, and it
+    only has to be checked once.
+    """
+
+    @staticmethod
+    def _args(**overrides):
+        base = dict(cstore_file=None, store_sop=None,
+                    store_transfer_syntax=None, delivery='auto')
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def test_without_the_flag_there_is_no_carrier(self):
+        assert runner._cstore_file_payload_for_result(
+            self._args(), None) is None
+
+    def test_the_flag_renders_the_named_file(self):
+        path = _reference_image()
+        carried = runner._cstore_file_payload_for_result(
+            self._args(cstore_file=path), None)
+        assert carried.dataset == Carrier.from_file(path).dataset
+
+    def test_store_transfer_syntax_reaches_the_overlay(self):
+        carried = runner._cstore_file_payload_for_result(
+            self._args(cstore_file=_reference_image(),
+                       store_transfer_syntax='1.2.840.10008.1.2'), None)
+        assert carried.transfer_syntax == '1.2.840.10008.1.2'
+
+    def test_store_sop_is_only_a_fallback(self):
+        """A carrier that names its own SOP Class keeps it.
+
+        ``--store-sop`` exists for a payload that names none; overriding a real
+        object's SOP Class would negotiate a context its Data Set contradicts.
+        """
+        path = _reference_image()
+        carried = runner._cstore_file_payload_for_result(
+            self._args(cstore_file=path, store_sop='1.2.3.4.5'), None)
+        assert carried.sop_class_uid == Carrier.from_file(path).sop_class_uid
+
+    def test_the_carrier_is_read_once_per_run(self):
+        """Every attack edits the same immutable bytes.
+
+        Re-reading per attack would be slow on a real study and, worse, would
+        make a carrier that changed on disk mid-run silently change the test.
+        """
+        args = self._args(cstore_file=_reference_image())
+        first = runner._get_cstore_file_context(args)
+        assert runner._get_cstore_file_context(args) is first
+
+    def test_an_unreadable_carrier_is_named_not_swallowed(self, tmp_path):
+        from c_scare.carrier import CarrierError
+
+        empty = tmp_path / 'not-dicom.dcm'
+        empty.write_bytes(b'')
+        with pytest.raises(CarrierError):
+            runner._get_cstore_file_context(
+                self._args(cstore_file=str(empty)))
+
+
+class TestLayering:
+    """The dependency directions this module split exists to hold.
+
+    Both are the kind of invariant that rots silently: an `import` added for
+    one convenient constant, and six months later the layering is gone and
+    nobody can say when.
+    """
+
+    def test_carrier_knows_nothing_about_attacks(self):
+        """A carrier is a DICOM object, useful to anything that needs one.
+
+        The C-GET retrieval path in ``client.py`` imports it and wants nothing
+        to do with the attack catalog. Teaching ``carrier`` about
+        ``AttackResult`` metadata would make that import pull in 7,000 lines of
+        payloads.
+        """
+        import ast
+
+        tree = ast.parse(open(c_scare_carrier.__file__).read())
+        imported = _module_level_imports(tree)
+        assert 'attacks' not in imported, imported
+        assert 'overlay' not in imported, imported
+        assert 'runner' not in imported, imported
+
+    def test_the_overlay_does_not_import_the_catalog_at_module_level(self):
+        """An attack is duck-typed: ``.payload`` bytes and ``.metadata``.
+
+        ``responders.py`` already keeps the catalog off its import path the
+        same way. Importing ``AttackResult`` for a type annotation would undo
+        that for every consumer of the overlay.
+        """
+        import ast
+        import sys
+
+        tree = ast.parse(open(overlay.__file__).read())
+        assert 'attacks' not in _module_level_imports(tree)
+
+        for module in ('c_scare.overlay', 'c_scare.attacks'):
+            sys.modules.pop(module, None)
+        importlib.import_module('c_scare.overlay')
+        assert 'c_scare.attacks' not in sys.modules
+
+    def test_the_runner_holds_no_dicom_overlay_logic(self):
+        """What is left in the CLI for ``--cstore-file`` is argv handling.
+
+        Named rather than counted: these are the functions that moved, and a
+        re-appearance means the split is being undone one helper at a time.
+        """
+        moved = [
+            '_cstore_file_overlay', '_grow_pixel_data', '_merge_attack_dataset',
+            '_stamp_cstore_file_identity', '_cstore_smoke_dataset',
+            '_KEYWORD_TAGS', '_CSTORE_TARGET_FIELDS', '_is_placeholder_uid',
+        ]
+        still_there = [name for name in moved if hasattr(runner, name)]
+        assert not still_there, still_there
+
+
+def _module_level_imports(tree):
+    """Names a module imports at import time, however the import is spelled.
+
+    Walks statements rather than the whole tree, so a lazy import inside a
+    function does not count -- that is the documented way to reach the catalog
+    from a module that must not pull it in. ``if TYPE_CHECKING:`` blocks do not
+    count either: they never execute.
+    """
+    import ast
+
+    names = set()
+
+    def _walk(body):
+        for node in body:
+            if isinstance(node, ast.Import):
+                names.update(alias.name.split('.')[-1] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    names.add(node.module.split('.')[-1])
+                # `from . import attacks` names the module in the aliases.
+                names.update(alias.name.split('.')[-1] for alias in node.names)
+            elif isinstance(node, ast.If):
+                if _mentions_type_checking(node.test):
+                    continue
+                _walk(node.body)
+                _walk(node.orelse)
+            elif isinstance(node, ast.Try):
+                # The repo's `try: from .x import y / except ImportError:`
+                # fallbacks are import-time imports like any other.
+                _walk(node.body)
+                for handler in node.handlers:
+                    _walk(handler.body)
+                _walk(node.orelse)
+                _walk(node.finalbody)
+
+    def _mentions_type_checking(node):
+        import ast as _ast
+        return any(isinstance(sub, _ast.Name) and sub.id == 'TYPE_CHECKING'
+                   for sub in _ast.walk(node))
+
+    _walk(tree.body)
+    return names
